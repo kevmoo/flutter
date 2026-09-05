@@ -18,10 +18,15 @@ enum OptionScope {
   any,
 }
 
-final Expando<Map<String, OptionDescriptor<Object?>>> _parserRegistry =
-    Expando<Map<String, OptionDescriptor<Object?>>>('OptionDescriptorRegistry');
+/// Registry mapping option names to their registered [OptionDescriptor] instances.
+typedef ArgParserRegistry = Map<String, OptionDescriptor<Object?>>;
 
-Map<String, OptionDescriptor<Object?>> _registryFor(ArgParser parser) =>
+// Uses an Expando (weak keys) rather than a top-level Map<ArgParser, ...> so that
+// short-lived ArgParser instances created across tests and commands can be
+// garbage-collected without leaking memory for the lifetime of the isolate.
+final _parserRegistry = Expando<ArgParserRegistry>('OptionDescriptorRegistry');
+
+ArgParserRegistry _registryFor(ArgParser parser) =>
     _parserRegistry[parser] ??= <String, OptionDescriptor<Object?>>{};
 
 /// A metadata-rich, type-safe descriptor for a command-line option or flag.
@@ -107,7 +112,7 @@ abstract class OptionDescriptor<T> {
       hideOverride ?? (hide || (verboseOnly && !verboseHelp));
 
   bool _isAlreadyRegistered(ArgParser parser) {
-    final Map<String, OptionDescriptor<Object?>> registry = _registryFor(parser);
+    final ArgParserRegistry registry = _registryFor(parser);
     if (parser.options.containsKey(name)) {
       final OptionDescriptor<Object?>? existing = registry[name];
       if (existing != null && identical(existing, this)) {
