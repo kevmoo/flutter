@@ -158,7 +158,7 @@ String _hashAndRenameWebOutput({required File file, File? sourceMapFile}) {
   // The source map shares the binary's hash so the pair stays discoverable as
   // '<binary>.map'. A `.wasm` binary embeds its map name in a binary custom
   // section that cannot be rewritten here, so its map keeps the unhashed name.
-  final bool isWasm = file.fileSystem.path.extension(file.path) == '.wasm';
+  final isWasm = file.fileSystem.path.extension(file.path) == '.wasm';
   if (sourceMapFile != null && sourceMapFile.existsSync() && !isWasm) {
     final String oldMapBasename = sourceMapFile.basename;
     final newMapBasename = '$newBasename.map';
@@ -1242,13 +1242,12 @@ class WebTemplatedFiles extends Target {
     if (!directory.existsSync()) {
       return;
     }
-    final pathContext = directory.fileSystem.path;
     for (final File file in directory.listSync(recursive: true).whereType<File>()) {
-      if (pathContext.extension(file.path) != '.wasm') {
+      if (directory.fileSystem.path.extension(file.path) != '.wasm') {
         continue;
       }
-      final List<String> segments = pathContext.split(
-        pathContext.relative(file.path, from: directory.path),
+      final List<String> segments = directory.fileSystem.path.split(
+        directory.fileSystem.path.relative(file.path, from: directory.path),
       );
       if (skipCanvasKit && segments.first == 'canvaskit') {
         continue;
@@ -1271,11 +1270,10 @@ class WebTemplatedFiles extends Target {
     _scanDirectoryForWasmHashes(canvasKitDirectory, wasmHashes);
 
     if (compileTargets != null) {
-      final pathContext = environment.fileSystem.path;
       for (final Dart2WebTarget target in compileTargets!) {
         for (final File file in target.buildFiles(environment)) {
-          if (pathContext.extension(file.path) == '.wasm' &&
-              !pathContext.split(file.path).contains('canvaskit') &&
+          if (environment.fileSystem.path.extension(file.path) == '.wasm' &&
+              !environment.fileSystem.path.split(file.path).contains('canvaskit') &&
               file.existsSync()) {
             wasmHashes[file.basename] = crypto.sha256.convert(file.readAsBytesSync()).toString();
           }
