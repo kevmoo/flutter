@@ -172,20 +172,7 @@ class BuildWebCommand extends BuildSubCommand {
         );
       }
       if (webContentHash) {
-        final String uncommentedContent = indexHtmlContent.replaceAll(
-          RegExp(r'<!--[\s\S]*?-->'),
-          '',
-        );
-        if (uncommentedContent.contains('main.dart.js') ||
-            uncommentedContent.contains('loadEntrypoint')) {
-          throwToolExit(
-            'Cannot build with "--web-content-hash" because web/index.html contains '
-            'direct references to "main.dart.js" or the deprecated "FlutterLoader.loadEntrypoint" API.\n'
-            'Modern Flutter Web applications use the templated "flutter_bootstrap.js" loader script '
-            'which automatically resolves content-hashed entrypoints. '
-            'Please update web/index.html or run "flutter create . --platforms web" to migrate.',
-          );
-        }
+        _validateIndexHtmlForContentHash(indexHtmlFile);
       }
     }
 
@@ -223,5 +210,22 @@ class BuildWebCommand extends BuildSubCommand {
       );
     }
     return FlutterCommandResult.success();
+  }
+
+  static final RegExp _htmlCommentRegex = RegExp(r'<!--[\s\S]*?-->');
+
+  void _validateIndexHtmlForContentHash(File indexHtmlFile) {
+    final String indexHtmlContent = indexHtmlFile.readAsStringSync();
+    final String uncommentedContent = indexHtmlContent.replaceAll(_htmlCommentRegex, '');
+    if (uncommentedContent.contains('main.dart.js') ||
+        uncommentedContent.contains('loadEntrypoint')) {
+      throwToolExit(
+        'Cannot build with "--web-content-hash" because web/index.html contains '
+        'direct references to "main.dart.js" or the deprecated "FlutterLoader.loadEntrypoint" API.\n'
+        'Modern Flutter Web applications use the templated "flutter_bootstrap.js" loader script '
+        'which automatically resolves content-hashed entrypoints. '
+        'Please update web/index.html or run "flutter create . --platforms web" to migrate.',
+      );
+    }
   }
 }
