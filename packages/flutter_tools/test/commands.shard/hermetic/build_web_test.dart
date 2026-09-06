@@ -268,7 +268,7 @@ void main() {
     testUsingContext(
       'Passes --web-content-hash flag to compiler configs (wasm: $useWasm)',
       () async {
-        final buildCommand = BuildCommand(
+        final BuildCommand buildCommand = createFakeBuildCommand(
           androidSdk: FakeAndroidSdk(),
           buildSystem: TestBuildSystem.all(BuildResult(success: true)),
           fileSystem: fileSystem,
@@ -312,7 +312,7 @@ void main() {
   testUsingContext(
     'Rejects --web-content-hash combined with --enable-wasm-deferred-loading',
     () async {
-      final buildCommand = BuildCommand(
+      final BuildCommand buildCommand = createFakeBuildCommand(
         androidSdk: FakeAndroidSdk(),
         buildSystem: TestBuildSystem.all(BuildResult(success: true)),
         fileSystem: fileSystem,
@@ -357,7 +357,7 @@ void main() {
   testUsingContext(
     'Rejects --web-content-hash when web/index.html references main.dart.js or loadEntrypoint',
     () async {
-      final buildCommand = BuildCommand(
+      final BuildCommand buildCommand = createFakeBuildCommand(
         androidSdk: FakeAndroidSdk(),
         buildSystem: TestBuildSystem.all(BuildResult(success: true)),
         fileSystem: fileSystem,
@@ -422,7 +422,7 @@ void main() {
   testUsingContext(
     'Prints serving guidance tip when --web-content-hash is used',
     () async {
-      final buildCommand = BuildCommand(
+      final BuildCommand buildCommand = createFakeBuildCommand(
         androidSdk: FakeAndroidSdk(),
         buildSystem: TestBuildSystem.all(BuildResult(success: true)),
         fileSystem: fileSystem,
