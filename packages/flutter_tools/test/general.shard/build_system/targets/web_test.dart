@@ -2329,6 +2329,66 @@ console.log(mapName);
   );
 
   test(
+    'WebReleaseBundle hashes physical assets, leaves NOTICES unhashed, and updates AssetManifest when webContentHash is true',
+    () => testbed.run(() async {
+      environment.defines[kBuildMode] = 'release';
+      environment.projectDir.childDirectory('web').createSync(recursive: true);
+      environment.buildDir.childFile('main.dart.js').createSync(recursive: true);
+
+      // Create a pubspec.yaml with assets and notices
+      environment.projectDir.childFile('pubspec.yaml').writeAsStringSync('''
+name: my_app
+flutter:
+  assets:
+    - images/logo.png
+    - NOTICES
+''');
+
+      final File logo = environment.projectDir.childDirectory('images').childFile('logo.png')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(<int>[1, 2, 3, 4]);
+      environment.projectDir.childFile('NOTICES')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('License notices');
+
+      const logoHash = '9f64a747'; // sha256 of [1,2,3,4]
+
+      await WebReleaseBundle(<WebCompilerConfig>[
+        const JsCompilerConfig(webContentHash: true),
+      ], const NoOpAnalytics()).build(environment);
+
+      final Directory assetsDir = environment.outputDir.childDirectory('assets');
+
+      expect(assetsDir.childDirectory('images').childFile('logo.$logoHash.png').existsSync(), true);
+      expect(assetsDir.childDirectory('images').childFile('logo.png').existsSync(), false);
+      expect(assetsDir.childFile('NOTICES').existsSync(), true);
+      expect(assetsDir.childFile('AssetManifest.bin').existsSync(), true);
+      expect(assetsDir.childFile('AssetManifest.bin.json').existsSync(), true);
+
+      // Verify flutter_assets.d references the hashed logo path
+      final File depfile = environment.buildDir.childFile('flutter_assets.d');
+      expect(depfile.existsSync(), true);
+      expect(depfile.readAsStringSync(), contains('logo.$logoHash.png'));
+
+      // Test stale asset cleanup on rebuild: modify logo content
+      logo.writeAsBytesSync(<int>[5, 6, 7, 8]);
+      const newLogoHash = '55e5509f'; // sha256 of [5,6,7,8]
+
+      await WebReleaseBundle(<WebCompilerConfig>[
+        const JsCompilerConfig(webContentHash: true),
+      ], const NoOpAnalytics()).build(environment);
+
+      expect(
+        assetsDir.childDirectory('images').childFile('logo.$newLogoHash.png').existsSync(),
+        true,
+      );
+      expect(
+        assetsDir.childDirectory('images').childFile('logo.$logoHash.png').existsSync(),
+        false,
+      );
+    }),
+  );
+  test(
     'WebTemplatedFiles populates wasmHashes from compileTargets on clean builds before outputDir is copied',
     () => testbed.run(() async {
       environment.projectDir.childDirectory('web').createSync(recursive: true);

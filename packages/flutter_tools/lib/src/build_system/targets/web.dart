@@ -2,11 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:meta/meta.dart';
 import 'package:package_config/package_config.dart';
+import 'package:standard_message_codec/standard_message_codec.dart';
 import 'package:unified_analytics/unified_analytics.dart';
 
 import '../../artifacts.dart';
@@ -41,6 +44,15 @@ import 'native_assets.dart';
 const String _kBundledFallbackRobotoFamily = 'Roboto';
 const String _kBundledFallbackRobotoAsset = 'fonts/fallback/Roboto-Regular.ttf';
 const String _kFontManifestJsonFile = 'FontManifest.json';
+
+const Set<String> _kUnhashedAssetBasenames = <String>{
+  'AssetManifest.json',
+  'AssetManifest.bin',
+  'AssetManifest.bin.json',
+  'FontManifest.json',
+  'NOTICES',
+  'NOTICES.Z',
+};
 
 /// Generates an entry point for a web target.
 // Keep this in sync with build_runner/resident_web_runner.dart
@@ -1099,6 +1111,9 @@ class WebReleaseBundle extends Target {
 
     createVersionFile(environment, environment.defines);
     final Directory outputDirectory = environment.outputDir.childDirectory('assets');
+    if (outputDirectory.existsSync()) {
+      outputDirectory.deleteSync(recursive: true);
+    }
     outputDirectory.createSync(recursive: true);
 
     final DartHooksResult dartHookResult = await LinkHooks.loadHookResult(environment);
@@ -1111,7 +1126,25 @@ class WebReleaseBundle extends Target {
     );
     final Depfile bundledDepfile = _bundleLocalRobotoFallback(environment, depfile);
     final DepfileService depfileService = environment.depFileService;
-    depfileService.writeToFile(bundledDepfile, environment.buildDir.childFile('flutter_assets.d'));
+
+    final bool webContentHash = compileTargets.any(
+      (Dart2WebTarget t) => t.compilerConfig.webContentHash,
+    );
+    if (webContentHash) {
+      final Map<String, File> renamedOutputs = _hashWebAssets(outputDirectory);
+      final List<File> updatedOutputs = bundledDepfile.outputs.map((File f) {
+        return renamedOutputs[f.path] ?? f;
+      }).toList();
+      depfileService.writeToFile(
+        Depfile(bundledDepfile.inputs, updatedOutputs),
+        environment.buildDir.childFile('flutter_assets.d'),
+      );
+    } else {
+      depfileService.writeToFile(
+        bundledDepfile,
+        environment.buildDir.childFile('flutter_assets.d'),
+      );
+    }
 
     final Directory webResources = environment.projectDir.childDirectory('web');
     final List<File> inputResourceFiles = webResources
@@ -1538,4 +1571,138 @@ extension on Environment {
   ServiceWorkerStrategy get serviceWorkerStrategy =>
       ServiceWorkerStrategy.fromCliName(defines[kServiceWorkerStrategy]) ??
       ServiceWorkerStrategy.offlineFirst;
+}
+
+Map<String, File> _hashWebAssets(Directory assetsDir) {
+  final renamedFileMap = <String, File>{};
+  if (!assetsDir.existsSync()) {
+    return renamedFileMap;
+  }
+
+  final FileSystem fileSystem = assetsDir.fileSystem;
+  final List<File> files = assetsDir.listSync(recursive: true).whereType<File>().toList();
+  final renamedAssets = <String, String>{};
+
+  for (final file in files) {
+    final String basename = file.basename;
+    if (_kUnhashedAssetBasenames.contains(basename)) {
+      continue;
+    }
+
+    final String contentHash = crypto.sha256
+        .convert(file.readAsBytesSync())
+        .toString()
+        .substring(0, 8);
+    final String newBasename = _computeHashedBasename(basename, contentHash);
+
+    final String relativePath = fileSystem.path.relative(file.path, from: assetsDir.path);
+    final String newRelativePath = fileSystem.path.join(
+      fileSystem.path.dirname(relativePath),
+      newBasename,
+    );
+
+    // Rename the file
+    final String newPath = fileSystem.path.join(assetsDir.path, newRelativePath);
+    final String oldPath = file.path;
+    file.renameSync(newPath);
+    renamedFileMap[oldPath] = fileSystem.file(newPath);
+
+    // Note: use forward slashes for mapping since the manifest uses them.
+    final String posixOldPath = relativePath.replaceAll(fileSystem.path.separator, '/');
+    final String posixNewPath = newRelativePath.replaceAll(fileSystem.path.separator, '/');
+    renamedAssets[posixOldPath] = posixNewPath;
+    renamedAssets[Uri.decodeFull(posixOldPath)] = posixNewPath;
+  }
+
+  // Now update the manifests if they exist
+  final File assetManifestBin = assetsDir.childFile('AssetManifest.bin');
+  if (assetManifestBin.existsSync()) {
+    final Uint8List rawBytes = assetManifestBin.readAsBytesSync();
+    final message = ByteData.sublistView(rawBytes);
+    final Object? decoded = const StandardMessageCodec().decodeMessage(message);
+    if (decoded is Map<Object?, Object?>) {
+      final newManifest = <String, dynamic>{};
+      for (final MapEntry<Object?, Object?> entry in decoded.entries) {
+        final key = entry.key.toString();
+        final Object? variantsVal = entry.value;
+        if (variantsVal is! List<Object?>) {
+          continue;
+        }
+        final newVariants = <dynamic>[];
+        for (final Object? variantObj in variantsVal) {
+          if (variantObj is! Map<Object?, Object?>) {
+            continue;
+          }
+          final newVariantMap = <String, dynamic>{};
+          for (final MapEntry<Object?, Object?> vEntry in variantObj.entries) {
+            final vKey = vEntry.key.toString();
+            if (vKey == 'asset') {
+              final vValue = vEntry.value.toString();
+              newVariantMap[vKey] = renamedAssets[vValue] ?? vValue;
+            } else {
+              newVariantMap[vKey] = vEntry.value;
+            }
+          }
+          newVariants.add(newVariantMap);
+        }
+        newManifest[key] = newVariants;
+      }
+      final ByteData encoded = const StandardMessageCodec().encodeMessage(newManifest)!;
+      final encodedBytes = Uint8List.sublistView(encoded);
+      assetManifestBin.writeAsBytesSync(encodedBytes);
+
+      // Update AssetManifest.bin.json
+      final File assetManifestBinJson = assetsDir.childFile('AssetManifest.bin.json');
+      if (assetManifestBinJson.existsSync()) {
+        assetManifestBinJson.writeAsStringSync(json.encode(base64.encode(encodedBytes)));
+      }
+    }
+  }
+
+  // Update legacy AssetManifest.json if present
+  final File assetManifestJson = assetsDir.childFile('AssetManifest.json');
+  if (assetManifestJson.existsSync()) {
+    final Object? decodedJson = json.decode(assetManifestJson.readAsStringSync());
+    if (decodedJson is Map<String, dynamic>) {
+      final newManifest = <String, dynamic>{};
+      for (final MapEntry<String, dynamic> entry in decodedJson.entries) {
+        final Object? variants = entry.value;
+        if (variants is List<dynamic>) {
+          final newVariants = <String>[];
+          for (final Object? variant in variants) {
+            if (variant is String) {
+              newVariants.add(renamedAssets[variant] ?? variant);
+            }
+          }
+          newManifest[entry.key] = newVariants;
+        }
+      }
+      assetManifestJson.writeAsStringSync(json.encode(newManifest));
+    }
+  }
+
+  final File fontManifest = assetsDir.childFile('FontManifest.json');
+  if (fontManifest.existsSync()) {
+    final Object? decodedJson = json.decode(fontManifest.readAsStringSync());
+    if (decodedJson is List<dynamic>) {
+      for (final Object? font in decodedJson) {
+        if (font is Map<String, dynamic>) {
+          final Object? fonts = font['fonts'];
+          if (fonts is List<dynamic>) {
+            for (final Object? fontAsset in fonts) {
+              if (fontAsset is Map<String, dynamic>) {
+                final Object? asset = fontAsset['asset'];
+                if (asset is String && renamedAssets.containsKey(asset)) {
+                  fontAsset['asset'] = renamedAssets[asset];
+                }
+              }
+            }
+          }
+        }
+      }
+      fontManifest.writeAsStringSync(json.encode(decodedJson));
+    }
+  }
+
+  return renamedFileMap;
 }
