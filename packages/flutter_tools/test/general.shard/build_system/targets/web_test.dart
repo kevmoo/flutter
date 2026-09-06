@@ -2012,6 +2012,10 @@ _flutter.loader.load();
         ..createSync(recursive: true);
       final File staleMap = environment.buildDir.childFile('main.dart.00000000.js.map')
         ..createSync(recursive: true);
+      final File stalePartJs = environment.buildDir.childFile('main.dart.js_1.part.js')
+        ..createSync(recursive: true);
+      final File stalePartMap = environment.buildDir.childFile('main.dart.js_1.part.js.map')
+        ..createSync(recursive: true);
       const jsContent = 'console.log("hello");\n//# sourceMappingURL=main.dart.js.map\n';
       final common = <String>[
         ..._kDart2jsLinuxArgs,
@@ -2060,6 +2064,8 @@ _flutter.loader.load();
       final expectedBasename = 'main.dart.$expectedHash.js';
       expect(staleJs, isNot(exists));
       expect(staleMap, isNot(exists));
+      expect(stalePartJs, isNot(exists));
+      expect(stalePartMap, isNot(exists));
       expect(environment.buildDir.childFile(expectedBasename), exists);
       expect(environment.buildDir.childFile('$expectedBasename.map'), exists);
 
@@ -2195,6 +2201,10 @@ _flutter.loader.load();
         ..createSync(recursive: true);
       final File staleUnhashed = environment.outputDir.childFile('main.dart.js')
         ..createSync(recursive: true);
+      final File staleWasmModule = environment.outputDir.childFile('main.dart_module1.wasm')
+        ..createSync(recursive: true);
+      final File staleWasmModuleMap = environment.outputDir.childFile('main.dart_module1.wasm.map')
+        ..createSync(recursive: true);
       final File unrelated = environment.outputDir.childFile('flutter.js')
         ..createSync(recursive: true);
 
@@ -2205,6 +2215,8 @@ _flutter.loader.load();
       expect(staleJs, isNot(exists));
       expect(staleMap, isNot(exists));
       expect(staleUnhashed, isNot(exists));
+      expect(staleWasmModule, isNot(exists));
+      expect(staleWasmModuleMap, isNot(exists));
       expect(unrelated, exists);
       expect(environment.outputDir.childFile('main.dart.11111111.js'), exists);
     }),

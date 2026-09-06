@@ -259,7 +259,14 @@ class Dart2JSTarget extends Dart2WebTarget {
 
     if (compilerConfig.webContentHash && environment.buildDir.existsSync()) {
       for (final File file in environment.buildDir.listSync().whereType<File>()) {
-        if (_mainJsRegex.hasMatch(file.basename) || _mainJsMapRegex.hasMatch(file.basename)) {
+        // Delete previously compiled JS entrypoints and deferred part files so
+        // that stale hashed outputs do not remain in buildDir and leftover
+        // .part.js files from prior builds do not trigger a false-positive
+        // deferred loading error.
+        if (_mainJsRegex.hasMatch(file.basename) ||
+            _mainJsMapRegex.hasMatch(file.basename) ||
+            _partFileRegex.hasMatch(file.basename) ||
+            file.basename.endsWith('.part.js.map')) {
           file.deleteSync();
         }
       }
@@ -1062,7 +1069,7 @@ class WebReleaseBundle extends Target {
   /// Matches the compiled entrypoint files (hashed or not) that this bundle
   /// copies into the output directory.
   static final RegExp _entrypointFileRegex = RegExp(
-    r'^main\.dart(\.[a-f0-9]+)?\.(js|wasm|mjs)(\.map)?$',
+    r'^main\.dart(_module[0-9]+)?(\.[a-f0-9]+)?\.(js|wasm|mjs)(\.map)?$',
   );
 
   @override
