@@ -2360,4 +2360,30 @@ console.log(mapName);
       expect(configString, contains('"main.dart.89abcdef.wasm":"$expectedHash"'));
     }),
   );
+
+  test(
+    'WebTemplatedFiles excludes canvaskit wasm files from compileTargets in buildConfigString',
+    () => testbed.run(() async {
+      environment.projectDir.childDirectory('web').createSync(recursive: true);
+      environment.buildDir.childFile('main.dart.89abcdef.wasm')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(<int>[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+      environment.buildDir.childDirectory('canvaskit').childFile('skwasm.wasm')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(<int>[0x00, 0x61, 0x73, 0x6d, 0x02, 0x00, 0x00, 0x00]);
+
+      final wasmTarget = Dart2WasmTarget(
+        const WasmCompilerConfig(webContentHash: true),
+        const NoOpAnalytics(),
+      );
+      final target = WebTemplatedFiles(
+        <Map<String, Object?>>[],
+        compileTargets: <Dart2WebTarget>[wasmTarget],
+      );
+
+      final String configString = target.buildConfigString(environment);
+      expect(configString, contains('"main.dart.89abcdef.wasm":'));
+      expect(configString, isNot(contains('"skwasm.wasm":')));
+    }),
+  );
 }

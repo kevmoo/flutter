@@ -128,16 +128,14 @@ const List<String> _kKnownHashedExtensions = <String>[
   '.mjs',
 ];
 
-String _computeHashedBasename(String oldBasename, String contentHash) {
-  for (final String ext in _kKnownHashedExtensions) {
-    if (oldBasename.endsWith(ext)) {
-      final String stem = oldBasename.substring(0, oldBasename.length - ext.length);
-      return '$stem.$contentHash$ext';
-    }
-  }
-  final int extensionIndex = oldBasename.lastIndexOf('.');
-  if (extensionIndex != -1) {
-    return '${oldBasename.substring(0, extensionIndex)}.$contentHash${oldBasename.substring(extensionIndex)}';
+String _computeHashedBasename(String oldBasename, String contentHash, FileSystem fileSystem) {
+  final String doubleExt = fileSystem.path.extension(oldBasename, 2);
+  final String ext = _kKnownHashedExtensions.contains(doubleExt)
+      ? doubleExt
+      : fileSystem.path.extension(oldBasename);
+  if (ext.isNotEmpty) {
+    final String stem = oldBasename.substring(0, oldBasename.length - ext.length);
+    return '$stem.$contentHash$ext';
   }
   return '$oldBasename.$contentHash';
 }
@@ -155,12 +153,12 @@ String _hashAndRenameWebOutput({required File file, File? sourceMapFile}) {
       .convert(file.readAsBytesSync())
       .toString()
       .substring(0, 8);
-  final String newBasename = _computeHashedBasename(file.basename, contentHash);
+  final String newBasename = _computeHashedBasename(file.basename, contentHash, file.fileSystem);
 
   // The source map shares the binary's hash so the pair stays discoverable as
   // '<binary>.map'. A `.wasm` binary embeds its map name in a binary custom
   // section that cannot be rewritten here, so its map keeps the unhashed name.
-  final bool isWasm = file.path.endsWith('.wasm');
+  final bool isWasm = file.fileSystem.path.extension(file.path) == '.wasm';
   if (sourceMapFile != null && sourceMapFile.existsSync() && !isWasm) {
     final String oldMapBasename = sourceMapFile.basename;
     final newMapBasename = '$newBasename.map';
@@ -1244,17 +1242,18 @@ class WebTemplatedFiles extends Target {
     if (!directory.existsSync()) {
       return;
     }
+    final pathContext = directory.fileSystem.path;
     for (final File file in directory.listSync(recursive: true).whereType<File>()) {
-      if (!file.path.endsWith('.wasm')) {
+      if (pathContext.extension(file.path) != '.wasm') {
         continue;
       }
-      final String relativePath = globals.fs.path
-          .relative(file.path, from: directory.path)
-          .replaceAll(r'\', '/');
-      if (skipCanvasKit && relativePath.startsWith('canvaskit/')) {
+      final List<String> segments = pathContext.split(
+        pathContext.relative(file.path, from: directory.path),
+      );
+      if (skipCanvasKit && segments.first == 'canvaskit') {
         continue;
       }
-      wasmHashes[relativePath] = crypto.sha256.convert(file.readAsBytesSync()).toString();
+      wasmHashes[segments.join('/')] = crypto.sha256.convert(file.readAsBytesSync()).toString();
     }
   }
 
@@ -1272,10 +1271,11 @@ class WebTemplatedFiles extends Target {
     _scanDirectoryForWasmHashes(canvasKitDirectory, wasmHashes);
 
     if (compileTargets != null) {
+      final pathContext = environment.fileSystem.path;
       for (final Dart2WebTarget target in compileTargets!) {
         for (final File file in target.buildFiles(environment)) {
-          if (file.path.endsWith('.wasm') &&
-              !file.path.contains('canvaskit/') &&
+          if (pathContext.extension(file.path) == '.wasm' &&
+              !pathContext.split(file.path).contains('canvaskit') &&
               file.existsSync()) {
             wasmHashes[file.basename] = crypto.sha256.convert(file.readAsBytesSync()).toString();
           }
