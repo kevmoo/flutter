@@ -183,6 +183,11 @@ class TextureGLES final : public Texture,
     configured_sampler_key_ = key;
   }
 
+  // |Texture|
+  bool ResizeStorage(ISize new_size) override;
+
+  void InitializeContentsIfNecessary();
+
   // Visible for testing.
   std::optional<HandleGLES> GetSyncFence() const;
 
@@ -239,8 +244,6 @@ class TextureGLES final : public Texture,
 
   // |Texture|
   ISize GetSize() const override;
-
-  void InitializeContentsIfNecessary();
 
   // Allocates storage for `(slice, mip_level)` if it has not been allocated
   // yet, so the subresource can be attached to a framebuffer. Returns false on
