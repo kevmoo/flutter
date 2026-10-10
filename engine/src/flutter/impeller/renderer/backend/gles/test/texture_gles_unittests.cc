@@ -232,4 +232,74 @@ TEST_P(TextureGLESTest, CreatingAndBindingEmptyTexturesDoesNotCrash) {
   ASSERT_EQ(texture, nullptr);
 }
 
+namespace {
+class MockReactorWorker final : public ReactorGLES::Worker {
+ public:
+  bool CanReactorReactOnCurrentThreadNow(
+      const ReactorGLES& reactor) const override {
+    return true;
+  }
+};
+}  // namespace
+
+TEST(TextureGLESMockTest, ResizeStorageReallocatesInPlace) {
+  using ::testing::_;
+  using ::testing::NiceMock;
+
+  auto mock_gles_impl = std::make_unique<NiceMock<MockGLESImpl>>();
+
+  EXPECT_CALL(*mock_gles_impl, GetIntegerv(_, _))
+      .WillRepeatedly([](GLenum name, GLint* value) {
+        if (name == GL_MAX_TEXTURE_SIZE) {
+          *value = 4096;
+        }
+      });
+  EXPECT_CALL(*mock_gles_impl, GenTextures(1, _)).Times(1);
+  EXPECT_CALL(*mock_gles_impl, GenFramebuffers(1, _)).Times(1);
+  EXPECT_CALL(*mock_gles_impl,
+              TexImage2D(GL_TEXTURE_2D, 0, _, 64, 64, 0, _, _, nullptr))
+      .Times(1);
+  EXPECT_CALL(*mock_gles_impl,
+              TexImage2D(GL_TEXTURE_2D, 0, _, 128, 96, 0, _, _, nullptr))
+      .Times(1);
+
+  std::shared_ptr<MockGLES> mock_gl = MockGLES::Init(std::move(mock_gles_impl));
+  auto proc_table = std::make_unique<ProcTableGLES>(kMockResolverGLES);
+  auto worker = std::make_shared<MockReactorWorker>();
+  auto reactor = std::make_shared<ReactorGLES>(std::move(proc_table));
+  reactor->AddWorker(worker);
+
+  TextureDescriptor desc;
+  desc.storage_mode = StorageMode::kDevicePrivate;
+  desc.type = TextureType::kTexture2D;
+  desc.format = PixelFormat::kR8G8B8A8UNormInt;
+  desc.size = {64, 64};
+  desc.mip_count = 1u;
+  desc.usage = TextureUsage::kRenderTarget;
+
+  auto texture = std::make_shared<TextureGLES>(reactor, desc);
+  HandleGLES fbo = reactor->CreateHandle(HandleType::kFrameBuffer);
+  texture->SetCachedFBO(fbo);
+  ASSERT_TRUE(reactor->React());
+
+  const std::optional<GLuint> initial_gl_handle = texture->GetGLHandle();
+  ASSERT_TRUE(initial_gl_handle.has_value());
+  EXPECT_TRUE(texture->Bind());
+
+  // Resizing to the same size is a no-op.
+  EXPECT_TRUE(texture->ResizeStorage({64, 64}));
+
+  // Resizing to a new size reallocates storage via glTexImage2D while keeping
+  // the existing GL texture handle and cached FBO handle intact.
+  EXPECT_TRUE(texture->ResizeStorage({128, 96}));
+  EXPECT_EQ(texture->GetTextureDescriptor().size, ISize(128, 96));
+  EXPECT_EQ(texture->GetGLHandle(), initial_gl_handle);
+  EXPECT_TRUE(HandleGLES::Equal{}(texture->GetCachedFBO(), fbo));
+
+  // Sizes exceeding GL_MAX_TEXTURE_SIZE or empty sizes are rejected.
+  EXPECT_FALSE(texture->ResizeStorage({8192, 96}));
+  EXPECT_FALSE(texture->ResizeStorage({0, 96}));
+  EXPECT_EQ(texture->GetTextureDescriptor().size, ISize(128, 96));
+}
+
 }  // namespace impeller::testing

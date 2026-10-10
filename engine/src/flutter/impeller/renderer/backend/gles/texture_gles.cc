@@ -908,7 +908,7 @@ bool TextureGLES::ResizeStorage(ISize new_size) {
   SetTextureSize(new_size);
   slice_mip_initialized_ = {};
   mipmap_generated_ = false;
-  if (was_initialized || !cached_fbo_.IsDead()) {
+  if (was_initialized || cached_fbo_.IsValid()) {
     InitializeContentsIfNecessary();
   }
   return true;
