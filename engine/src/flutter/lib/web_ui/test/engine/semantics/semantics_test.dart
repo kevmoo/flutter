@@ -51,6 +51,10 @@ void runSemanticsTests() {
     EngineSemantics.debugResetSemantics();
   });
 
+  tearDown(() {
+    EnginePlatformDispatcher.instance.onSemanticsActionEvent = null;
+  });
+
   group(EngineSemanticsOwner, () {
     _testEngineSemanticsOwner();
   });
@@ -4713,30 +4717,42 @@ void _testRoute() {
     semantics().semanticsEnabled = false;
   });
 
-  test('skips non-focusable SemanticScrollable to focus on inner descendant', () async {
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
+  test('skips non-focusable Focusable containers to focus on inner descendant', () async {
+    Future<void> checkContainerRouteDefaultFocus({
+      required SemanticsNodeUpdate Function(
+        SemanticsTester tester,
+        List<SemanticsNodeUpdate> leafChildren,
+      )
+      buildContainer,
+      required Map<int, EngineSemanticsRole> expectedContainerRoles,
+      required int firstLeafId,
+    }) async {
+      // 1. Container wrapping a non-focusable leaf ('Heading') + focusable button:
+      //    route default focus should skip the container and focus the leaf <span>.
+      EngineSemantics.debugResetSemantics();
+      semantics()
+        ..debugOverrideTimestampFunction(() => _testTime)
+        ..semanticsEnabled = true;
 
-    final capturedActions = <CapturedAction>[];
-    EnginePlatformDispatcher.instance.onSemanticsActionEvent = (ui.SemanticsActionEvent event) {
-      capturedActions.add((event.nodeId, event.type, event.arguments));
-    };
+      final capturedActions = <CapturedAction>[];
+      EnginePlatformDispatcher.instance.onSemanticsActionEvent = (ui.SemanticsActionEvent event) {
+        capturedActions.add((event.nodeId, event.type, event.arguments));
+      };
 
-    var tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          flags: const ui.SemanticsFlags(hasImplicitScrolling: true),
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(id: 2, label: 'Heading', rect: const ui.Rect.fromLTRB(0, 0, 100, 50)),
+      var tester = SemanticsTester(owner());
+      tester.updateNode(
+        id: 0,
+        flags: const ui.SemanticsFlags(scopesRoute: true),
+        transform: Matrix4.identity().toFloat64(),
+        children: <SemanticsNodeUpdate>[
+          buildContainer(tester, <SemanticsNodeUpdate>[
             tester.updateNode(
-              id: 3,
+              id: firstLeafId,
+              label: 'Heading',
+              rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
+            ),
+            tester.updateNode(
+              id: firstLeafId + 1,
               label: 'Click me!',
               flags: const ui.SemanticsFlags(
                 isEnabled: ui.Tristate.isTrue,
@@ -4746,36 +4762,38 @@ void _testRoute() {
               hasTap: true,
               rect: const ui.Rect.fromLTRB(0, 50, 100, 100),
             ),
-          ],
-        ),
-      ],
-    );
-    tester.apply();
+          ]),
+        ],
+      );
+      tester.apply();
 
-    expect(capturedActions, isEmpty);
-    expect(tester.getSemanticsObject(1).semanticRole?.kind, EngineSemanticsRole.scrollable);
-    final DomElement span = owner().debugSemanticsTree![2]!.element.querySelectorAll('span').single;
-    expect(span.tabIndex, -1);
-    expect(domDocument.activeElement, span);
+      expect(capturedActions, isEmpty);
+      for (final MapEntry<int, EngineSemanticsRole>(:key, :value)
+          in expectedContainerRoles.entries) {
+        expect(tester.getSemanticsObject(key).semanticRole?.kind, value);
+      }
+      final DomElement span = owner().debugSemanticsTree![firstLeafId]!.element
+          .querySelectorAll('span')
+          .single;
+      expect(span.tabIndex, -1);
+      expect(domDocument.activeElement, span);
 
-    EngineSemantics.debugResetSemantics();
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
+      // 2. Container wrapping only a focusable button:
+      //    route default focus should skip the container and focus the button.
+      EngineSemantics.debugResetSemantics();
+      semantics()
+        ..debugOverrideTimestampFunction(() => _testTime)
+        ..semanticsEnabled = true;
 
-    tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          flags: const ui.SemanticsFlags(hasImplicitScrolling: true),
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
+      tester = SemanticsTester(owner());
+      tester.updateNode(
+        id: 0,
+        flags: const ui.SemanticsFlags(scopesRoute: true),
+        transform: Matrix4.identity().toFloat64(),
+        children: <SemanticsNodeUpdate>[
+          buildContainer(tester, <SemanticsNodeUpdate>[
             tester.updateNode(
-              id: 2,
+              id: firstLeafId,
               label: 'Click me!',
               flags: const ui.SemanticsFlags(
                 isEnabled: ui.Tristate.isTrue,
@@ -4785,327 +4803,96 @@ void _testRoute() {
               hasTap: true,
               rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
             ),
-          ],
-        ),
-      ],
+          ]),
+        ],
+      );
+      tester.apply();
+
+      expect(capturedActions, isEmpty);
+      final DomElement button = tester.getSemanticsObject(firstLeafId).element;
+      expect(button.tabIndex, 0);
+      expect(domDocument.activeElement, button);
+    }
+
+    // SemanticScrollable (hasImplicitScrolling: true)
+    await checkContainerRouteDefaultFocus(
+      buildContainer: (SemanticsTester tester, List<SemanticsNodeUpdate> children) =>
+          tester.updateNode(
+            id: 1,
+            flags: const ui.SemanticsFlags(hasImplicitScrolling: true),
+            rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+            children: children,
+          ),
+      expectedContainerRoles: <int, EngineSemanticsRole>{1: EngineSemanticsRole.scrollable},
+      firstLeafId: 2,
     );
-    tester.apply();
 
-    expect(capturedActions, isEmpty);
-    final DomElement button = tester.getSemanticsObject(2).element;
-    expect(button.tabIndex, 0);
-    expect(domDocument.activeElement, button);
+    // SemanticForm (ui.SemanticsRole.form)
+    await checkContainerRouteDefaultFocus(
+      buildContainer: (SemanticsTester tester, List<SemanticsNodeUpdate> children) =>
+          tester.updateNode(
+            id: 1,
+            role: ui.SemanticsRole.form,
+            rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+            children: children,
+          ),
+      expectedContainerRoles: <int, EngineSemanticsRole>{1: EngineSemanticsRole.form},
+      firstLeafId: 2,
+    );
 
-    semantics().semanticsEnabled = false;
-  });
-
-  test('skips non-focusable SemanticForm to focus on inner descendant', () async {
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    final capturedActions = <CapturedAction>[];
-    EnginePlatformDispatcher.instance.onSemanticsActionEvent = (ui.SemanticsActionEvent event) {
-      capturedActions.add((event.nodeId, event.type, event.arguments));
-    };
-
-    var tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.form,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(id: 2, label: 'Heading', rect: const ui.Rect.fromLTRB(0, 0, 100, 50)),
-            tester.updateNode(
-              id: 3,
-              label: 'Submit',
-              flags: const ui.SemanticsFlags(
-                isEnabled: ui.Tristate.isTrue,
-                isButton: true,
-                isFocused: ui.Tristate.isFalse,
+    // SemanticList -> SemanticListItem
+    await checkContainerRouteDefaultFocus(
+      buildContainer: (SemanticsTester tester, List<SemanticsNodeUpdate> children) =>
+          tester.updateNode(
+            id: 1,
+            role: ui.SemanticsRole.list,
+            rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+            children: <SemanticsNodeUpdate>[
+              tester.updateNode(
+                id: 2,
+                role: ui.SemanticsRole.listItem,
+                rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+                children: children,
               ),
-              hasTap: true,
-              rect: const ui.Rect.fromLTRB(0, 50, 100, 100),
-            ),
-          ],
-        ),
-      ],
+            ],
+          ),
+      expectedContainerRoles: <int, EngineSemanticsRole>{
+        1: EngineSemanticsRole.list,
+        2: EngineSemanticsRole.listItem,
+      },
+      firstLeafId: 3,
     );
-    tester.apply();
 
-    expect(capturedActions, isEmpty);
-    expect(tester.getSemanticsObject(1).semanticRole?.kind, EngineSemanticsRole.form);
-    final DomElement span = owner().debugSemanticsTree![2]!.element.querySelectorAll('span').single;
-    expect(span.tabIndex, -1);
-    expect(domDocument.activeElement, span);
-
-    EngineSemantics.debugResetSemantics();
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.form,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(
-              id: 2,
-              label: 'Submit',
-              flags: const ui.SemanticsFlags(
-                isEnabled: ui.Tristate.isTrue,
-                isButton: true,
-                isFocused: ui.Tristate.isFalse,
+    // SemanticTable -> SemanticRow -> SemanticCell
+    await checkContainerRouteDefaultFocus(
+      buildContainer: (SemanticsTester tester, List<SemanticsNodeUpdate> children) =>
+          tester.updateNode(
+            id: 1,
+            role: ui.SemanticsRole.table,
+            rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+            children: <SemanticsNodeUpdate>[
+              tester.updateNode(
+                id: 2,
+                role: ui.SemanticsRole.row,
+                rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+                children: <SemanticsNodeUpdate>[
+                  tester.updateNode(
+                    id: 3,
+                    role: ui.SemanticsRole.cell,
+                    rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
+                    children: children,
+                  ),
+                ],
               ),
-              hasTap: true,
-              rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-            ),
-          ],
-        ),
-      ],
+            ],
+          ),
+      expectedContainerRoles: <int, EngineSemanticsRole>{
+        1: EngineSemanticsRole.table,
+        2: EngineSemanticsRole.row,
+        3: EngineSemanticsRole.cell,
+      },
+      firstLeafId: 4,
     );
-    tester.apply();
-
-    expect(capturedActions, isEmpty);
-    final DomElement button = tester.getSemanticsObject(2).element;
-    expect(button.tabIndex, 0);
-    expect(domDocument.activeElement, button);
-
-    semantics().semanticsEnabled = false;
-  });
-
-  test('skips non-focusable SemanticList to focus on inner descendant', () async {
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    final capturedActions = <CapturedAction>[];
-    EnginePlatformDispatcher.instance.onSemanticsActionEvent = (ui.SemanticsActionEvent event) {
-      capturedActions.add((event.nodeId, event.type, event.arguments));
-    };
-
-    var tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.list,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(
-              id: 2,
-              role: ui.SemanticsRole.listItem,
-              rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-              children: <SemanticsNodeUpdate>[
-                tester.updateNode(
-                  id: 3,
-                  label: 'Heading',
-                  rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-                ),
-                tester.updateNode(
-                  id: 4,
-                  label: 'Item button',
-                  flags: const ui.SemanticsFlags(
-                    isEnabled: ui.Tristate.isTrue,
-                    isButton: true,
-                    isFocused: ui.Tristate.isFalse,
-                  ),
-                  hasTap: true,
-                  rect: const ui.Rect.fromLTRB(0, 50, 100, 100),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
-    tester.apply();
-
-    expect(capturedActions, isEmpty);
-    expect(tester.getSemanticsObject(1).semanticRole?.kind, EngineSemanticsRole.list);
-    expect(tester.getSemanticsObject(2).semanticRole?.kind, EngineSemanticsRole.listItem);
-    final DomElement span = owner().debugSemanticsTree![3]!.element.querySelectorAll('span').single;
-    expect(span.tabIndex, -1);
-    expect(domDocument.activeElement, span);
-
-    EngineSemantics.debugResetSemantics();
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.list,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(
-              id: 2,
-              role: ui.SemanticsRole.listItem,
-              rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-              children: <SemanticsNodeUpdate>[
-                tester.updateNode(
-                  id: 3,
-                  label: 'Item button',
-                  flags: const ui.SemanticsFlags(
-                    isEnabled: ui.Tristate.isTrue,
-                    isButton: true,
-                    isFocused: ui.Tristate.isFalse,
-                  ),
-                  hasTap: true,
-                  rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
-    tester.apply();
-
-    expect(capturedActions, isEmpty);
-    final DomElement button = tester.getSemanticsObject(3).element;
-    expect(button.tabIndex, 0);
-    expect(domDocument.activeElement, button);
-
-    semantics().semanticsEnabled = false;
-  });
-
-  test('skips non-focusable SemanticTable to focus on inner descendant', () async {
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    final capturedActions = <CapturedAction>[];
-    EnginePlatformDispatcher.instance.onSemanticsActionEvent = (ui.SemanticsActionEvent event) {
-      capturedActions.add((event.nodeId, event.type, event.arguments));
-    };
-
-    var tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.table,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(
-              id: 2,
-              role: ui.SemanticsRole.row,
-              rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-              children: <SemanticsNodeUpdate>[
-                tester.updateNode(
-                  id: 3,
-                  role: ui.SemanticsRole.cell,
-                  rect: const ui.Rect.fromLTRB(0, 0, 100, 100),
-                  children: <SemanticsNodeUpdate>[
-                    tester.updateNode(
-                      id: 4,
-                      label: 'Heading',
-                      rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-                    ),
-                    tester.updateNode(
-                      id: 5,
-                      label: 'Cell button',
-                      flags: const ui.SemanticsFlags(
-                        isEnabled: ui.Tristate.isTrue,
-                        isButton: true,
-                        isFocused: ui.Tristate.isFalse,
-                      ),
-                      hasTap: true,
-                      rect: const ui.Rect.fromLTRB(0, 50, 100, 100),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
-    tester.apply();
-
-    expect(capturedActions, isEmpty);
-    expect(tester.getSemanticsObject(1).semanticRole?.kind, EngineSemanticsRole.table);
-    expect(tester.getSemanticsObject(2).semanticRole?.kind, EngineSemanticsRole.row);
-    expect(tester.getSemanticsObject(3).semanticRole?.kind, EngineSemanticsRole.cell);
-    final DomElement span = owner().debugSemanticsTree![4]!.element.querySelectorAll('span').single;
-    expect(span.tabIndex, -1);
-    expect(domDocument.activeElement, span);
-
-    EngineSemantics.debugResetSemantics();
-    semantics()
-      ..debugOverrideTimestampFunction(() => _testTime)
-      ..semanticsEnabled = true;
-
-    tester = SemanticsTester(owner());
-    tester.updateNode(
-      id: 0,
-      flags: const ui.SemanticsFlags(scopesRoute: true),
-      transform: Matrix4.identity().toFloat64(),
-      children: <SemanticsNodeUpdate>[
-        tester.updateNode(
-          id: 1,
-          role: ui.SemanticsRole.table,
-          rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-          children: <SemanticsNodeUpdate>[
-            tester.updateNode(
-              id: 2,
-              role: ui.SemanticsRole.row,
-              rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-              children: <SemanticsNodeUpdate>[
-                tester.updateNode(
-                  id: 3,
-                  role: ui.SemanticsRole.cell,
-                  rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-                  children: <SemanticsNodeUpdate>[
-                    tester.updateNode(
-                      id: 4,
-                      label: 'Cell button',
-                      flags: const ui.SemanticsFlags(
-                        isEnabled: ui.Tristate.isTrue,
-                        isButton: true,
-                        isFocused: ui.Tristate.isFalse,
-                      ),
-                      hasTap: true,
-                      rect: const ui.Rect.fromLTRB(0, 0, 100, 50),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ],
-        ),
-      ],
-    );
-    tester.apply();
-
-    expect(capturedActions, isEmpty);
-    final DomElement button = tester.getSemanticsObject(4).element;
-    expect(button.tabIndex, 0);
-    expect(domDocument.activeElement, button);
 
     semantics().semanticsEnabled = false;
   });
