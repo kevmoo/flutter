@@ -53,6 +53,7 @@ case "$CRATE" in
   impeller_typographer) check_crate_hygiene impeller_typographer 20 ;;
   impeller_wgpu)        check_crate_hygiene impeller_wgpu 26 ;;
   impeller_canvas)      check_crate_hygiene impeller_canvas 22 ;;
+  impeller_web)         check_crate_hygiene impeller_web 2 ;;
   all)
     check_crate_hygiene impeller_geometry 40
     check_crate_hygiene impeller_path 25
@@ -61,11 +62,12 @@ case "$CRATE" in
     check_crate_hygiene impeller_typographer 20
     check_crate_hygiene impeller_wgpu 26
     check_crate_hygiene impeller_canvas 22
+    check_crate_hygiene impeller_web 2
     CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked -p impeller_canvas --test golden_parity
     CARGO_TARGET_DIR="$TARGET_DIR" cargo run --locked -p impeller_canvas --bin showcase -- "$REPO_ROOT/showcase.png"
     ;;
   *)
-    echo "Usage: $0 [impeller_geometry|impeller_path|impeller_core|impeller_tessellator|impeller_typographer|impeller_wgpu|impeller_canvas|all]"
+    echo "Usage: $0 [impeller_geometry|impeller_path|impeller_core|impeller_tessellator|impeller_typographer|impeller_wgpu|impeller_canvas|impeller_web|all]"
     exit 1
     ;;
 esac

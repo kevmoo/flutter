@@ -8,6 +8,7 @@ members = [
     "crates/impeller_typographer",
     "crates/impeller_wgpu",
     "crates/impeller_canvas",
+    "crates/impeller_web",
 ]
 
 [workspace.package]
@@ -24,13 +25,16 @@ approx = "0.5"
 cosmic-text = { version = "0.12", default-features = false, features = ["std", "swash"] }
 etagere = "0.2.10"
 kurbo = "0.13"
+js-sys = "0.3"
 wasm-bindgen = "0.2"
+wasm-bindgen-cli-support = "=0.2.129"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Document",
     "Element",
     "HtmlCanvasElement",
     "OffscreenCanvas",
+    "Performance",
     "Window",
     "Navigator",
     "WorkerGlobalScope",
@@ -43,3 +47,4 @@ impeller_tessellator = { path = "crates/impeller_tessellator" }
 impeller_typographer = { path = "crates/impeller_typographer" }
 impeller_wgpu = { path = "crates/impeller_wgpu" }
 impeller_canvas = { path = "crates/impeller_canvas" }
+impeller_web = { path = "crates/impeller_web" }

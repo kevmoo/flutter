@@ -38,6 +38,10 @@ struct ColorPoint {
     _pad1: f32,
 };
 
+struct ColorStopsUniform {
+    points: array<ColorPoint, 64>,
+};
+
 @group(0) @binding(0)
 var<uniform> frame_info: FrameInfo;
 
@@ -45,7 +49,7 @@ var<uniform> frame_info: FrameInfo;
 var<uniform> frag_info: FragInfo;
 
 @group(0) @binding(2)
-var<storage, read> color_data: array<ColorPoint>;
+var<uniform> color_data: ColorStopsUniform;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -104,17 +108,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if frag_info.is_fast_two_stop != 0u {
             result_color = mix(frag_info.fast_color_0, frag_info.fast_color_1, clamp(t, 0.0, 1.0));
         } else if frag_info.colors_length == 1u {
-            result_color = color_data[0u].color;
+            result_color = color_data.points[0u].color;
         } else if frag_info.colors_length > 1u {
-            let last_idx = frag_info.colors_length - 1u;
-            if t <= color_data[0u].stop {
-                result_color = color_data[0u].color;
-            } else if t >= color_data[last_idx].stop {
-                result_color = color_data[last_idx].color;
+            let clamped_len = min(frag_info.colors_length, 64u);
+            let last_idx = clamped_len - 1u;
+            if t <= color_data.points[0u].stop {
+                result_color = color_data.points[0u].color;
+            } else if t >= color_data.points[last_idx].stop {
+                result_color = color_data.points[last_idx].color;
             } else {
-                for (var i: u32 = 1u; i < frag_info.colors_length; i = i + 1u) {
-                    let prev_point = color_data[i - 1u];
-                    let current_point = color_data[i];
+                for (var i: u32 = 1u; i < clamped_len; i = i + 1u) {
+                    let prev_point = color_data.points[i - 1u];
+                    let current_point = color_data.points[i];
                     if t >= prev_point.stop && t <= current_point.stop {
                         if current_point.inverse_delta > 1000.0 {
                             result_color = current_point.color;

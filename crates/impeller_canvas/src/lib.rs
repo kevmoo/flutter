@@ -21,6 +21,7 @@ use std::path::Path as FsPath;
 use std::sync::Arc;
 
 pub use impeller_wgpu::WgpuRenderer as WgpuContext;
+pub type FontId = BuiltinFont;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum DrawStyle {
@@ -1011,6 +1012,10 @@ impl Canvas {
         self.sync_glyph_atlases();
     }
 
+    pub fn take_typographer(&mut self) -> Option<TypographerContext> {
+        self.typographer.take()
+    }
+
     pub fn typographer(&self) -> Option<&TypographerContext> {
         self.typographer.as_ref()
     }
@@ -1042,10 +1047,7 @@ impl Canvas {
         self.typographer_mut().shape_text(s, style, origin)
     }
 
-    fn sync_glyph_atlases(&mut self) {
-        let Some(ref typographer) = self.typographer else {
-            return;
-        };
+    pub fn sync_glyph_atlases_with(&mut self, typographer: &TypographerContext) {
         let alpha_gen = typographer.alpha_atlas.generation;
         let alpha_arc = match &self.cached_alpha_atlas {
             Some((g, arc)) if *g == alpha_gen => Arc::clone(arc),
@@ -1076,6 +1078,57 @@ impl Canvas {
                 }
             }
         }
+    }
+
+    pub fn emit_glyph_quads_batch(
+        &mut self,
+        quads: Vec<AtlasGlyphQuad>,
+        transform: Matrix,
+        use_linear_filter: bool,
+    ) {
+        if quads.is_empty() {
+            return;
+        }
+        let Some(top) = self.stack.last() else {
+            return;
+        };
+        if top.clip_rects.is_empty() {
+            return;
+        }
+        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
+            top.clip_rects.iter().copied().map(Some).collect()
+        } else {
+            vec![None]
+        };
+        for clip_rect in clip_targets {
+            let command_index = self.commands.len();
+            self.glyph_batches.push(PendingGlyphBatch {
+                command_index,
+                transform,
+                quads: quads.clone(),
+                blend_mode: BlendMode::SrcOver,
+                clip_rect,
+            });
+            self.commands.push(DrawCommand::GlyphAtlas(
+                GlyphAtlasBatch::new(
+                    quads.clone(),
+                    transform,
+                    None,
+                    None,
+                    BlendMode::SrcOver,
+                    clip_rect,
+                )
+                .with_linear_filter(use_linear_filter),
+            ));
+        }
+    }
+
+    fn sync_glyph_atlases(&mut self) {
+        let Some(typographer) = self.typographer.take() else {
+            return;
+        };
+        self.sync_glyph_atlases_with(&typographer);
+        self.typographer = Some(typographer);
     }
 
     pub fn width(&self) -> u32 {
@@ -2167,7 +2220,12 @@ pub struct ShowcaseStats {
 pub fn build_showcase_canvas() -> Canvas {
     let bg = Color::new(0.06, 0.07, 0.10, 1.0);
     let mut canvas = Canvas::new(800, 600, bg);
+    draw_showcase_scene(&mut canvas);
+    canvas
+}
 
+/// Draws the 800x600 4-quadrant Impeller GPU diagnostic showcase scene onto `canvas`.
+pub fn draw_showcase_scene(canvas: &mut Canvas) {
     let panel_bg = Paint::fill(Color::new(0.10, 0.12, 0.17, 1.0));
     let panel_radii = RoundingRadii::from_single_radius(14.0);
 
@@ -2692,7 +2750,1282 @@ pub fn build_showcase_canvas() -> Canvas {
     canvas.restore();
 
     canvas.restore();
-    canvas
+}
+
+const QUARTER_CIRCLE_5: [(Scalar, Scalar); 5] = [
+    (1.0, 0.0),
+    (0.9238795, 0.38268343),
+    (0.70710677, 0.70710677),
+    (0.38268343, 0.9238795),
+    (0.0, 1.0),
+];
+
+fn append_filled_rect_mesh(mesh: &mut TessellatedMesh, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    let l = rect.get_left();
+    let t = rect.get_top();
+    let r = rect.get_right();
+    let b = rect.get_bottom();
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&[
+        Vertex2D::new(l, t),
+        Vertex2D::new(r, t),
+        Vertex2D::new(r, b),
+        Vertex2D::new(l, b),
+    ]);
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn build_rrect_perimeter(rect: Rect, rx: Scalar, ry: Scalar) -> [Vertex2D; 20] {
+    let l = rect.get_left();
+    let t = rect.get_top();
+    let r = rect.get_right();
+    let b = rect.get_bottom();
+    let rx = rx.clamp(0.0, rect.get_width() * 0.5);
+    let ry = ry.clamp(0.0, rect.get_height() * 0.5);
+
+    let mut pts = [Vertex2D::new(0.0, 0.0); 20];
+    // Bottom-right (0..5): center (r - rx, b - ry), +x * cos, +y * sin
+    for (i, &(c, s)) in QUARTER_CIRCLE_5.iter().enumerate() {
+        pts[i] = Vertex2D::new((r - rx) + rx * c, (b - ry) + ry * s);
+    }
+    // Bottom-left (5..10): center (l + rx, b - ry), -x * sin, +y * cos
+    for (i, &(c, s)) in QUARTER_CIRCLE_5.iter().enumerate() {
+        pts[5 + i] = Vertex2D::new((l + rx) - rx * s, (b - ry) + ry * c);
+    }
+    // Top-left (10..15): center (l + rx, t + ry), -x * cos, -y * sin
+    for (i, &(c, s)) in QUARTER_CIRCLE_5.iter().enumerate() {
+        pts[10 + i] = Vertex2D::new((l + rx) - rx * c, (t + ry) - ry * s);
+    }
+    // Top-right (15..20): center (r - rx, t + ry), +x * sin, -y * cos
+    for (i, &(c, s)) in QUARTER_CIRCLE_5.iter().enumerate() {
+        pts[15 + i] = Vertex2D::new((r - rx) + rx * s, (t + ry) - ry * c);
+    }
+    pts
+}
+
+fn append_filled_rrect_mesh(mesh: &mut TessellatedMesh, rect: Rect, rx: Scalar, ry: Scalar) {
+    if rect.is_empty() {
+        return;
+    }
+    if rx <= 0.5 && ry <= 0.5 {
+        append_filled_rect_mesh(mesh, rect);
+        return;
+    }
+    let pts = build_rrect_perimeter(rect, rx, ry);
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&pts);
+    for i in 1..19u32 {
+        mesh.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+    }
+}
+
+fn append_stroked_rrect_mesh(
+    mesh: &mut TessellatedMesh,
+    rect: Rect,
+    rx: Scalar,
+    ry: Scalar,
+    stroke_width: Scalar,
+) {
+    if rect.is_empty() || stroke_width <= 0.0 {
+        return;
+    }
+    let half = stroke_width * 0.5;
+    let outer_rect = Rect::from_ltrb(
+        rect.get_left() - half,
+        rect.get_top() - half,
+        rect.get_right() + half,
+        rect.get_bottom() + half,
+    );
+    let inner_w = (rect.get_width() - stroke_width).max(0.0);
+    let inner_h = (rect.get_height() - stroke_width).max(0.0);
+    if inner_w <= 0.0 || inner_h <= 0.0 {
+        append_filled_rrect_mesh(mesh, outer_rect, rx + half, ry + half);
+        return;
+    }
+    let inner_rect = Rect::from_xywh(
+        rect.get_left() + half,
+        rect.get_top() + half,
+        inner_w,
+        inner_h,
+    );
+    let outer_pts = build_rrect_perimeter(outer_rect, rx + half, ry + half);
+    let inner_pts = build_rrect_perimeter(inner_rect, (rx - half).max(0.0), (ry - half).max(0.0));
+    let base = mesh.vertices.len() as u32;
+    for i in 0..20 {
+        mesh.vertices.push(outer_pts[i]);
+        mesh.vertices.push(inner_pts[i]);
+    }
+    for i in 0..20u32 {
+        let next = (i + 1) % 20;
+        let o0 = base + i * 2;
+        let i0 = o0 + 1;
+        let o1 = base + next * 2;
+        let i1 = o1 + 1;
+        mesh.indices
+            .extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
+    }
+}
+
+fn append_filled_circle_mesh(mesh: &mut TessellatedMesh, center: Point, radius: Scalar) {
+    if radius <= 0.0 {
+        return;
+    }
+    let base = mesh.vertices.len() as u32;
+    const N: usize = 16;
+    for i in 0..N {
+        let angle = (i as Scalar) * (2.0 * std::f32::consts::PI / (N as Scalar));
+        let (s, c) = angle.sin_cos();
+        mesh.vertices
+            .push(Vertex2D::new(center.x + radius * c, center.y + radius * s));
+    }
+    for i in 1..(N as u32 - 1) {
+        mesh.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+    }
+}
+
+fn append_stroked_arc_mesh(
+    mesh: &mut TessellatedMesh,
+    center: Point,
+    radii: Size,
+    start_angle: Scalar,
+    sweep_angle: Scalar,
+    stroke_w: Scalar,
+    segments: usize,
+) {
+    let rx = radii.width;
+    let ry = radii.height;
+    if rx <= 0.0 || ry <= 0.0 || stroke_w <= 0.0 || sweep_angle.abs() <= 1e-4 {
+        return;
+    }
+    let segs = segments.max(4);
+    let half = stroke_w * 0.5;
+    let rx_out = rx + half;
+    let ry_out = ry + half;
+    let rx_in = (rx - half).max(0.0);
+    let ry_in = (ry - half).max(0.0);
+    let base = mesh.vertices.len() as u32;
+    for i in 0..=segs {
+        let t = (i as Scalar) / (segs as Scalar);
+        let a = start_angle + sweep_angle * t;
+        let (s, c) = a.sin_cos();
+        mesh.vertices
+            .push(Vertex2D::new(center.x + rx_out * c, center.y + ry_out * s));
+        mesh.vertices
+            .push(Vertex2D::new(center.x + rx_in * c, center.y + ry_in * s));
+    }
+    for i in 0..(segs as u32) {
+        let o0 = base + i * 2;
+        let i0 = o0 + 1;
+        let o1 = base + (i + 1) * 2;
+        let i1 = o1 + 1;
+        mesh.indices
+            .extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
+    }
+}
+
+fn append_stroked_polyline_mesh(
+    mesh: &mut TessellatedMesh,
+    points: &[Point],
+    stroke_w: Scalar,
+) {
+    if points.len() < 2 || stroke_w <= 0.0 {
+        return;
+    }
+    let half = stroke_w * 0.5;
+    for pair in points.windows(2) {
+        let p0 = pair[0];
+        let p1 = pair[1];
+        let dx = p1.x - p0.x;
+        let dy = p1.y - p0.y;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 1e-4 {
+            continue;
+        }
+        let nx = -dy / len * half;
+        let ny = dx / len * half;
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices.extend_from_slice(&[
+            Vertex2D::new(p0.x + nx, p0.y + ny),
+            Vertex2D::new(p1.x + nx, p1.y + ny),
+            Vertex2D::new(p1.x - nx, p1.y - ny),
+            Vertex2D::new(p0.x - nx, p0.y - ny),
+        ]);
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapedLabelKey {
+    text: String,
+    font: BuiltinFont,
+    font_size_milli: u32,
+    line_height_milli: u32,
+    max_width_milli: Option<u32>,
+}
+
+struct FrameLabelShaper<'a> {
+    typographer: &'a mut TypographerContext,
+    base_tx: Matrix,
+    cache: std::collections::HashMap<ShapedLabelKey, Vec<AtlasGlyphQuad>>,
+    quads: Vec<AtlasGlyphQuad>,
+}
+
+impl<'a> FrameLabelShaper<'a> {
+    fn new(typographer: &'a mut TypographerContext, base_tx: Matrix, capacity: usize) -> Self {
+        Self {
+            typographer,
+            base_tx,
+            cache: std::collections::HashMap::with_capacity(32),
+            quads: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push_text(
+        &mut self,
+        text: &str,
+        style: TextStyle,
+        logical_origin: Point,
+        clip_bounds: Option<Rect>,
+    ) {
+        let dev_pt = self.base_tx.transform_point(logical_origin);
+        let dev_origin_x = dev_pt.x.round();
+        let dev_origin_y = dev_pt.y.round();
+        let scale_y = self.base_tx.e(1, 1).abs().clamp(0.25, 8.0);
+        let scale_x = self.base_tx.e(0, 0).abs().clamp(0.25, 8.0);
+
+        let scaled_font_size = (style.font_size * scale_y).round().max(1.0);
+        let scaled_line_height = (style.line_height * scale_y).round().max(1.0);
+        let scaled_max_w = style.max_width.map(|w| (w * scale_x).round().max(1.0));
+        let key = ShapedLabelKey {
+            text: text.to_string(),
+            font: style.font,
+            font_size_milli: (scaled_font_size * 1000.0) as u32,
+            line_height_milli: (scaled_line_height * 1000.0) as u32,
+            max_width_milli: scaled_max_w.map(|w| (w * 1000.0) as u32),
+        };
+
+        if !self.cache.contains_key(&key) {
+            let frame = self.typographer.shape_text(
+                text,
+                TextStyle {
+                    font: style.font,
+                    font_size: scaled_font_size,
+                    line_height: scaled_line_height,
+                    color: Color::WHITE,
+                    max_width: scaled_max_w,
+                },
+                Point::ZERO,
+            );
+            self.cache.insert(key.clone(), frame.quads);
+        }
+
+        let dev_clip = clip_bounds.map(|r| {
+            let p0 = self.base_tx.transform_point(Point::new(r.get_left(), r.get_top()));
+            let p1 = self
+                .base_tx
+                .transform_point(Point::new(r.get_right(), r.get_bottom()));
+            Rect::from_ltrb(
+                p0.x.min(p1.x),
+                p0.y.min(p1.y),
+                p0.x.max(p1.x),
+                p0.y.max(p1.y),
+            )
+        });
+
+        if let Some(template_quads) = self.cache.get(&key) {
+            for q in template_quads {
+                let dest_rect = Rect::from_xywh(
+                    q.dest_rect.get_left() + dev_origin_x,
+                    q.dest_rect.get_top() + dev_origin_y,
+                    q.dest_rect.get_width(),
+                    q.dest_rect.get_height(),
+                );
+                if let Some(clip) = dev_clip {
+                    if dest_rect.get_right() > clip.get_right() + 1.0
+                        || dest_rect.get_bottom() > clip.get_bottom() + 1.0
+                        || dest_rect.get_left() < clip.get_left() - 1.0
+                        || dest_rect.get_top() < clip.get_top() - 1.0
+                    {
+                        continue;
+                    }
+                }
+                self.quads.push(AtlasGlyphQuad {
+                    dest_rect,
+                    atlas_rect: q.atlas_rect,
+                    color: style.color,
+                    is_color: q.is_color,
+                });
+            }
+        }
+    }
+
+    fn push_icon(
+        &mut self,
+        icon_font: FontId,
+        icon: MaterialIcon,
+        logical_size: Scalar,
+        color: Color,
+        logical_origin: Point,
+        clip_bounds: Option<Rect>,
+    ) {
+        let mut buf = [0u8; 4];
+        let s = icon.codepoint().encode_utf8(&mut buf);
+        self.push_text(
+            s,
+            TextStyle {
+                font: icon_font,
+                font_size: logical_size,
+                line_height: logical_size,
+                color,
+                max_width: None,
+            },
+            logical_origin,
+            clip_bounds,
+        );
+    }
+}
+
+/// Renders the `flutter-wasm-compare` `MorphingLayoutMatrix` (`morphing_layout_matrix.dart`)
+/// workload onto `canvas`:
+/// - Computes dynamic grid `columns`, `rows`, `dynamic_aspect = (width / height) * (1.0 + 0.35 * sin(anim_value * 2 * PI))`,
+///   and cell dimensions with `min_cell_extent = 8.0`.
+/// - Draws `node_count` polymorphic cards (`WAVE`, `CORE`, `SYNC`, `Node`, `TH`, `WASM`) with batched
+///   GPU draw commands and adaptive label/glyph caching for 1,000+ and 5,000+ card grids.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_morphing_grid_workload(
+    canvas: &mut Canvas,
+    typographer: &mut TypographerContext,
+    font_id: FontId,
+    mono_font_id: FontId,
+    icon_font_id: FontId,
+    width: Scalar,
+    height: Scalar,
+    node_count: usize,
+    anim_value: Scalar,
+) {
+    if node_count == 0 || width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    let t = (anim_value * 2.0 * std::f32::consts::PI).sin();
+    let dynamic_aspect = (width / height) * (1.0 + 0.35 * t);
+    let columns = ((node_count as Scalar * dynamic_aspect).sqrt().round() as usize)
+        .clamp(1, node_count);
+    let rows = node_count.div_ceil(columns);
+
+    let min_cell_extent: Scalar = 8.0;
+    let raw_spacing: Scalar = if node_count > 1000 {
+        1.0
+    } else if node_count > 200 {
+        2.0
+    } else {
+        4.0
+    };
+    let max_spacing_x = if columns > 1 {
+        ((width - (columns as Scalar) * min_cell_extent) / ((columns - 1) as Scalar))
+            .clamp(0.0, raw_spacing)
+    } else {
+        0.0
+    };
+    let max_spacing_y = if rows > 1 {
+        ((height - (rows as Scalar) * min_cell_extent) / ((rows - 1) as Scalar))
+            .clamp(0.0, raw_spacing)
+    } else {
+        0.0
+    };
+    let spacing = max_spacing_x.min(max_spacing_y);
+
+    let total_spacing_x = spacing * (columns.saturating_sub(1) as Scalar);
+    let total_spacing_y = spacing * (rows.saturating_sub(1) as Scalar);
+    let cell_w = ((width - total_spacing_x) / (columns as Scalar)).max(min_cell_extent);
+    let cell_h = ((height - total_spacing_y) / (rows as Scalar)).max(min_cell_extent);
+
+    let sx = cell_w / 140.0;
+    let sy = cell_h / 80.0;
+    let avg_scale = (sx + sy) * 0.5;
+    let skip_glyphs = (node_count > 400 && cell_h < 22.0) || cell_h < 12.0 || cell_w < 20.0;
+    let use_static_labels = node_count > 120;
+    let draw_borders = node_count <= 1200 && cell_w >= 20.0 && cell_h >= 12.0;
+
+    let mut card_bg_mesh = TessellatedMesh::default();
+    let mut card_border_mesh = TessellatedMesh::default();
+    let mut track_mesh = TessellatedMesh::default();
+    let mut amber_fill_mesh = TessellatedMesh::default();
+    let mut amber_stroke_mesh = TessellatedMesh::default();
+    let mut teal_fill_mesh = TessellatedMesh::default();
+    let mut teal_stroke_mesh = TessellatedMesh::default();
+    let mut orange_mesh = TessellatedMesh::default();
+    let mut cyan_mesh = TessellatedMesh::default();
+    let mut purple_mesh = TessellatedMesh::default();
+    let mut green_status_mesh = TessellatedMesh::default();
+    let mut dim_status_mesh = TessellatedMesh::default();
+
+    let base_tx = canvas.get_current_transform();
+    let mut shaper = FrameLabelShaper::new(
+        typographer,
+        base_tx,
+        if skip_glyphs { 0 } else { node_count * 8 },
+    );
+
+    let orange = Color::make_rgba8(0xFF, 0xAB, 0x40, 0xFF);
+    let cyan = Color::make_rgba8(0x18, 0xFF, 0xFF, 0xFF);
+    let purple = Color::make_rgba8(0xE0, 0x40, 0xFB, 0xFF);
+    let amber = Color::make_rgba8(0xFF, 0xD7, 0x40, 0xFF);
+    let green_active = Color::make_rgba8(0x69, 0xF0, 0xAE, 0xFF);
+    let dim_inactive = Color::new(1.0, 1.0, 1.0, 0.38);
+    let teal = Color::make_rgba8(0x64, 0xFF, 0xDA, 0xFF);
+
+    for index in 0..node_count {
+        let col = index % columns;
+        let row = index / columns;
+        let x = (col as Scalar) * (cell_w + spacing);
+        let y = (row as Scalar) * (cell_h + spacing);
+        if x >= width || y >= height {
+            continue;
+        }
+
+        let card_rect = Rect::from_xywh(
+            x + 1.0 * sx,
+            y + 1.0 * sy,
+            (138.0 * sx).max(1.0),
+            (78.0 * sy).max(1.0),
+        );
+        let card_rx = 4.0 * sx;
+        let card_ry = 4.0 * sy;
+        append_filled_rrect_mesh(&mut card_bg_mesh, card_rect, card_rx, card_ry);
+        if draw_borders {
+            append_stroked_rrect_mesh(
+                &mut card_border_mesh,
+                card_rect,
+                card_rx,
+                card_ry,
+                (1.0 * avg_scale).max(0.75),
+            );
+        }
+
+        let clip = Some(card_rect);
+        match index % 6 {
+            0 => {
+                // WAVE sparkline card
+                let x0 = x + 8.0 * sx;
+                let y0 = y + 26.0 * sy;
+                let w = 124.0 * sx;
+                let h = 44.0 * sy;
+                let pts_len = if node_count > 400 { 5usize } else { 8usize };
+                let mut pts = [Point::ZERO; 8];
+                for (i, pt) in pts.iter_mut().enumerate().take(pts_len) {
+                    let px = x0 + (i as Scalar / (pts_len - 1) as Scalar) * w;
+                    let phase = anim_value * 2.0 * std::f32::consts::PI
+                        + (i as Scalar) * 0.7
+                        + (index as Scalar);
+                    let py = (y0 + h * 0.5) + phase.sin() * (h * 0.35);
+                    *pt = Point::new(px, py);
+                }
+                append_stroked_polyline_mesh(
+                    &mut orange_mesh,
+                    &pts[..pts_len],
+                    (2.0 * avg_scale).max(1.0),
+                );
+                if !skip_glyphs {
+                    let label = if use_static_labels {
+                        "WAVE".to_string()
+                    } else {
+                        format!("WAVE #{index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 13.0 * sy,
+                            color: orange,
+                            max_width: None,
+                        },
+                        Point::new(x + 8.0 * sx, y + 8.0 * sy),
+                        clip,
+                    );
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::ShowChart,
+                        14.0 * sy,
+                        orange,
+                        Point::new(x + 118.0 * sx, y + 7.0 * sy),
+                        clip,
+                    );
+                }
+            }
+            1 => {
+                // CORE gauge card
+                let gauge_frac = ((anim_value * 3.0 * std::f32::consts::PI
+                    + (index as Scalar) * 1.2)
+                    .sin()
+                    + 1.0)
+                    * 0.5;
+                let bar_rect = Rect::from_xywh(
+                    x + 8.0 * sx,
+                    y + 62.0 * sy,
+                    (124.0 * gauge_frac.clamp(0.15, 1.0)) * sx,
+                    (4.0 * sy).max(1.0),
+                );
+                append_filled_rrect_mesh(&mut cyan_mesh, bar_rect, 2.0 * sx, 2.0 * sy);
+                if !skip_glyphs {
+                    let title = if use_static_labels {
+                        "CORE".to_string()
+                    } else {
+                        format!("CORE #{index}")
+                    };
+                    let ops = if use_static_labels {
+                        "75 ops".to_string()
+                    } else {
+                        let gauge = (gauge_frac * 100.0).round() as i32;
+                        format!("{gauge} ops")
+                    };
+                    shaper.push_text(
+                        &title,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 13.0 * sy,
+                            color: cyan,
+                            max_width: None,
+                        },
+                        Point::new(x + 8.0 * sx, y + 18.0 * sy),
+                        clip,
+                    );
+                    shaper.push_text(
+                        &ops,
+                        TextStyle {
+                            font: mono_font_id,
+                            font_size: 13.0 * sy,
+                            line_height: 16.0 * sy,
+                            color: Color::WHITE,
+                            max_width: None,
+                        },
+                        Point::new(x + 8.0 * sx, y + 38.0 * sy),
+                        clip,
+                    );
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::Speed,
+                        22.0 * sy,
+                        cyan,
+                        Point::new(x + 106.0 * sx, y + 26.0 * sy),
+                        clip,
+                    );
+                }
+            }
+            2 => {
+                // SYNC circular + linear progress card
+                let progress = (((anim_value * 2.0 * std::f32::consts::PI
+                    + (index as Scalar) * 0.5)
+                    .cos()
+                    + 1.0)
+                    * 0.5)
+                    .clamp(0.15, 0.95);
+                let center = Point::new(x + 22.0 * sx, y + 40.0 * sy);
+                let arc_segs = if node_count > 400 { 8 } else { 14 };
+                append_stroked_arc_mesh(
+                    &mut track_mesh,
+                    center,
+                    Size::new(12.0 * sx, 12.0 * sy),
+                    0.0,
+                    2.0 * std::f32::consts::PI,
+                    (3.2 * avg_scale).max(1.0),
+                    arc_segs,
+                );
+                append_stroked_arc_mesh(
+                    &mut purple_mesh,
+                    center,
+                    Size::new(12.0 * sx, 12.0 * sy),
+                    -std::f32::consts::FRAC_PI_2,
+                    progress * 2.0 * std::f32::consts::PI,
+                    (3.2 * avg_scale).max(1.0),
+                    arc_segs,
+                );
+                let bar_track = Rect::from_xywh(
+                    x + 42.0 * sx,
+                    y + 44.0 * sy,
+                    86.0 * sx,
+                    (5.0 * sy).max(1.0),
+                );
+                let bar_fill = Rect::from_xywh(
+                    x + 42.0 * sx,
+                    y + 44.0 * sy,
+                    86.0 * progress * sx,
+                    (5.0 * sy).max(1.0),
+                );
+                append_filled_rrect_mesh(&mut track_mesh, bar_track, 2.5 * sx, 2.5 * sy);
+                append_filled_rrect_mesh(&mut purple_mesh, bar_fill, 2.5 * sx, 2.5 * sy);
+                if !skip_glyphs {
+                    let label = if use_static_labels {
+                        "SYNC".to_string()
+                    } else {
+                        format!("SYNC {index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 13.0 * sy,
+                            color: purple,
+                            max_width: None,
+                        },
+                        Point::new(x + 42.0 * sx, y + 22.0 * sy),
+                        clip,
+                    );
+                }
+            }
+            3 => {
+                // Node amber pill chip card
+                let chip_rect = Rect::from_xywh(
+                    x + 20.0 * sx,
+                    y + 24.0 * sy,
+                    100.0 * sx,
+                    32.0 * sy,
+                );
+                append_filled_rrect_mesh(&mut amber_fill_mesh, chip_rect, 16.0 * sx, 16.0 * sy);
+                if draw_borders {
+                    append_stroked_rrect_mesh(
+                        &mut amber_stroke_mesh,
+                        chip_rect,
+                        16.0 * sx,
+                        16.0 * sy,
+                        (1.0 * avg_scale).max(0.75),
+                    );
+                }
+                if !skip_glyphs {
+                    let icon = if index % 2 == 1 {
+                        MaterialIcon::Bolt
+                    } else {
+                        MaterialIcon::AutoAwesome
+                    };
+                    shaper.push_icon(
+                        icon_font_id,
+                        icon,
+                        14.0 * sy,
+                        amber,
+                        Point::new(x + 30.0 * sx, y + 32.0 * sy),
+                        clip,
+                    );
+                    let label = if use_static_labels {
+                        "Node".to_string()
+                    } else {
+                        format!("Node {index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 13.0 * sy,
+                            color: amber,
+                            max_width: None,
+                        },
+                        Point::new(x + 48.0 * sx, y + 33.0 * sy),
+                        clip,
+                    );
+                }
+            }
+            4 => {
+                // TH status card
+                let active = (anim_value * 4.0 * std::f32::consts::PI + (index as Scalar)).sin()
+                    > 0.0;
+                let color = if active { green_active } else { dim_inactive };
+                let target_mesh = if active {
+                    &mut green_status_mesh
+                } else {
+                    &mut dim_status_mesh
+                };
+                if skip_glyphs {
+                    append_filled_circle_mesh(
+                        target_mesh,
+                        Point::new(x + 114.0 * sx, y + 38.0 * sy),
+                        (7.0 * avg_scale).max(1.5),
+                    );
+                } else {
+                    let label = if use_static_labels {
+                        "TH".to_string()
+                    } else {
+                        format!("TH #{index}")
+                    };
+                    let icon = if active {
+                        MaterialIcon::CheckCircle
+                    } else {
+                        MaterialIcon::RadioButtonUnchecked
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 14.0 * sy,
+                            color,
+                            max_width: None,
+                        },
+                        Point::new(x + 10.0 * sx, y + 32.0 * sy),
+                        clip,
+                    );
+                    shaper.push_icon(
+                        icon_font_id,
+                        icon,
+                        18.0 * sy,
+                        color,
+                        Point::new(x + 108.0 * sx, y + 29.0 * sy),
+                        clip,
+                    );
+                }
+            }
+            _ => {
+                // WASM teal box card
+                let box_rect = Rect::from_xywh(
+                    x + 16.0 * sx,
+                    y + 24.0 * sy,
+                    108.0 * sx,
+                    32.0 * sy,
+                );
+                append_filled_rrect_mesh(&mut teal_fill_mesh, box_rect, 5.0 * sx, 5.0 * sy);
+                if draw_borders {
+                    append_stroked_rrect_mesh(
+                        &mut teal_stroke_mesh,
+                        box_rect,
+                        5.0 * sx,
+                        5.0 * sy,
+                        (1.2 * avg_scale).max(0.75),
+                    );
+                }
+                if !skip_glyphs {
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::Memory,
+                        14.0 * sy,
+                        teal,
+                        Point::new(x + 24.0 * sx, y + 32.0 * sy),
+                        clip,
+                    );
+                    let label = if use_static_labels {
+                        "WASM".to_string()
+                    } else {
+                        format!("WASM #{index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: mono_font_id,
+                            font_size: 11.0 * sy,
+                            line_height: 13.0 * sy,
+                            color: teal,
+                            max_width: None,
+                        },
+                        Point::new(x + 42.0 * sx, y + 33.0 * sy),
+                        clip,
+                    );
+                }
+            }
+        }
+    }
+
+    canvas.emit_mesh(
+        card_bg_mesh,
+        &Paint::fill(Color::make_rgba8(0x13, 0x17, 0x22, 0xFF)),
+    );
+    canvas.emit_mesh(
+        card_border_mesh,
+        &Paint::fill(Color::new(1.0, 1.0, 1.0, 0.14)),
+    );
+    canvas.emit_mesh(track_mesh, &Paint::fill(Color::new(1.0, 1.0, 1.0, 0.14)));
+    canvas.emit_mesh(
+        amber_fill_mesh,
+        &Paint::fill(Color::new(1.0, 0.76, 0.03, 0.18)),
+    );
+    canvas.emit_mesh(
+        amber_stroke_mesh,
+        &Paint::fill(Color::new(1.0, 0.84, 0.25, 0.42)),
+    );
+    canvas.emit_mesh(
+        teal_fill_mesh,
+        &Paint::fill(Color::new(0.39, 1.0, 0.85, 0.16)),
+    );
+    canvas.emit_mesh(
+        teal_stroke_mesh,
+        &Paint::fill(Color::new(0.39, 1.0, 0.85, 0.45)),
+    );
+    canvas.emit_mesh(orange_mesh, &Paint::fill(orange));
+    canvas.emit_mesh(cyan_mesh, &Paint::fill(cyan));
+    canvas.emit_mesh(purple_mesh, &Paint::fill(purple));
+    canvas.emit_mesh(green_status_mesh, &Paint::fill(green_active));
+    canvas.emit_mesh(dim_status_mesh, &Paint::fill(dim_inactive));
+
+    let glyph_quads = shaper.quads;
+    canvas.emit_glyph_quads_batch(glyph_quads, Matrix::IDENTITY, false);
+    canvas.sync_glyph_atlases_with(typographer);
+}
+
+fn collect_bouncy_leaves(
+    node_index: usize,
+    count: usize,
+    depth: usize,
+    rect: Rect,
+    anim_value: Scalar,
+    leaves: &mut Vec<(usize, Rect)>,
+) {
+    if count <= 1 || rect.get_width() < 6.0 || rect.get_height() < 6.0 {
+        leaves.push((node_index, rect));
+        return;
+    }
+
+    let left_count = count / 2;
+    let right_count = count - left_count;
+
+    let hash = (node_index as u64).wrapping_mul(2654435761);
+    let is_reversed = ((hash >> 16) & 1) == 1;
+    let phase_offset = ((node_index as Scalar) * 0.17) % 1.0;
+    let local_t = (anim_value + phase_offset) % 1.0;
+    let wave = (local_t * 2.0 * std::f32::consts::PI).sin();
+    let delta = (wave * 3200.0).round() as i32;
+    let flex1 = (5000 + delta).clamp(1200, 8800) as Scalar;
+    let flex2 = (5000 - delta).clamp(1200, 8800) as Scalar;
+    let ratio1 = flex1 / (flex1 + flex2);
+
+    let (first_idx, first_cnt, second_idx, second_cnt) = if is_reversed {
+        (
+            node_index + left_count,
+            right_count,
+            node_index + 1,
+            left_count,
+        )
+    } else {
+        (
+            node_index + 1,
+            left_count,
+            node_index + left_count,
+            right_count,
+        )
+    };
+
+    if depth.is_multiple_of(2) {
+        let h1 = rect.get_height() * ratio1;
+        let r1 = Rect::from_xywh(rect.get_left(), rect.get_top(), rect.get_width(), h1);
+        let r2 = Rect::from_xywh(
+            rect.get_left(),
+            rect.get_top() + h1,
+            rect.get_width(),
+            (rect.get_height() - h1).max(0.0),
+        );
+        collect_bouncy_leaves(first_idx, first_cnt, depth + 1, r1, anim_value, leaves);
+        collect_bouncy_leaves(second_idx, second_cnt, depth + 1, r2, anim_value, leaves);
+    } else {
+        let w1 = rect.get_width() * ratio1;
+        let r1 = Rect::from_xywh(rect.get_left(), rect.get_top(), w1, rect.get_height());
+        let r2 = Rect::from_xywh(
+            rect.get_left() + w1,
+            rect.get_top(),
+            (rect.get_width() - w1).max(0.0),
+            rect.get_height(),
+        );
+        collect_bouncy_leaves(first_idx, first_cnt, depth + 1, r1, anim_value, leaves);
+        collect_bouncy_leaves(second_idx, second_cnt, depth + 1, r2, anim_value, leaves);
+    }
+}
+
+/// Renders the `flutter-wasm-compare` `BouncyLayoutMatrix` (`bouncy_layout_matrix.dart`)
+/// recursive binary space partitioning workload onto `canvas`:
+/// - Splits the viewport recursively using deterministic Knuth multiplicative hashing
+///   (`(node_index as u64).wrapping_mul(2654435761)`), `is_reversed = ((hash >> 16) & 1) == 1`,
+///   `phase_offset = (node_index * 0.17) % 1.0`, `flex: 5000 ± delta` (`1200..8800`), alternating
+///   `Column` (`depth % 2 == 0`) and `Row` (`depth % 2 == 1`).
+/// - Renders 7 distinct leaf widget types (button, checkbox, reflowing paragraph text, timer picker,
+///   circular progress arc, slider, and mini app bar) with batched GPU meshes and glyph runs.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_bouncy_workload(
+    canvas: &mut Canvas,
+    typographer: &mut TypographerContext,
+    font_id: FontId,
+    mono_font_id: FontId,
+    icon_font_id: FontId,
+    width: Scalar,
+    height: Scalar,
+    node_count: usize,
+    anim_value: Scalar,
+) {
+    if node_count == 0 || width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    let root_rect = Rect::from_xywh(4.0, 4.0, (width - 8.0).max(1.0), (height - 8.0).max(1.0));
+    let mut leaves = Vec::with_capacity(node_count);
+    collect_bouncy_leaves(0, node_count, 0, root_rect, anim_value, &mut leaves);
+
+    let mut pane_bg_mesh = TessellatedMesh::default();
+    let mut pane_border_mesh = TessellatedMesh::default();
+    let mut appbar_bg_mesh = TessellatedMesh::default();
+    let mut track_mesh = TessellatedMesh::default();
+    let mut blue_btn_mesh = TessellatedMesh::default();
+    let mut green_mesh = TessellatedMesh::default();
+    let mut amber_bg_mesh = TessellatedMesh::default();
+    let mut amber_border_mesh = TessellatedMesh::default();
+    let mut purple_mesh = TessellatedMesh::default();
+    let mut cyan_mesh = TessellatedMesh::default();
+    let mut teal_skeleton_mesh = TessellatedMesh::default();
+
+    let base_tx = canvas.get_current_transform();
+    let mut shaper = FrameLabelShaper::new(typographer, base_tx, node_count * 10);
+    let use_static_labels = node_count > 100;
+
+    let blue_btn = Color::make_rgba8(0x1E, 0x88, 0xE5, 0xFF);
+    let green = Color::make_rgba8(0x00, 0xE6, 0x76, 0xFF);
+    let amber = Color::make_rgba8(0xFF, 0xAB, 0x40, 0xFF);
+    let purple = Color::make_rgba8(0xE0, 0x40, 0xFB, 0xFF);
+    let cyan = Color::make_rgba8(0x18, 0xFF, 0xFF, 0xFF);
+    let teal = Color::make_rgba8(0x64, 0xFF, 0xDA, 0xFF);
+
+    for (node_index, cell_rect) in leaves {
+        let pane = Rect::from_xywh(
+            cell_rect.get_left() + 1.5,
+            cell_rect.get_top() + 1.5,
+            (cell_rect.get_width() - 3.0).max(1.0),
+            (cell_rect.get_height() - 3.0).max(1.0),
+        );
+        let pw = pane.get_width();
+        let ph = pane.get_height();
+        let px = pane.get_left();
+        let py = pane.get_top();
+        let cx = px + pw * 0.5;
+        let cy = py + ph * 0.5;
+
+        append_filled_rrect_mesh(&mut pane_bg_mesh, pane, 6.0, 6.0);
+        if pw >= 12.0 && ph >= 10.0 {
+            append_stroked_rrect_mesh(&mut pane_border_mesh, pane, 6.0, 6.0, 1.0);
+        }
+
+        let draw_glyphs = pw >= 28.0 && ph >= 16.0 && (node_count <= 300 || (pw >= 38.0 && ph >= 20.0));
+        let clip = Some(pane);
+
+        match node_index % 7 {
+            0 => {
+                // Button leaf
+                let bw = (pw - 12.0).clamp(6.0, 132.0);
+                let bh = (ph - 10.0).clamp(6.0, 32.0);
+                let btn_rect = Rect::from_xywh(cx - bw * 0.5, cy - bh * 0.5, bw, bh);
+                append_filled_rrect_mesh(&mut blue_btn_mesh, btn_rect, 6.0, 6.0);
+                if draw_glyphs && bw >= 36.0 && bh >= 14.0 {
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::Bolt,
+                        12.0,
+                        Color::WHITE,
+                        Point::new(btn_rect.get_left() + 6.0, cy - 6.0),
+                        Some(btn_rect),
+                    );
+                    let label = if use_static_labels {
+                        "ACTION".to_string()
+                    } else {
+                        format!("ACTION #{node_index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 10.5,
+                            line_height: 12.5,
+                            color: Color::WHITE,
+                            max_width: None,
+                        },
+                        Point::new(btn_rect.get_left() + 20.0, cy - 6.0),
+                        Some(btn_rect),
+                    );
+                }
+            }
+            1 => {
+                // Checkbox leaf
+                let cb_size = 16.0_f32.min(pw * 0.35).min(ph * 0.6).max(4.0);
+                let cb_rect = Rect::from_xywh(px + 8.0, cy - cb_size * 0.5, cb_size, cb_size);
+                append_filled_rrect_mesh(&mut green_mesh, cb_rect, 3.5, 3.5);
+                if draw_glyphs && pw >= 44.0 {
+                    let label = if use_static_labels {
+                        "OPT".to_string()
+                    } else {
+                        format!("OPT #{node_index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 11.0,
+                            line_height: 13.0,
+                            color: Color::new(1.0, 1.0, 1.0, 0.78),
+                            max_width: None,
+                        },
+                        Point::new(cb_rect.get_right() + 6.0, cy - 6.5),
+                        clip,
+                    );
+                }
+            }
+            2 => {
+                // Reflowing paragraph text leaf
+                let bar_w = (pw - 12.0).max(2.0);
+                append_filled_rrect_mesh(
+                    &mut track_mesh,
+                    Rect::from_xywh(px + 6.0, py + 5.0, bar_w, 2.5),
+                    1.2,
+                    1.2,
+                );
+                if draw_glyphs && ph >= 22.0 {
+                    let wrap_w = if use_static_labels {
+                        (((pw - 12.0).max(24.0) / 24.0).round() * 24.0).max(24.0)
+                    } else {
+                        (pw - 12.0).max(20.0)
+                    };
+                    let para = if use_static_labels {
+                        "Dynamic layout reflow stress test under shifting constraints.".to_string()
+                    } else {
+                        format!(
+                            "Node #{node_index}: Dynamic layout reflow stress test under shifting constraints."
+                        )
+                    };
+                    shaper.push_text(
+                        &para,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 9.5,
+                            line_height: 11.5,
+                            color: Color::new(1.0, 1.0, 1.0, 0.65),
+                            max_width: Some(wrap_w),
+                        },
+                        Point::new(px + 6.0, py + 10.0),
+                        clip,
+                    );
+                }
+            }
+            3 => {
+                // Timer picker leaf
+                let tw = (pw - 10.0).clamp(6.0, 118.0);
+                let th = (ph - 8.0).clamp(6.0, 32.0);
+                let trect = Rect::from_xywh(cx - tw * 0.5, cy - th * 0.5, tw, th);
+                append_filled_rrect_mesh(&mut amber_bg_mesh, trect, 6.0, 6.0);
+                append_stroked_rrect_mesh(&mut amber_border_mesh, trect, 6.0, 6.0, 1.0);
+                if draw_glyphs && tw >= 38.0 && th >= 14.0 {
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::Speed,
+                        13.0,
+                        amber,
+                        Point::new(trect.get_left() + 6.0, cy - 6.5),
+                        Some(trect),
+                    );
+                    let time_str = if use_static_labels {
+                        "04:42".to_string()
+                    } else {
+                        let secs = ((anim_value * 60.0) as usize + node_index) % 60;
+                        let mins = (node_index % 12) + 1;
+                        format!("{mins:02}:{secs:02}")
+                    };
+                    shaper.push_text(
+                        &time_str,
+                        TextStyle {
+                            font: mono_font_id,
+                            font_size: 11.5,
+                            line_height: 13.5,
+                            color: amber,
+                            max_width: None,
+                        },
+                        Point::new(trect.get_left() + 22.0, cy - 6.5),
+                        Some(trect),
+                    );
+                }
+            }
+            4 => {
+                // Circular progress indicator leaf
+                let rad = (pw.min(ph) * 0.28).clamp(3.0, 13.0);
+                let progress = 0.25
+                    + 0.65
+                        * ((anim_value * 2.0 * std::f32::consts::PI + (node_index as Scalar)).sin()
+                            * 0.5
+                            + 0.5);
+                let arc_center = if pw > 74.0 {
+                    Point::new(px + rad + 10.0, cy)
+                } else {
+                    Point::new(cx, cy)
+                };
+                append_stroked_arc_mesh(
+                    &mut track_mesh,
+                    arc_center,
+                    Size::new(rad, rad),
+                    0.0,
+                    2.0 * std::f32::consts::PI,
+                    2.8,
+                    12,
+                );
+                append_stroked_arc_mesh(
+                    &mut purple_mesh,
+                    arc_center,
+                    Size::new(rad, rad),
+                    -std::f32::consts::FRAC_PI_2,
+                    progress * 2.0 * std::f32::consts::PI,
+                    2.8,
+                    12,
+                );
+                if draw_glyphs && pw > 74.0 {
+                    let pct = if use_static_labels {
+                        "72%".to_string()
+                    } else {
+                        format!("{}%", (progress * 100.0).round() as i32)
+                    };
+                    shaper.push_text(
+                        &pct,
+                        TextStyle {
+                            font: mono_font_id,
+                            font_size: 11.0,
+                            line_height: 13.0,
+                            color: purple,
+                            max_width: None,
+                        },
+                        Point::new(arc_center.x + rad + 8.0, cy - 6.5),
+                        clip,
+                    );
+                }
+            }
+            5 => {
+                // Slider leaf
+                let val = 0.2
+                    + 0.6
+                        * ((anim_value * 2.0 * std::f32::consts::PI
+                            + (node_index as Scalar) * 0.5)
+                            .cos()
+                            * 0.5
+                            + 0.5);
+                let sx0 = px + 8.0;
+                let sw = (pw - 16.0).max(4.0);
+                let sy0 = cy + 2.0;
+                append_filled_rrect_mesh(
+                    &mut track_mesh,
+                    Rect::from_xywh(sx0, sy0, sw, 4.0),
+                    2.0,
+                    2.0,
+                );
+                append_filled_rrect_mesh(
+                    &mut cyan_mesh,
+                    Rect::from_xywh(sx0, sy0, sw * val, 4.0),
+                    2.0,
+                    2.0,
+                );
+                let thumb_r = 5.0_f32.min(ph * 0.25).max(2.0);
+                append_filled_circle_mesh(
+                    &mut cyan_mesh,
+                    Point::new(sx0 + sw * val, sy0 + 2.0),
+                    thumb_r,
+                );
+                if draw_glyphs && ph >= 28.0 {
+                    let label = if use_static_labels {
+                        "SLIDER".to_string()
+                    } else {
+                        format!("SLIDER #{node_index}")
+                    };
+                    shaper.push_text(
+                        &label,
+                        TextStyle {
+                            font: mono_font_id,
+                            font_size: 9.5,
+                            line_height: 11.5,
+                            color: cyan,
+                            max_width: None,
+                        },
+                        Point::new(sx0, py + 5.0),
+                        clip,
+                    );
+                }
+            }
+            _ => {
+                // Mini AppBar leaf
+                let bar_h = (ph * 0.38).clamp(4.0, 22.0);
+                let header_rect = Rect::from_xywh(px + 1.0, py + 1.0, (pw - 2.0).max(2.0), bar_h);
+                append_filled_rrect_mesh(&mut appbar_bg_mesh, header_rect, 4.0, 4.0);
+                if ph > bar_h + 12.0 && pw > 16.0 {
+                    let body_y = py + bar_h + 6.0;
+                    append_filled_rrect_mesh(
+                        &mut track_mesh,
+                        Rect::from_xywh(px + 8.0, body_y, (pw - 16.0) * 0.75, 4.0),
+                        2.0,
+                        2.0,
+                    );
+                    if ph > bar_h + 22.0 {
+                        append_filled_rrect_mesh(
+                            &mut teal_skeleton_mesh,
+                            Rect::from_xywh(px + 8.0, body_y + 8.0, (pw - 16.0) * 0.5, 4.0),
+                            2.0,
+                            2.0,
+                        );
+                    }
+                }
+                if draw_glyphs && bar_h >= 14.0 && pw >= 44.0 {
+                    shaper.push_icon(
+                        icon_font_id,
+                        MaterialIcon::Memory,
+                        11.0,
+                        teal,
+                        Point::new(px + 6.0, py + (bar_h - 11.0) * 0.5),
+                        Some(header_rect),
+                    );
+                    let title = if use_static_labels {
+                        "PANE".to_string()
+                    } else {
+                        format!("PANE #{node_index}")
+                    };
+                    shaper.push_text(
+                        &title,
+                        TextStyle {
+                            font: font_id,
+                            font_size: 9.5,
+                            line_height: 11.5,
+                            color: Color::WHITE,
+                            max_width: None,
+                        },
+                        Point::new(px + 20.0, py + (bar_h - 11.0) * 0.5),
+                        Some(header_rect),
+                    );
+                }
+            }
+        }
+    }
+
+    canvas.emit_mesh(
+        pane_bg_mesh,
+        &Paint::fill(Color::make_rgba8(0x16, 0x1B, 0x26, 0xFF)),
+    );
+    canvas.emit_mesh(
+        appbar_bg_mesh,
+        &Paint::fill(Color::make_rgba8(0x1F, 0x26, 0x33, 0xFF)),
+    );
+    canvas.emit_mesh(
+        pane_border_mesh,
+        &Paint::fill(Color::new(1.0, 1.0, 1.0, 0.12)),
+    );
+    canvas.emit_mesh(track_mesh, &Paint::fill(Color::new(1.0, 1.0, 1.0, 0.14)));
+    canvas.emit_mesh(
+        amber_bg_mesh,
+        &Paint::fill(Color::new(1.0, 0.67, 0.25, 0.12)),
+    );
+    canvas.emit_mesh(
+        amber_border_mesh,
+        &Paint::fill(Color::new(1.0, 0.67, 0.25, 0.40)),
+    );
+    canvas.emit_mesh(
+        teal_skeleton_mesh,
+        &Paint::fill(Color::new(0.39, 1.0, 0.85, 0.24)),
+    );
+    canvas.emit_mesh(blue_btn_mesh, &Paint::fill(blue_btn));
+    canvas.emit_mesh(green_mesh, &Paint::fill(green));
+    canvas.emit_mesh(purple_mesh, &Paint::fill(purple));
+    canvas.emit_mesh(cyan_mesh, &Paint::fill(cyan));
+
+    let glyph_quads = shaper.quads;
+    canvas.emit_glyph_quads_batch(glyph_quads, Matrix::IDENTITY, false);
+    canvas.sync_glyph_atlases_with(typographer);
 }
 
 /// Verifies that all 4 quadrants of the rendered 800x600 showcase image have non-empty,
@@ -3560,6 +4893,150 @@ mod tests {
                 "PolymorphicCard #{} should render bright text/icon/accent pixels, got {}",
                 idx,
                 bright_accent
+            );
+        }
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderMorphingGridWorkload
+    #[test]
+    fn test_can_render_morphing_grid_workload_64_and_500() {
+        let renderer = shared_test_renderer();
+        let bg = Color::make_rgba8(0x09, 0x0C, 0x10, 0xFF);
+        let mut typographer = TypographerContext::new();
+
+        let mut canvas_64 = Canvas::new(640, 480, bg);
+        draw_morphing_grid_workload(
+            &mut canvas_64,
+            &mut typographer,
+            BuiltinFont::RobotoBold,
+            BuiltinFont::RobotoMonoBold,
+            BuiltinFont::MaterialIcons,
+            640.0,
+            480.0,
+            64,
+            0.25,
+        );
+        assert!(
+            !canvas_64.commands().is_empty(),
+            "64-node morphing grid should emit draw commands"
+        );
+        assert!(
+            canvas_64.commands().len() <= 20,
+            "64-node morphing grid should coalesce draw commands into <= 20 batches, got {}",
+            canvas_64.commands().len()
+        );
+        let rgba_64 = canvas_64
+            .render_to_pixels(&renderer)
+            .expect("render 64-node morphing grid");
+        let non_bg_64 = rgba_64
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| {
+                (px[0] as i32 - 0x09).abs()
+                    + (px[1] as i32 - 0x0C).abs()
+                    + (px[2] as i32 - 0x10).abs()
+                    > 10
+            })
+            .count();
+        assert!(
+            non_bg_64 > 150_000,
+            "expected >150k non-bg pixels for 64-node grid, got {}",
+            non_bg_64
+        );
+
+        let mut canvas_500 = Canvas::new(640, 480, bg);
+        draw_morphing_grid_workload(
+            &mut canvas_500,
+            &mut typographer,
+            BuiltinFont::RobotoBold,
+            BuiltinFont::RobotoMonoBold,
+            BuiltinFont::MaterialIcons,
+            640.0,
+            480.0,
+            500,
+            0.55,
+        );
+        assert!(
+            !canvas_500.commands().is_empty(),
+            "500-node morphing grid should emit draw commands"
+        );
+        assert!(
+            canvas_500.commands().len() <= 20,
+            "500-node morphing grid should coalesce draw commands into <= 20 batches, got {}",
+            canvas_500.commands().len()
+        );
+        let rgba_500 = canvas_500
+            .render_to_pixels(&renderer)
+            .expect("render 500-node morphing grid");
+        let non_bg_500 = rgba_500
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| {
+                (px[0] as i32 - 0x09).abs()
+                    + (px[1] as i32 - 0x0C).abs()
+                    + (px[2] as i32 - 0x10).abs()
+                    > 10
+            })
+            .count();
+        assert!(
+            non_bg_500 > 150_000,
+            "expected >150k non-bg pixels for 500-node grid, got {}",
+            non_bg_500
+        );
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderBouncyLayoutWorkload
+    #[test]
+    fn test_can_render_bouncy_workload_64_and_100() {
+        let renderer = shared_test_renderer();
+        let bg = Color::make_rgba8(0x09, 0x0C, 0x10, 0xFF);
+        let mut typographer = TypographerContext::new();
+
+        for &node_count in &[64usize, 100usize] {
+            let mut canvas = Canvas::new(640, 480, bg);
+            draw_bouncy_workload(
+                &mut canvas,
+                &mut typographer,
+                BuiltinFont::RobotoBold,
+                BuiltinFont::RobotoMonoBold,
+                BuiltinFont::MaterialIcons,
+                640.0,
+                480.0,
+                node_count,
+                0.35,
+            );
+            assert!(
+                !canvas.commands().is_empty(),
+                "{}-node bouncy workload should emit draw commands",
+                node_count
+            );
+            assert!(
+                canvas.commands().len() <= 20,
+                "{}-node bouncy workload should coalesce draw commands into <= 20 batches, got {}",
+                node_count,
+                canvas.commands().len()
+            );
+            let rgba = canvas
+                .render_to_pixels(&renderer)
+                .expect("render bouncy workload");
+            let non_bg = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|px| {
+                    (px[0] as i32 - 0x09).abs()
+                        + (px[1] as i32 - 0x0C).abs()
+                        + (px[2] as i32 - 0x10).abs()
+                        > 10
+                })
+                .count();
+            assert!(
+                non_bg > 150_000,
+                "expected >150k non-bg pixels for {}-node bouncy layout, got {}",
+                node_count,
+                non_bg
             );
         }
     }

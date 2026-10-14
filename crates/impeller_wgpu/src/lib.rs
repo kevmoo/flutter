@@ -777,16 +777,20 @@ fn build_rrect_blur_frag_uniform(
     }
 }
 
+pub const MAX_GRADIENT_STOPS: usize = 64;
+
 fn build_gpu_color_points(
     stops: &[GradientStop],
-) -> (Vec<GpuColorPoint>, bool, [f32; 4], [f32; 4]) {
+) -> (
+    [GpuColorPoint; MAX_GRADIENT_STOPS],
+    u32,
+    bool,
+    [f32; 4],
+    [f32; 4],
+) {
+    let mut gpu_stops = [GpuColorPoint::default(); MAX_GRADIENT_STOPS];
     if stops.is_empty() {
-        return (
-            vec![GpuColorPoint::default()],
-            true,
-            [0.0; 4],
-            [0.0; 4],
-        );
+        return (gpu_stops, 0, true, [0.0; 4], [0.0; 4]);
     }
 
     let mut sorted = stops.to_vec();
@@ -795,6 +799,9 @@ fn build_gpu_color_points(
             .partial_cmp(&b.offset)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    if sorted.len() > MAX_GRADIENT_STOPS {
+        sorted.truncate(MAX_GRADIENT_STOPS);
+    }
 
     let is_fast_two_stop = sorted.len() == 2
         && (sorted[0].offset - 0.0).abs() <= K_EH_CLOSE_ENOUGH
@@ -805,7 +812,6 @@ fn build_gpu_color_points(
     let fast_0 = [c0.red, c0.green, c0.blue, c0.alpha];
     let fast_1 = [c1.red, c1.green, c1.blue, c1.alpha];
 
-    let mut gpu_stops = Vec::with_capacity(sorted.len());
     let mut last_stop = sorted[0].offset;
     for (i, s) in sorted.iter().enumerate() {
         let cur_stop = s.offset.clamp(0.0, 1.0);
@@ -815,16 +821,22 @@ fn build_gpu_color_points(
         } else {
             1.0 / delta
         };
-        gpu_stops.push(GpuColorPoint {
+        gpu_stops[i] = GpuColorPoint {
             color: [s.color.red, s.color.green, s.color.blue, s.color.alpha],
             stop: cur_stop,
             inverse_delta,
             _pad: [0.0; 2],
-        });
+        };
         last_stop = cur_stop;
     }
 
-    (gpu_stops, is_fast_two_stop, fast_0, fast_1)
+    (
+        gpu_stops,
+        sorted.len() as u32,
+        is_fast_two_stop,
+        fast_0,
+        fast_1,
+    )
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1020,6 +1032,8 @@ struct PreparedDrawCall {
     scissor: [u32; 4],
 }
 
+type PipelineCacheKey = (PipelineKind, u32, u32, wgpu::TextureFormat);
+
 pub struct WgpuRenderer {
     pub adapter_name: String,
     pub backend_name: String,
@@ -1037,7 +1051,7 @@ pub struct WgpuRenderer {
     nearest_sampler: wgpu::Sampler,
     fallback_alpha_atlas: Arc<CachedGpuAtlas>,
     fallback_color_atlas: Arc<CachedGpuAtlas>,
-    pipeline_cache: Mutex<HashMap<(PipelineKind, u32, u32), Arc<wgpu::RenderPipeline>>>,
+    pipeline_cache: Mutex<HashMap<PipelineCacheKey, Arc<wgpu::RenderPipeline>>>,
     atlas_cache: Mutex<HashMap<AtlasCacheKey, Arc<CachedGpuAtlas>>>,
 }
 
@@ -1112,32 +1126,80 @@ impl WgpuRenderer {
     pub async fn new_for_canvas(
         canvas: web_sys::HtmlCanvasElement,
     ) -> Result<(Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration), String> {
+        Self::new_for_canvas_with_backend(canvas, true).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_for_canvas_with_backend(
+        canvas: web_sys::HtmlCanvasElement,
+        prefer_webgpu: bool,
+    ) -> Result<(Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration), String> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+        if prefer_webgpu {
+            let webgpu_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..Default::default()
+            });
+            if let Ok(surface) =
+                webgpu_instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            {
+                if let Ok(ok) =
+                    Self::init_with_surface(webgpu_instance, surface, width, height, false).await
+                {
+                    return Ok(ok);
+                }
+            }
+        }
+
+        let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
             ..Default::default()
         });
-        let surface = instance
+        let surface = gl_instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
-            .map_err(|e| format!("Failed to create canvas surface: {e}"))?;
-        Self::init_with_surface(instance, surface, width, height).await
+            .map_err(|e| format!("Failed to create WebGL2 canvas surface: {e}"))?;
+        Self::init_with_surface(gl_instance, surface, width, height, true).await
     }
 
     #[cfg(target_arch = "wasm32")]
     pub async fn new_for_offscreen_canvas(
         canvas: web_sys::OffscreenCanvas,
     ) -> Result<(Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration), String> {
+        Self::new_for_offscreen_canvas_with_backend(canvas, true).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_for_offscreen_canvas_with_backend(
+        canvas: web_sys::OffscreenCanvas,
+        prefer_webgpu: bool,
+    ) -> Result<(Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration), String> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+        if prefer_webgpu {
+            let webgpu_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..Default::default()
+            });
+            if let Ok(surface) = webgpu_instance
+                .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas.clone()))
+            {
+                if let Ok(ok) =
+                    Self::init_with_surface(webgpu_instance, surface, width, height, false).await
+                {
+                    return Ok(ok);
+                }
+            }
+        }
+
+        let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
             ..Default::default()
         });
-        let surface = instance
+        let surface = gl_instance
             .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
-            .map_err(|e| format!("Failed to create offscreen canvas surface: {e}"))?;
-        Self::init_with_surface(instance, surface, width, height).await
+            .map_err(|e| format!("Failed to create WebGL2 offscreen canvas surface: {e}"))?;
+        Self::init_with_surface(gl_instance, surface, width, height, true).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1146,6 +1208,7 @@ impl WgpuRenderer {
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
+        is_webgl2: bool,
     ) -> Result<(Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration), String> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -1160,11 +1223,16 @@ impl WgpuRenderer {
         let adapter_name = info.name.clone();
         let backend_name = format!("{:?}", info.backend);
 
+        let base_limits = if is_webgl2 || info.backend == wgpu::Backend::Gl {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            wgpu::Limits::default()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
+                    required_limits: base_limits.using_resolution(adapter.limits()),
                     ..Default::default()
                 },
                 None,
@@ -1172,9 +1240,15 @@ impl WgpuRenderer {
             .await
             .map_err(|e| format!("Failed to request WebGPU/WebGL2 device: {e}"))?;
 
-        let config = surface
-            .get_default_config(&adapter, width, height)
+        let caps = surface.get_capabilities(&adapter);
+        let mut config = surface
+            .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or_else(|| "Surface incompatible with adapter".to_string())?;
+        if caps.formats.contains(&wgpu::TextureFormat::Rgba8Unorm) {
+            config.format = wgpu::TextureFormat::Rgba8Unorm;
+        } else if caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm) {
+            config.format = wgpu::TextureFormat::Bgra8Unorm;
+        }
         surface.configure(&device, &config);
 
         let ctx = Self::from_device_and_queue(adapter_name, backend_name, device, queue);
@@ -1262,7 +1336,7 @@ impl WgpuRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -1524,7 +1598,12 @@ impl WgpuRenderer {
         kind: PipelineKind,
         blend_mode: BlendMode,
     ) -> Arc<wgpu::RenderPipeline> {
-        self.get_or_create_pipeline_with_samples(kind, blend_mode, DEFAULT_SAMPLE_COUNT)
+        self.get_or_create_pipeline_with_samples_and_format(
+            kind,
+            blend_mode,
+            DEFAULT_SAMPLE_COUNT,
+            TARGET_FORMAT,
+        )
     }
 
     pub fn get_or_create_pipeline_with_samples(
@@ -1533,8 +1612,23 @@ impl WgpuRenderer {
         blend_mode: BlendMode,
         sample_count: u32,
     ) -> Arc<wgpu::RenderPipeline> {
+        self.get_or_create_pipeline_with_samples_and_format(
+            kind,
+            blend_mode,
+            sample_count,
+            TARGET_FORMAT,
+        )
+    }
+
+    pub fn get_or_create_pipeline_with_samples_and_format(
+        &self,
+        kind: PipelineKind,
+        blend_mode: BlendMode,
+        sample_count: u32,
+        format: wgpu::TextureFormat,
+    ) -> Arc<wgpu::RenderPipeline> {
         let samples = normalize_sample_count(sample_count);
-        let key = (kind, blend_mode as u32, samples);
+        let key = (kind, blend_mode as u32, samples, format);
         if let Ok(cache) = self.pipeline_cache.lock() {
             if let Some(existing) = cache.get(&key) {
                 return Arc::clone(existing);
@@ -1635,7 +1729,7 @@ impl WgpuRenderer {
                     module: shader,
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: TARGET_FORMAT,
+                        format,
                         blend: Some(blend_state),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -1699,6 +1793,7 @@ impl WgpuRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_draw_call(
         &self,
         cmd: &DrawCommand,
@@ -1707,6 +1802,7 @@ impl WgpuRenderer {
         internal_height: u32,
         ssaa_scale: u32,
         sample_count: u32,
+        format: wgpu::TextureFormat,
     ) -> Option<PreparedDrawCall> {
         let scissor = Self::compute_scissor_rect(
             cmd.clip_rect(),
@@ -1726,10 +1822,11 @@ impl WgpuRenderer {
                 if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                     return None;
                 }
-                let pipeline = self.get_or_create_pipeline_with_samples(
+                let pipeline = self.get_or_create_pipeline_with_samples_and_format(
                     PipelineKind::SolidFill,
                     *blend_mode,
                     sample_count,
+                    format,
                 );
                 let mvp = ortho * *transform;
                 let frame_uniform = SolidFrameUniform { mvp: mvp.m };
@@ -1800,10 +1897,11 @@ impl WgpuRenderer {
                 if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                     return None;
                 }
-                let pipeline = self.get_or_create_pipeline_with_samples(
+                let pipeline = self.get_or_create_pipeline_with_samples_and_format(
                     PipelineKind::LinearGradientFill,
                     *blend_mode,
                     sample_count,
+                    format,
                 );
                 let mvp = ortho * *transform;
                 let frame_uniform = GradientFrameUniform {
@@ -1814,7 +1912,7 @@ impl WgpuRenderer {
                 let start_to_end = gradient.end_point - gradient.start_point;
                 let dot_se = start_to_end.x * start_to_end.x + start_to_end.y * start_to_end.y;
                 let inv_dot = if dot_se <= 1.0e-8 { 0.0 } else { 1.0 / dot_se };
-                let (gpu_stops, is_fast_two_stop, fast_color_0, fast_color_1) =
+                let (gpu_stops, colors_length, is_fast_two_stop, fast_color_0, fast_color_1) =
                     build_gpu_color_points(&gradient.stops);
 
                 let frag_uniform = LinearGradientFragUniform {
@@ -1827,11 +1925,7 @@ impl WgpuRenderer {
                     fast_color_0,
                     fast_color_1,
                     tile_mode: gradient.tile_mode as u32,
-                    colors_length: if gradient.stops.is_empty() {
-                        0
-                    } else {
-                        gpu_stops.len() as u32
-                    },
+                    colors_length,
                     is_fast_two_stop: u32::from(is_fast_two_stop),
                     _pad: 0,
                 };
@@ -1853,9 +1947,9 @@ impl WgpuRenderer {
                 let stops_buf = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("LinearGradient Stops SSBO"),
+                        label: Some("LinearGradient Stops UBO"),
                         contents: bytemuck::cast_slice(&gpu_stops),
-                        usage: wgpu::BufferUsages::STORAGE,
+                        usage: wgpu::BufferUsages::UNIFORM,
                     });
 
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1911,10 +2005,11 @@ impl WgpuRenderer {
                 if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                     return None;
                 }
-                let pipeline = self.get_or_create_pipeline_with_samples(
+                let pipeline = self.get_or_create_pipeline_with_samples_and_format(
                     PipelineKind::RadialGradientFill,
                     *blend_mode,
                     sample_count,
+                    format,
                 );
                 let mvp = ortho * *transform;
                 let frame_uniform = GradientFrameUniform {
@@ -1922,7 +2017,7 @@ impl WgpuRenderer {
                     matrix: Matrix::IDENTITY.m,
                 };
 
-                let (gpu_stops, is_fast_two_stop, fast_color_0, fast_color_1) =
+                let (gpu_stops, colors_length, is_fast_two_stop, fast_color_0, fast_color_1) =
                     build_gpu_color_points(&gradient.stops);
 
                 let frag_uniform = RadialGradientFragUniform {
@@ -1933,11 +2028,7 @@ impl WgpuRenderer {
                     fast_color_0,
                     fast_color_1,
                     tile_mode: gradient.tile_mode as u32,
-                    colors_length: if gradient.stops.is_empty() {
-                        0
-                    } else {
-                        gpu_stops.len() as u32
-                    },
+                    colors_length,
                     is_fast_two_stop: u32::from(is_fast_two_stop),
                     _pad: 0,
                 };
@@ -1959,9 +2050,9 @@ impl WgpuRenderer {
                 let stops_buf = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("RadialGradient Stops SSBO"),
+                        label: Some("RadialGradient Stops UBO"),
                         contents: bytemuck::cast_slice(&gpu_stops),
-                        usage: wgpu::BufferUsages::STORAGE,
+                        usage: wgpu::BufferUsages::UNIFORM,
                     });
 
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2016,10 +2107,11 @@ impl WgpuRenderer {
                 if params.rect.is_empty() {
                     return None;
                 }
-                let pipeline = self.get_or_create_pipeline_with_samples(
+                let pipeline = self.get_or_create_pipeline_with_samples_and_format(
                     PipelineKind::RRectBlur,
                     *blend_mode,
                     sample_count,
+                    format,
                 );
 
                 let pos_left = params.rect.get_left();
@@ -2104,10 +2196,11 @@ impl WgpuRenderer {
                 if batch.quads.is_empty() {
                     return None;
                 }
-                let pipeline = self.get_or_create_pipeline_with_samples(
+                let pipeline = self.get_or_create_pipeline_with_samples_and_format(
                     PipelineKind::GlyphAtlas,
                     batch.blend_mode,
                     sample_count,
+                    format,
                 );
 
                 let alpha_gpu = batch
@@ -2273,6 +2366,7 @@ impl WgpuRenderer {
                     target.internal_height,
                     target.ssaa_scale,
                     target.sample_count,
+                    TARGET_FORMAT,
                 )
             })
             .collect();
@@ -2291,6 +2385,85 @@ impl WgpuRenderer {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Impeller Offscreen RenderPass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: attachment_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(pm_clear.red.clamp(0.0, 1.0)),
+                            g: f64::from(pm_clear.green.clamp(0.0, 1.0)),
+                            b: f64::from(pm_clear.blue.clamp(0.0, 1.0)),
+                            a: f64::from(pm_clear.alpha.clamp(0.0, 1.0)),
+                        }),
+                        store: store_op,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            for call in &prepared {
+                render_pass.set_pipeline(&call.pipeline);
+                render_pass.set_bind_group(0, &call.bind_group, &[]);
+                render_pass.set_scissor_rect(
+                    call.scissor[0],
+                    call.scissor[1],
+                    call.scissor[2],
+                    call.scissor[3],
+                );
+                render_pass.set_vertex_buffer(0, call.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(call.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..call.index_count, 0, 0..1);
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to_texture_view(
+        &self,
+        target_view: &wgpu::TextureView,
+        msaa_view: Option<&wgpu::TextureView>,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+        clear_color: Color,
+        commands: &[DrawCommand],
+    ) -> Result<(), String> {
+        let w = width.max(1);
+        let h = height.max(1);
+        let effective_samples = if msaa_view.is_some() {
+            normalize_sample_count(sample_count)
+        } else {
+            1
+        };
+        let ortho = Matrix::make_orthographic(Size::new(w as Scalar, h as Scalar));
+        let prepared: Vec<PreparedDrawCall> = commands
+            .iter()
+            .filter_map(|cmd| {
+                self.prepare_draw_call(cmd, ortho, w, h, 1, effective_samples, format)
+            })
+            .collect();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Impeller Surface CommandEncoder"),
+            });
+
+        let pm_clear = clear_color.premultiply();
+        let (attachment_view, resolve_target, store_op) = match msaa_view {
+            Some(mv) => (mv, Some(target_view), wgpu::StoreOp::Discard),
+            None => (target_view, None, wgpu::StoreOp::Store),
+        };
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Impeller Surface RenderPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: attachment_view,
                     resolve_target,
