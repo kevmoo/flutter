@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/impeller_geometry",
+    "crates/impeller_path",
+    "crates/impeller_core",
+    "crates/impeller_tessellator",
+    "crates/impeller_typographer",
+    "crates/impeller_wgpu",
+    "crates/impeller_canvas",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+pollster = "0.4"
+wgpu = "24.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+approx = "0.5"
+cosmic-text = { version = "0.12", default-features = false, features = ["std", "swash"] }
+etagere = "0.2.10"
+kurbo = "0.13"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "OffscreenCanvas",
+    "Window",
+    "Navigator",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+] }
+impeller_geometry = { path = "crates/impeller_geometry" }
+impeller_path = { path = "crates/impeller_path" }
+impeller_core = { path = "crates/impeller_core" }
+impeller_tessellator = { path = "crates/impeller_tessellator" }
+impeller_typographer = { path = "crates/impeller_typographer" }
+impeller_wgpu = { path = "crates/impeller_wgpu" }
+impeller_canvas = { path = "crates/impeller_canvas" }
