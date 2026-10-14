@@ -584,6 +584,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "impeller_skwasm_ffi"
+version = "0.1.0"
+dependencies = [
+ "impeller_canvas",
+ "impeller_core",
+ "impeller_geometry",
+ "impeller_path",
+ "impeller_tessellator",
+ "impeller_typographer",
+ "impeller_wgpu",
+ "js-sys",
+ "pollster",
+ "wasm-bindgen",
+ "wasm-bindgen-cli-support",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "impeller_tessellator"
 version = "0.1.0"
 dependencies = [

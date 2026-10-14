@@ -7,9 +7,11 @@
 //! - `GlyphAtlas` & `GlyphAtlasContext` (A8 alpha mask & RGBA8 color glyph atlases)
 //! - Embedded `Roboto-Regular`, `Roboto-Bold`, `DejaVuSansMono-Bold`, and `MaterialIcons-Regular` fonts + vector glyph outline extraction to `impeller_path::Path`.
 
+pub mod paragraph;
 pub mod rectangle_packer;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cosmic_text::{
@@ -19,6 +21,7 @@ use cosmic_text::{
 use impeller_geometry::{Color, IPoint, ISize, Point, Rect, Scalar};
 use impeller_path::{FillType, Path, PathBuilder};
 
+pub use paragraph::*;
 pub use rectangle_packer::{AllocId, RectanglePacker, SkylineRectanglePacker};
 
 pub const ROBOTO_REGULAR_TTF: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Regular.ttf");
@@ -161,8 +164,22 @@ impl ScaledFont {
     }
 }
 
+/// Re-exported `fontdb::ID` handle for dynamically registered fonts.
+pub type FontDbId = cosmic_text::fontdb::ID;
+
 /// Cache key tuple `(BuiltinFont, glyph_id, font_size_milli, subpixel_x, subpixel_y)`.
 pub type GlyphCacheKey = (BuiltinFont, u16, u32, SubpixelBin, SubpixelBin);
+
+/// Internal atlas cache key `(fontdb::ID, glyph_id, font_size_milli, subpixel_x, subpixel_y, cache_key_flags_bits)`
+/// so dynamically registered fonts and synthetic styles (e.g. `FAKE_ITALIC`) cache without collision.
+pub(crate) type InternalGlyphCacheKey = (
+    cosmic_text::fontdb::ID,
+    u16,
+    u32,
+    SubpixelBin,
+    SubpixelBin,
+    u32,
+);
 
 /// Cached atlas glyph metadata `(atlas_rect, is_color, bearing, size)`.
 pub type GlyphCacheValue = (Rect, bool, IPoint, ISize);
@@ -220,14 +237,19 @@ pub struct AtlasGlyphQuad {
     pub is_color: bool,
 }
 
+static NEXT_ATLAS_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A GPU-ready glyph atlas backing buffer (`AlphaBitmap` `R8` or `ColorBitmap` `RGBA8`).
 #[derive(Debug, Clone)]
 pub struct GlyphAtlas {
+    pub atlas_id: u64,
     pub atlas_type: GlyphAtlasType,
     pub size: ISize,
     /// Raw pixel bytes (`width * height` for `AlphaBitmap`, `width * height * 4` for `ColorBitmap`).
     pub pixels: Vec<u8>,
     pub generation: u64,
+    pub resize_epoch: u64,
+    pub row_generations: Vec<u64>,
 }
 
 impl GlyphAtlas {
@@ -236,17 +258,66 @@ impl GlyphAtlas {
             GlyphAtlasType::AlphaBitmap => 1usize,
             GlyphAtlasType::ColorBitmap => 4usize,
         };
+        let h_usize = height as usize;
         Self {
+            atlas_id: NEXT_ATLAS_ID.fetch_add(1, Ordering::Relaxed),
             atlas_type,
             size: ISize::new(i64::from(width), i64::from(height)),
-            pixels: vec![0u8; (width as usize) * (height as usize) * bpp],
+            pixels: vec![0u8; (width as usize) * h_usize * bpp],
             generation: 1,
+            resize_epoch: 1,
+            row_generations: vec![1u64; h_usize],
+        }
+    }
+
+    /// Marks rows in `[y_start, y_start + padded_h)` as modified at `self.generation`.
+    pub(crate) fn mark_dirty_rows(&mut self, y_start: i64, padded_h: i64) {
+        let y0 = y_start.max(0) as usize;
+        let y1 = (y_start + padded_h).clamp(0, self.size.height) as usize;
+        let end = y1.min(self.row_generations.len());
+        if y0 < end {
+            self.row_generations[y0..end].fill(self.generation);
+        }
+    }
+
+    /// Returns the half-open row span `(y_min, y_max)` modified since `uploaded_generation`,
+    /// or `None` if `uploaded_generation >= self.generation`.
+    pub fn dirty_row_range_since(&self, uploaded_generation: u64) -> Option<(u32, u32)> {
+        if uploaded_generation >= self.generation {
+            return None;
+        }
+        if uploaded_generation == 0 {
+            return Some((0, self.size.height.max(1) as u32));
+        }
+        let first_y = self
+            .row_generations
+            .iter()
+            .position(|&row_gen| row_gen > uploaded_generation)?;
+        let last_y = self
+            .row_generations
+            .iter()
+            .rposition(|&row_gen| row_gen > uploaded_generation)
+            .unwrap_or(first_y);
+        Some((first_y as u32, (last_y + 1) as u32))
+    }
+
+    /// Returns a zero-allocation metadata clone of this `GlyphAtlas` with empty `pixels`
+    /// and `row_generations` vectors (`0` heap allocations).
+    pub fn descriptor_without_pixels(&self) -> Self {
+        Self {
+            atlas_id: self.atlas_id,
+            atlas_type: self.atlas_type,
+            size: self.size,
+            pixels: Vec::new(),
+            generation: self.generation,
+            resize_epoch: self.resize_epoch,
+            row_generations: Vec::new(),
         }
     }
 
     /// Grows the backing pixel buffer to `(new_width, new_height)`, copying all existing
     /// pixel rows into the top-left corner so existing atlas coordinates remain valid,
-    /// and bumps `generation`.
+    /// and bumps `generation` and `resize_epoch`.
     pub fn grow(&mut self, new_width: u32, new_height: u32) {
         let old_w = self.size.width.max(0) as usize;
         let old_h = self.size.height.max(0) as usize;
@@ -271,6 +342,8 @@ impl GlyphAtlas {
         self.pixels = new_pixels;
         self.size = ISize::new(new_w as i64, new_h as i64);
         self.generation = self.generation.wrapping_add(1);
+        self.resize_epoch = self.resize_epoch.wrapping_add(1);
+        self.row_generations = vec![self.generation; new_h];
     }
 }
 
@@ -306,13 +379,16 @@ pub struct TextFrame {
 }
 
 #[derive(Debug, Clone)]
-struct RegisteredFont {
-    id: cosmic_text::fontdb::ID,
-    family: String,
-    weight: Weight,
-    style: Style,
-    stretch: Stretch,
+pub(crate) struct RegisteredFont {
+    pub(crate) id: cosmic_text::fontdb::ID,
+    pub(crate) family: String,
+    pub(crate) weight: Weight,
+    pub(crate) style: Style,
+    pub(crate) stretch: Stretch,
 }
+
+pub(crate) type ResolvedFontCacheKey = (Vec<String>, u16, i32);
+pub(crate) type ResolvedFontCacheValue = (String, Style, CacheKeyFlags);
 
 /// Persistent typographer context holding `cosmic_text::FontSystem`, `SwashCache`, and `GlyphAtlas`.
 pub struct TypographerContext {
@@ -320,10 +396,13 @@ pub struct TypographerContext {
     pub color_atlas: GlyphAtlas,
     alpha_packer: RectanglePacker,
     color_packer: RectanglePacker,
-    glyph_cache: HashMap<GlyphCacheKey, GlyphCacheValue>,
-    font_system: FontSystem,
+    glyph_cache: HashMap<InternalGlyphCacheKey, GlyphCacheValue>,
+    pub(crate) paragraph_layout_cache: HashMap<u64, Arc<CachedParagraphLayout>>,
+    pub(crate) resolved_font_cache: HashMap<ResolvedFontCacheKey, ResolvedFontCacheValue>,
+    pub(crate) cache_epoch: u64,
+    pub(crate) font_system: FontSystem,
     swash_cache: SwashCache,
-    fonts: [RegisteredFont; 4],
+    pub(crate) fonts: [RegisteredFont; 4],
 }
 
 impl std::fmt::Debug for TypographerContext {
@@ -332,6 +411,10 @@ impl std::fmt::Debug for TypographerContext {
             .field("alpha_atlas_size", &self.alpha_atlas.size)
             .field("color_atlas_size", &self.color_atlas.size)
             .field("cached_glyphs", &self.glyph_cache.len())
+            .field(
+                "cached_paragraph_layouts",
+                &self.paragraph_layout_cache.len(),
+            )
             .finish()
     }
 }
@@ -418,6 +501,9 @@ impl TypographerContext {
             alpha_packer: RectanglePacker::new(i64::from(alpha_w), i64::from(alpha_w)),
             color_packer: RectanglePacker::new(i64::from(color_w), i64::from(color_w)),
             glyph_cache: HashMap::new(),
+            paragraph_layout_cache: HashMap::new(),
+            resolved_font_cache: HashMap::new(),
+            cache_epoch: 1,
             font_system,
             swash_cache: SwashCache::new(),
             fonts: [roboto_reg, roboto_bold, roboto_mono_bold, material_icons],
@@ -430,16 +516,186 @@ impl TypographerContext {
         self.glyph_cache.len()
     }
 
-    /// Looks up a cached glyph entry by its [`GlyphCacheKey`].
-    pub fn lookup_cached_glyph(&self, key: &GlyphCacheKey) -> Option<GlyphCacheValue> {
-        self.glyph_cache.get(key).copied()
+    /// Returns the number of distinct `Paragraph` layouts currently cached in `paragraph_layout_cache`.
+    pub fn cached_paragraph_layout_count(&self) -> usize {
+        self.paragraph_layout_cache.len()
     }
 
-    fn registered_font(&self, font: BuiltinFont) -> &RegisteredFont {
+    /// Looks up a cached glyph entry by its [`GlyphCacheKey`].
+    pub fn lookup_cached_glyph(&self, key: &GlyphCacheKey) -> Option<GlyphCacheValue> {
+        let font_id = self.registered_font(key.0).id;
+        self.glyph_cache
+            .get(&(font_id, key.1, key.2, key.3, key.4, 0))
+            .copied()
+    }
+
+    /// Dynamically registers raw TrueType/OpenType font bytes into the `FontSystem` database
+    /// (supporting `fontCollection_registerTypeface` in `impeller_skwasm_ffi`).
+    ///
+    /// If `family_alias` is provided (e.g. `"MaterialIcons"`, `"Roboto"`,
+    /// `"packages/cupertino_icons/CupertinoIcons"`), adds the alias to the face's family list
+    /// and disables `monospaced` on icon fonts so `cosmic-text` never substitutes a monospace fallback.
+    pub fn register_font_bytes(
+        &mut self,
+        bytes: &[u8],
+        family_alias: Option<&str>,
+    ) -> Vec<cosmic_text::fontdb::ID> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let shared_bytes: Arc<dyn AsRef<[u8]> + Sync + Send> = Arc::new(bytes.to_vec());
+        let raw_ids = self
+            .font_system
+            .db_mut()
+            .load_font_source(cosmic_text::fontdb::Source::Binary(shared_bytes));
+
+        let alias_trimmed = family_alias.map(str::trim).filter(|s| !s.is_empty());
+        let mut final_ids = Vec::with_capacity(raw_ids.len());
+
+        for raw_id in raw_ids {
+            let Some(mut face) = self.font_system.db().face(raw_id).cloned() else {
+                continue;
+            };
+            let mut modified = false;
+
+            if let Some(alias) = alias_trimmed {
+                if !face.families.iter().any(|(name, _)| name == alias) {
+                    face.families.push((
+                        alias.to_string(),
+                        cosmic_text::fontdb::Language::English_UnitedStates,
+                    ));
+                    modified = true;
+                }
+                if let Some(short) = alias.rsplit('/').next() {
+                    if short != alias && !face.families.iter().any(|(name, _)| name == short) {
+                        face.families.push((
+                            short.to_string(),
+                            cosmic_text::fontdb::Language::English_UnitedStates,
+                        ));
+                        modified = true;
+                    }
+                }
+            }
+
+            let is_icon_font = alias_trimmed
+                .is_some_and(|a| a.to_ascii_lowercase().contains("icons"))
+                || face
+                    .families
+                    .iter()
+                    .any(|(name, _)| name.to_ascii_lowercase().contains("icons"));
+            if is_icon_font && face.monospaced {
+                face.monospaced = false;
+                modified = true;
+            }
+
+            let resolved_id = if modified {
+                let db = self.font_system.db_mut();
+                db.remove_face(raw_id);
+                face.id = cosmic_text::fontdb::ID::dummy();
+                db.push_face_info(face.clone());
+                db.faces()
+                    .last()
+                    .map_or(raw_id, |inserted| inserted.id)
+            } else {
+                raw_id
+            };
+
+            let matches_material_icons = alias_trimmed.is_some_and(|a| {
+                a.eq_ignore_ascii_case("MaterialIcons") || a.eq_ignore_ascii_case("Material Icons")
+            }) || face.families.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("MaterialIcons")
+                    || name.eq_ignore_ascii_case("Material Icons")
+            });
+            if matches_material_icons {
+                let fam = alias_trimmed
+                    .map(str::to_string)
+                    .or_else(|| face.families.first().map(|(n, _)| n.clone()))
+                    .unwrap_or_else(|| "MaterialIcons".to_string());
+                self.fonts[3] = RegisteredFont {
+                    id: resolved_id,
+                    family: fam,
+                    weight: face.weight,
+                    style: face.style,
+                    stretch: face.stretch,
+                };
+            }
+
+            final_ids.push(resolved_id);
+        }
+
+        if !final_ids.is_empty() {
+            self.paragraph_layout_cache.clear();
+            self.resolved_font_cache.clear();
+            self.cache_epoch = self.cache_epoch.wrapping_add(1).max(1);
+        }
+
+        final_ids
+    }
+
+    /// Clears cached glyph entries and paragraph layout caches (for `fontCollection_clearCaches`).
+    pub fn clear_caches(&mut self) {
+        self.glyph_cache.clear();
+        self.paragraph_layout_cache.clear();
+        self.resolved_font_cache.clear();
+        self.cache_epoch = self.cache_epoch.wrapping_add(1).max(1);
+        self.alpha_packer.reset();
+        self.color_packer.reset();
+        self.alpha_atlas.pixels.fill(0);
+        self.color_atlas.pixels.fill(0);
+        self.alpha_atlas.generation = self.alpha_atlas.generation.wrapping_add(1);
+        self.color_atlas.generation = self.color_atlas.generation.wrapping_add(1);
+        self.alpha_atlas.resize_epoch = self.alpha_atlas.resize_epoch.wrapping_add(1);
+        self.color_atlas.resize_epoch = self.color_atlas.resize_epoch.wrapping_add(1);
+        self.alpha_atlas
+            .row_generations
+            .fill(self.alpha_atlas.generation);
+        self.color_atlas
+            .row_generations
+            .fill(self.color_atlas.generation);
+    }
+
+    /// Checks whether any registered typeface in this [`TypographerContext`] covers `codepoint`.
+    pub fn is_codepoint_covered(&mut self, codepoint: u32) -> bool {
+        let Some(ch) = char::from_u32(codepoint) else {
+            return false;
+        };
+        let face_ids: Vec<cosmic_text::fontdb::ID> =
+            self.font_system.db().faces().map(|f| f.id).collect();
+        for id in face_ids {
+            if let Some(font) = self.font_system.get_font(id) {
+                if font
+                    .rustybuzz()
+                    .glyph_index(ch)
+                    .is_some_and(|gid| gid.0 != 0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks whether a specific raw TrueType/OpenType font byte slice covers `codepoint`
+    /// (for `typefaces_filterCoveredCodePoints`).
+    pub fn is_codepoint_covered_by_font_bytes(bytes: &[u8], codepoint: u32) -> bool {
+        let Some(ch) = char::from_u32(codepoint) else {
+            return false;
+        };
+        let Ok(face) = cosmic_text::ttf_parser::Face::parse(bytes, 0) else {
+            return false;
+        };
+        face.glyph_index(ch).is_some_and(|gid| gid.0 != 0)
+    }
+
+    pub(crate) fn registered_font(&self, font: BuiltinFont) -> &RegisteredFont {
         &self.fonts[font_index(font)]
     }
 
-    fn builtin_for_id(&self, id: cosmic_text::fontdb::ID, fallback: BuiltinFont) -> BuiltinFont {
+    pub(crate) fn builtin_for_id(
+        &self,
+        id: cosmic_text::fontdb::ID,
+        fallback: BuiltinFont,
+    ) -> BuiltinFont {
         if id == self.fonts[0].id {
             BuiltinFont::RobotoRegular
         } else if id == self.fonts[1].id {
@@ -511,7 +767,7 @@ impl TypographerContext {
 
     fn pack_alpha_mask(
         &mut self,
-        key: GlyphCacheKey,
+        key: InternalGlyphCacheKey,
         bearing: IPoint,
         w: i64,
         h: i64,
@@ -546,6 +802,7 @@ impl TypographerContext {
                 .copy_from_slice(&data[src_offset..src_offset + row_len]);
         }
         self.alpha_atlas.generation = self.alpha_atlas.generation.wrapping_add(1);
+        self.alpha_atlas.mark_dirty_rows(packed.y, padded_h);
 
         let atlas_rect = Rect::from_xywh(
             dst_x as Scalar,
@@ -563,7 +820,7 @@ impl TypographerContext {
     /// where `swash` / `skrifa` returns `None`.
     fn rasterize_ttf_outline_mask(
         &mut self,
-        key: GlyphCacheKey,
+        key: InternalGlyphCacheKey,
         pair: FontGlyphPair,
         font_id: cosmic_text::fontdb::ID,
         font_size: Scalar,
@@ -688,13 +945,20 @@ impl TypographerContext {
         self.pack_alpha_mask(key, bearing, w, h, &bitmap)
     }
 
-    fn resolve_or_rasterize_glyph(
+    pub(crate) fn resolve_or_rasterize_glyph(
         &mut self,
         pair: FontGlyphPair,
         font_id: cosmic_text::fontdb::ID,
         flags: CacheKeyFlags,
     ) -> GlyphCacheValue {
-        let key = pair.cache_key();
+        let key: InternalGlyphCacheKey = (
+            font_id,
+            pair.glyph_id,
+            pair.scaled_font.font_size_milli,
+            pair.subpixel_position.x,
+            pair.subpixel_position.y,
+            flags.bits(),
+        );
         if let Some(&cached) = self.glyph_cache.get(&key) {
             return cached;
         }
@@ -788,6 +1052,7 @@ impl TypographerContext {
                     }
                 }
                 self.color_atlas.generation = self.color_atlas.generation.wrapping_add(1);
+                self.color_atlas.mark_dirty_rows(packed.y, padded_h);
 
                 let atlas_rect = Rect::from_xywh(
                     dst_x as Scalar,
@@ -1790,5 +2055,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// C++ source: typographer_unittests.cc:GlyphAtlasDirtyRowRangeAndResizeEpochTracking
+    #[test]
+    fn test_glyph_atlas_dirty_row_range_resize_epoch_and_descriptor() {
+        let mut ctx = TypographerContext::with_atlas_sizes(64, 64);
+        assert_eq!(ctx.alpha_atlas.generation, 1);
+        assert_eq!(ctx.alpha_atlas.resize_epoch, 1);
+        assert_eq!(ctx.alpha_atlas.row_generations.len(), 64);
+        assert_eq!(ctx.alpha_atlas.dirty_row_range_since(1), None);
+        assert_eq!(ctx.alpha_atlas.dirty_row_range_since(0), Some((0, 64)));
+
+        let initial_id = ctx.alpha_atlas.atlas_id;
+        assert!(initial_id >= 1);
+
+        // Shape a single glyph; generation increases, resize_epoch stays 1, dirty rows cover only the glyph's padded span.
+        let frame = ctx.shape_text(
+            "A",
+            TextStyle {
+                font: BuiltinFont::RobotoRegular,
+                font_size: 16.0,
+                line_height: 20.0,
+                color: Color::WHITE,
+                max_width: None,
+            },
+            Point::new(0.0, 0.0),
+        );
+        assert_eq!(frame.quads.len(), 1);
+        let gen_after_a = ctx.alpha_atlas.generation;
+        assert!(gen_after_a > 1);
+        assert_eq!(ctx.alpha_atlas.resize_epoch, 1);
+
+        let dirty_a = ctx
+            .alpha_atlas
+            .dirty_row_range_since(1)
+            .expect("dirty row range after packing 'A'");
+        let glyph_h = frame.quads[0].atlas_rect.get_height() as u32;
+        assert_eq!(dirty_a.0, 0);
+        // Padded height is glyph_h + 2 (1px top + 1px bottom border).
+        assert_eq!(dirty_a.1, glyph_h + 2);
+        assert!(dirty_a.1 < 64);
+        assert_eq!(ctx.alpha_atlas.dirty_row_range_since(gen_after_a), None);
+
+        // Zero-allocation descriptor preserves metadata without cloning pixels/row_generations.
+        let desc = ctx.alpha_atlas.descriptor_without_pixels();
+        assert_eq!(desc.atlas_id, initial_id);
+        assert_eq!(desc.atlas_type, GlyphAtlasType::AlphaBitmap);
+        assert_eq!(desc.size, ctx.alpha_atlas.size);
+        assert_eq!(desc.generation, gen_after_a);
+        assert_eq!(desc.resize_epoch, 1);
+        assert!(desc.pixels.is_empty());
+        assert_eq!(desc.pixels.capacity(), 0);
+        assert!(desc.row_generations.is_empty());
+        assert_eq!(desc.row_generations.capacity(), 0);
+
+        // Force atlas growth; resize_epoch increments and row_generations resizes.
+        ctx.alpha_atlas.grow(128, 128);
+        assert_eq!(ctx.alpha_atlas.atlas_id, initial_id);
+        assert_eq!(ctx.alpha_atlas.resize_epoch, 2);
+        assert_eq!(ctx.alpha_atlas.row_generations.len(), 128);
+        assert_eq!(
+            ctx.alpha_atlas.dirty_row_range_since(gen_after_a),
+            Some((0, 128))
+        );
+
+        // clear_caches increments resize_epoch again and resets all row_generations.
+        let gen_after_grow = ctx.alpha_atlas.generation;
+        ctx.clear_caches();
+        assert_eq!(ctx.alpha_atlas.resize_epoch, 3);
+        assert!(ctx.alpha_atlas.generation > gen_after_grow);
+        assert_eq!(
+            ctx.alpha_atlas.dirty_row_range_since(gen_after_grow),
+            Some((0, 128))
+        );
     }
 }

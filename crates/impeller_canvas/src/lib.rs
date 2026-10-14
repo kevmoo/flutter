@@ -1,21 +1,25 @@
 #![forbid(unsafe_code)]
 
 pub use impeller_geometry::{
-    BlendMode, Color, Matrix, Point, Radians, Rect, Scalar, Size, TileMode, K_EH_CLOSE_ENOUGH,
+    BlendMode, Color, ColorMatrix, Matrix, Point, Radians, Rect, Scalar, Size, TileMode,
+    K_EH_CLOSE_ENOUGH,
 };
 pub use impeller_path::{Cap, FillType, Join, Path, PathBuilder, PathComponent, RoundingRadii};
 use impeller_tessellator::{
-    compute_stroke_alpha_coverage, CircleGeometry, FillPathGeometry, LineGeometry,
-    RoundRectGeometry, StrokeParameters, StrokePathGeometry, TessellatedMesh, Vertex2D,
+    compute_stroke_alpha_coverage, ArcGeometry, CircleGeometry, DiffRoundRectGeometry,
+    EllipseGeometry, FillTessellationKind, LineGeometry, RoundRectGeometry, StrokeParameters,
+    TessellatedMesh, Tessellator, Vertex2D,
 };
 pub use impeller_typographer::{
-    AtlasGlyphQuad, BuiltinFont, GlyphAtlas, GlyphAtlasType, MaterialIcon, SubpixelBin, TextFrame,
-    TextStyle, TypographerContext,
+    AtlasGlyphQuad, BuiltinFont, FontFeature, FontVariation, GlyphAtlas, GlyphAtlasType, GlyphInfo,
+    MaterialIcon, Paragraph, ParagraphBuilder, ParagraphLineMetrics, ParagraphStyle,
+    PlaceholderSpan, RichTextSpan, RichTextStyle, StrutStyle, SubpixelBin, TextAlign, TextBox,
+    TextDirection, TextFrame, TextShadow, TextStyle, TypographerContext,
 };
 pub use impeller_wgpu::{
     compare_golden_rgba, save_rgba_png, DrawCommand, GlyphAtlasBatch, GoldenDiffMetrics,
-    GradientStop, LinearGradientParams, RRectBlurParams, RadialGradientParams, WgpuRenderer,
-    DEFAULT_TEXT_CONTRAST,
+    GradientStop, ImageTexture, LinearGradientParams, RRectBlurParams, RadialGradientParams,
+    TextureFillBatch, UvVertex, WgpuRenderer, DEFAULT_TEXT_CONTRAST,
 };
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -44,11 +48,109 @@ pub enum PointStyle {
     Square,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum VertexMode {
+    #[default]
+    Triangles = 0,
+    TriangleStrip = 1,
+    TriangleFan = 2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColorFilter {
+    Mode(Color, BlendMode),
+    Matrix([f32; 20]),
+    SrgbToLinear,
+    LinearToSrgb,
+    Compose(Box<ColorFilter>, Box<ColorFilter>),
+}
+
+impl ColorFilter {
+    pub fn apply(&self, color: Color) -> Color {
+        match self {
+            Self::Mode(filter_color, blend_mode) => color.blend(*filter_color, *blend_mode),
+            Self::Matrix(m) => color.apply_color_matrix(&ColorMatrix { array: *m }),
+            Self::SrgbToLinear => color.srgb_to_linear(),
+            Self::LinearToSrgb => color.linear_to_srgb(),
+            Self::Compose(outer, inner) => outer.apply(inner.apply(color)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageFilter {
+    Blur {
+        sigma_x: Scalar,
+        sigma_y: Scalar,
+        tile_mode: TileMode,
+    },
+    Dilate {
+        radius_x: Scalar,
+        radius_y: Scalar,
+    },
+    Erode {
+        radius_x: Scalar,
+        radius_y: Scalar,
+    },
+    Matrix(Matrix),
+    ColorFilter(ColorFilter),
+    Compose(Box<ImageFilter>, Box<ImageFilter>),
+}
+
+impl ImageFilter {
+    pub fn filter_bounds(&self, bounds: Rect) -> Rect {
+        match self {
+            Self::Blur {
+                sigma_x, sigma_y, ..
+            } => {
+                let pad_x = (sigma_x.max(0.0) * 3.0).ceil();
+                let pad_y = (sigma_y.max(0.0) * 3.0).ceil();
+                Rect::from_ltrb(
+                    bounds.get_left() - pad_x,
+                    bounds.get_top() - pad_y,
+                    bounds.get_right() + pad_x,
+                    bounds.get_bottom() + pad_y,
+                )
+            }
+            Self::Dilate { radius_x, radius_y } => {
+                let rx = radius_x.max(0.0);
+                let ry = radius_y.max(0.0);
+                Rect::from_ltrb(
+                    bounds.get_left() - rx,
+                    bounds.get_top() - ry,
+                    bounds.get_right() + rx,
+                    bounds.get_bottom() + ry,
+                )
+            }
+            Self::Erode { radius_x, radius_y } => {
+                let rx = radius_x.max(0.0);
+                let ry = radius_y.max(0.0);
+                Rect::from_ltrb(
+                    bounds.get_left() + rx,
+                    bounds.get_top() + ry,
+                    (bounds.get_right() - rx).max(bounds.get_left() + rx),
+                    (bounds.get_bottom() - ry).max(bounds.get_top() + ry),
+                )
+            }
+            Self::Matrix(m) => transform_rect(m, bounds),
+            Self::ColorFilter(_) => bounds,
+            Self::Compose(outer, inner) => outer.filter_bounds(inner.filter_bounds(bounds)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintShader {
     Solid(Color),
     LinearGradient(LinearGradientParams),
     RadialGradient(RadialGradientParams),
+    Image {
+        texture: ImageTexture,
+        tile_mode_x: TileMode,
+        tile_mode_y: TileMode,
+        matrix: Matrix,
+        linear_filter: bool,
+    },
 }
 
 pub type ColorSource = PaintShader;
@@ -64,6 +166,8 @@ pub struct Paint {
     pub color: Color,
     pub shader: Option<PaintShader>,
     pub color_source: Option<ColorSource>,
+    pub color_filter: Option<ColorFilter>,
+    pub image_filter: Option<ImageFilter>,
     pub style: DrawStyle,
     pub stroke_width: Scalar,
     pub stroke_cap: Cap,
@@ -81,6 +185,8 @@ impl Default for Paint {
             color: Color::BLACK,
             shader: None,
             color_source: None,
+            color_filter: None,
+            image_filter: None,
             style: DrawStyle::Fill,
             stroke_width: 0.0,
             stroke_cap: Cap::Butt,
@@ -153,6 +259,16 @@ impl Paint {
         self
     }
 
+    pub fn with_color_filter(mut self, filter: ColorFilter) -> Self {
+        self.color_filter = Some(filter);
+        self
+    }
+
+    pub fn with_image_filter(mut self, filter: ImageFilter) -> Self {
+        self.image_filter = Some(filter);
+        self
+    }
+
     pub fn with_mask_blur_sigma(mut self, sigma: Scalar) -> Self {
         self.mask_blur_sigma = sigma;
         self
@@ -167,15 +283,19 @@ impl Paint {
             Some(ColorSource::Solid(c)) => *c,
             _ => self.color,
         };
+        let filtered = match &self.color_filter {
+            Some(cf) => cf.apply(base),
+            None => base,
+        };
         if self.invert_colors {
             Color::new(
-                (1.0 - base.red).clamp(0.0, 1.0),
-                (1.0 - base.green).clamp(0.0, 1.0),
-                (1.0 - base.blue).clamp(0.0, 1.0),
-                base.alpha,
+                (1.0 - filtered.red).clamp(0.0, 1.0),
+                (1.0 - filtered.green).clamp(0.0, 1.0),
+                (1.0 - filtered.blue).clamp(0.0, 1.0),
+                filtered.alpha,
             )
         } else {
-            base
+            filtered
         }
     }
 
@@ -206,6 +326,8 @@ impl Paint {
     pub fn can_apply_opacity_peephole(&self) -> bool {
         self.blend_mode == BlendMode::SrcOver
             && !self.invert_colors
+            && self.color_filter.is_none()
+            && self.image_filter.is_none()
             && self.mask_blur_sigma <= K_EH_CLOSE_ENOUGH
     }
 
@@ -215,7 +337,11 @@ impl Paint {
         }
         if matches!(
             self.effective_color_source(),
-            Some(ColorSource::LinearGradient(_) | ColorSource::RadialGradient(_))
+            Some(
+                ColorSource::LinearGradient(_)
+                    | ColorSource::RadialGradient(_)
+                    | ColorSource::Image { .. }
+            )
         ) {
             return false;
         }
@@ -274,6 +400,7 @@ impl Paint {
 #[derive(Clone, Debug)]
 pub enum DisplayListOp {
     Save,
+    SaveLayer(Option<Rect>, Option<Paint>),
     Restore,
     RestoreToCount(usize),
     Translate(Scalar, Scalar),
@@ -297,11 +424,56 @@ pub enum DisplayListOp {
     DrawDashedPath(Path, Scalar, Vec<Scalar>, Paint),
     DrawPath(Path, Paint),
     DrawRRectShadow(Rect, Scalar, Scalar, Color),
+    DrawShadow {
+        path: Path,
+        color: Color,
+        elevation: Scalar,
+        transparent_occluder: bool,
+        device_pixel_ratio: Scalar,
+    },
     DrawTextFrame(TextFrame, Point, Paint),
+    DrawParagraph(Arc<Paragraph>, Point),
     DrawText(String, TextStyle, Point),
     DrawIcon(MaterialIcon, Scalar, Color, Point),
     DrawGlyphPath(char, BuiltinFont, Scalar, Point, Paint),
     DrawPolymorphicCard(usize, Scalar, Rect),
+    DrawImage(ImageTexture, Point, Paint, bool),
+    DrawImageRect(ImageTexture, Rect, Rect, Paint, bool),
+    DrawAtlas {
+        atlas: ImageTexture,
+        rst_transforms: Vec<[Scalar; 4]>,
+        tex_rects: Vec<Rect>,
+        colors: Option<Vec<Color>>,
+        blend_mode: BlendMode,
+        cull_rect: Option<Rect>,
+        paint: Option<Paint>,
+        linear_filter: bool,
+    },
+    DrawVertices {
+        positions: Vec<Point>,
+        tex_coords: Option<Vec<Point>>,
+        colors: Option<Vec<Color>>,
+        indices: Vec<u16>,
+        blend_mode: BlendMode,
+        paint: Paint,
+    },
+    DrawPicture(Arc<DisplayList>),
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CanvasReplayStats {
+    pub op_count: u32,
+    pub rrect_count: u32,
+    pub drrect_count: u32,
+    pub path_count: u32,
+    pub paragraph_count: u32,
+    pub picture_count: u32,
+    pub save_layer_count: u32,
+    pub path_fill_count: u32,
+    pub path_stroke_count: u32,
+    pub path_convex_fast_count: u32,
+    pub path_pslg_count: u32,
+    pub culled_count: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -323,13 +495,22 @@ impl DisplayList {
     }
 
     pub fn dispatch(&self, canvas: &mut Canvas) {
+        let base_save_count = canvas.get_save_count();
         for op in &self.ops {
+            canvas.replay_stats.op_count += 1;
             match op {
                 DisplayListOp::Save => canvas.save(),
+                DisplayListOp::SaveLayer(bounds, paint) => {
+                    canvas.replay_stats.save_layer_count += 1;
+                    canvas.save_layer(*bounds, paint.as_ref());
+                }
                 DisplayListOp::Restore => {
                     canvas.restore();
                 }
-                DisplayListOp::RestoreToCount(c) => canvas.restore_to_count(*c),
+                DisplayListOp::RestoreToCount(c) => {
+                    let adjusted = base_save_count.saturating_sub(1) + (*c).max(1);
+                    canvas.restore_to_count(adjusted);
+                }
                 DisplayListOp::Translate(tx, ty) => canvas.translate(*tx, *ty),
                 DisplayListOp::Scale(sx, sy) => canvas.scale(*sx, *sy),
                 DisplayListOp::Rotate(r) => canvas.rotate(*r),
@@ -342,10 +523,12 @@ impl DisplayList {
                 DisplayListOp::DrawColor(color, mode) => canvas.draw_color(*color, *mode),
                 DisplayListOp::DrawRect(rect, paint) => canvas.draw_rect(*rect, paint),
                 DisplayListOp::DrawRRect(rect, radii, paint) => {
-                    canvas.draw_rrect(*rect, *radii, paint)
+                    canvas.replay_stats.rrect_count += 1;
+                    canvas.draw_rrect(*rect, *radii, paint);
                 }
                 DisplayListOp::DrawDiffRRect(or, orad, ir, irad, paint) => {
-                    canvas.draw_diff_rrect(*or, *orad, *ir, *irad, paint)
+                    canvas.replay_stats.drrect_count += 1;
+                    canvas.draw_diff_rrect(*or, *orad, *ir, *irad, paint);
                 }
                 DisplayListOp::DrawOval(rect, paint) => canvas.draw_oval(*rect, paint),
                 DisplayListOp::DrawCircle(center, radius, paint) => {
@@ -361,12 +544,34 @@ impl DisplayList {
                 DisplayListOp::DrawDashedPath(path, offset, intervals, paint) => {
                     canvas.draw_dashed_path(path, *offset, intervals, paint)
                 }
-                DisplayListOp::DrawPath(path, paint) => canvas.draw_path(path, paint),
+                DisplayListOp::DrawPath(path, paint) => {
+                    canvas.replay_stats.path_count += 1;
+                    canvas.draw_path(path, paint);
+                }
                 DisplayListOp::DrawRRectShadow(rect, radius, sigma, color) => {
                     canvas.draw_rrect_shadow(*rect, *radius, *sigma, *color)
                 }
+                DisplayListOp::DrawShadow {
+                    path,
+                    color,
+                    elevation,
+                    transparent_occluder,
+                    device_pixel_ratio,
+                } => {
+                    canvas.draw_shadow(
+                        path,
+                        *color,
+                        *elevation,
+                        *transparent_occluder,
+                        *device_pixel_ratio,
+                    );
+                }
                 DisplayListOp::DrawTextFrame(frame, origin, paint) => {
                     canvas.draw_text_frame(frame, *origin, paint)
+                }
+                DisplayListOp::DrawParagraph(paragraph, offset) => {
+                    canvas.replay_stats.paragraph_count += 1;
+                    canvas.draw_paragraph(paragraph, *offset);
                 }
                 DisplayListOp::DrawText(text, style, origin) => {
                     canvas.draw_text(text, *style, *origin)
@@ -379,6 +584,54 @@ impl DisplayList {
                 }
                 DisplayListOp::DrawPolymorphicCard(index, anim, rect) => {
                     canvas.draw_polymorphic_card(*index, *anim, *rect)
+                }
+                DisplayListOp::DrawImage(image, offset, paint, linear) => {
+                    canvas.draw_image(image, *offset, paint, *linear)
+                }
+                DisplayListOp::DrawImageRect(image, src, dst, paint, linear) => {
+                    canvas.draw_image_rect(image, *src, *dst, paint, *linear)
+                }
+                DisplayListOp::DrawAtlas {
+                    atlas,
+                    rst_transforms,
+                    tex_rects,
+                    colors,
+                    blend_mode,
+                    cull_rect,
+                    paint,
+                    linear_filter,
+                } => {
+                    canvas.draw_atlas(
+                        atlas,
+                        rst_transforms,
+                        tex_rects,
+                        colors.as_deref(),
+                        *blend_mode,
+                        *cull_rect,
+                        paint.as_ref(),
+                        *linear_filter,
+                    );
+                }
+                DisplayListOp::DrawVertices {
+                    positions,
+                    tex_coords,
+                    colors,
+                    indices,
+                    blend_mode,
+                    paint,
+                } => {
+                    canvas.draw_vertices(
+                        positions,
+                        tex_coords.as_deref(),
+                        colors.as_deref(),
+                        indices,
+                        *blend_mode,
+                        paint,
+                    );
+                }
+                DisplayListOp::DrawPicture(picture) => {
+                    canvas.replay_stats.picture_count += 1;
+                    canvas.draw_picture(picture);
                 }
             }
         }
@@ -397,6 +650,11 @@ impl DisplayListBuilder {
 
     pub fn save(&mut self) -> &mut Self {
         self.ops.push(DisplayListOp::Save);
+        self
+    }
+
+    pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<Paint>) -> &mut Self {
+        self.ops.push(DisplayListOp::SaveLayer(bounds, paint));
         self
     }
 
@@ -513,8 +771,13 @@ impl DisplayListBuilder {
         use_center: bool,
         paint: Paint,
     ) -> &mut Self {
-        self.ops
-            .push(DisplayListOp::DrawArc(oval_bounds, start, sweep, use_center, paint));
+        self.ops.push(DisplayListOp::DrawArc(
+            oval_bounds,
+            start,
+            sweep,
+            use_center,
+            paint,
+        ));
         self
     }
 
@@ -531,8 +794,9 @@ impl DisplayListBuilder {
         off_length: Scalar,
         paint: Paint,
     ) -> &mut Self {
-        self.ops
-            .push(DisplayListOp::DrawDashedLine(p0, p1, on_length, off_length, paint));
+        self.ops.push(DisplayListOp::DrawDashedLine(
+            p0, p1, on_length, off_length, paint,
+        ));
         self
     }
 
@@ -564,8 +828,12 @@ impl DisplayListBuilder {
         blur_sigma: Scalar,
         color: Color,
     ) -> &mut Self {
-        self.ops
-            .push(DisplayListOp::DrawRRectShadow(rect, corner_radius, blur_sigma, color));
+        self.ops.push(DisplayListOp::DrawRRectShadow(
+            rect,
+            corner_radius,
+            blur_sigma,
+            color,
+        ));
         self
     }
 
@@ -580,7 +848,12 @@ impl DisplayListBuilder {
         self
     }
 
-    pub fn draw_text(&mut self, text: impl Into<String>, style: TextStyle, origin: Point) -> &mut Self {
+    pub fn draw_text(
+        &mut self,
+        text: impl Into<String>,
+        style: TextStyle,
+        origin: Point,
+    ) -> &mut Self {
         self.ops
             .push(DisplayListOp::DrawText(text.into(), style, origin));
         self
@@ -606,8 +879,9 @@ impl DisplayListBuilder {
         origin: Point,
         paint: Paint,
     ) -> &mut Self {
-        self.ops
-            .push(DisplayListOp::DrawGlyphPath(ch, font, font_size, origin, paint));
+        self.ops.push(DisplayListOp::DrawGlyphPath(
+            ch, font, font_size, origin, paint,
+        ));
         self
     }
 
@@ -617,8 +891,123 @@ impl DisplayListBuilder {
         animation_value: Scalar,
         rect: Rect,
     ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawPolymorphicCard(
+            index,
+            animation_value,
+            rect,
+        ));
+        self
+    }
+
+    pub fn draw_paragraph(
+        &mut self,
+        paragraph: impl Into<Arc<Paragraph>>,
+        offset: Point,
+    ) -> &mut Self {
         self.ops
-            .push(DisplayListOp::DrawPolymorphicCard(index, animation_value, rect));
+            .push(DisplayListOp::DrawParagraph(paragraph.into(), offset));
+        self
+    }
+
+    pub fn draw_image(
+        &mut self,
+        image: ImageTexture,
+        offset: Point,
+        paint: Paint,
+        linear_filter: bool,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawImage(
+            image,
+            offset,
+            paint,
+            linear_filter,
+        ));
+        self
+    }
+
+    pub fn draw_image_rect(
+        &mut self,
+        image: ImageTexture,
+        src: Rect,
+        dst: Rect,
+        paint: Paint,
+        linear_filter: bool,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawImageRect(
+            image,
+            src,
+            dst,
+            paint,
+            linear_filter,
+        ));
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_atlas(
+        &mut self,
+        atlas: ImageTexture,
+        rst_transforms: Vec<[Scalar; 4]>,
+        tex_rects: Vec<Rect>,
+        colors: Option<Vec<Color>>,
+        blend_mode: BlendMode,
+        cull_rect: Option<Rect>,
+        paint: Option<Paint>,
+        linear_filter: bool,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawAtlas {
+            atlas,
+            rst_transforms,
+            tex_rects,
+            colors,
+            blend_mode,
+            cull_rect,
+            paint,
+            linear_filter,
+        });
+        self
+    }
+
+    pub fn draw_vertices(
+        &mut self,
+        positions: Vec<Point>,
+        tex_coords: Option<Vec<Point>>,
+        colors: Option<Vec<Color>>,
+        indices: Vec<u16>,
+        blend_mode: BlendMode,
+        paint: Paint,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawVertices {
+            positions,
+            tex_coords,
+            colors,
+            indices,
+            blend_mode,
+            paint,
+        });
+        self
+    }
+
+    pub fn draw_shadow(
+        &mut self,
+        path: Path,
+        color: Color,
+        elevation: Scalar,
+        transparent_occluder: bool,
+        device_pixel_ratio: Scalar,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawShadow {
+            path,
+            color,
+            elevation,
+            transparent_occluder,
+            device_pixel_ratio,
+        });
+        self
+    }
+
+    pub fn draw_picture(&mut self, picture: Arc<DisplayList>) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawPicture(picture));
         self
     }
 
@@ -746,8 +1135,14 @@ fn transform_rect(tx: &Matrix, rect: Rect) -> Rect {
         tx.transform_point(Point::new(rect.get_left(), rect.get_bottom())),
         tx.transform_point(Point::new(rect.get_right(), rect.get_bottom())),
     ];
-    let min_x = corners.iter().map(|p| p.x).fold(Scalar::INFINITY, Scalar::min);
-    let min_y = corners.iter().map(|p| p.y).fold(Scalar::INFINITY, Scalar::min);
+    let min_x = corners
+        .iter()
+        .map(|p| p.x)
+        .fold(Scalar::INFINITY, Scalar::min);
+    let min_y = corners
+        .iter()
+        .map(|p| p.y)
+        .fold(Scalar::INFINITY, Scalar::min);
     let max_x = corners
         .iter()
         .map(|p| p.x)
@@ -833,6 +1228,260 @@ fn union_rect_list(rects: &[Rect]) -> Option<Rect> {
     } else {
         None
     }
+}
+
+#[inline]
+fn rect_contains_rect(outer: Rect, inner: Rect) -> bool {
+    inner.get_left() >= outer.get_left()
+        && inner.get_top() >= outer.get_top()
+        && inner.get_right() <= outer.get_right()
+        && inner.get_bottom() <= outer.get_bottom()
+}
+
+#[inline]
+fn expand_rect(rect: Rect, pad: Scalar) -> Rect {
+    Rect::from_ltrb(
+        rect.get_left() - pad,
+        rect.get_top() - pad,
+        rect.get_right() + pad,
+        rect.get_bottom() + pad,
+    )
+}
+
+const MAX_GEOMETRY_MESH_CACHE_ENTRIES: usize = 512;
+const MAX_SEEN_PATH_IDS: usize = 1024;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct CircleMeshCacheKey {
+    radius_bits: u32,
+    quantized_scale: u32,
+    is_stroke: bool,
+    stroke_width_bits: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct PathMeshCacheKey {
+    path_cache_id: u64,
+    fill_type: u8,
+    quantized_scale: u32,
+    is_stroke: bool,
+    stroke_width_bits: u32,
+    stroke_cap: u8,
+    stroke_join: u8,
+    stroke_miter_bits: u32,
+}
+
+#[derive(Default)]
+struct GeometryMeshCache {
+    circles: std::collections::HashMap<CircleMeshCacheKey, Arc<TessellatedMesh>>,
+    paths: std::collections::HashMap<
+        PathMeshCacheKey,
+        (Arc<TessellatedMesh>, Option<FillTessellationKind>),
+    >,
+    seen_path_ids: std::collections::HashSet<u64>,
+}
+
+thread_local! {
+    static GEOMETRY_MESH_CACHE: std::cell::RefCell<GeometryMeshCache> =
+        std::cell::RefCell::new(GeometryMeshCache::default());
+}
+
+#[inline]
+fn encode_cap(cap: Cap) -> u8 {
+    match cap {
+        Cap::Butt => 0,
+        Cap::Round => 1,
+        Cap::Square => 2,
+    }
+}
+
+#[inline]
+fn encode_join(join: Join) -> u8 {
+    match join {
+        Join::Miter => 0,
+        Join::Round => 1,
+        Join::Bevel => 2,
+    }
+}
+
+#[inline]
+fn encode_fill_type(fill_type: FillType) -> u8 {
+    match fill_type {
+        FillType::NonZero => 0,
+        FillType::Odd => 1,
+    }
+}
+
+#[inline]
+fn paint_uses_local_coords_for_shader(paint: &Paint) -> bool {
+    matches!(
+        paint.effective_color_source(),
+        Some(
+            ColorSource::LinearGradient(_)
+                | ColorSource::RadialGradient(_)
+                | ColorSource::Image { .. }
+        )
+    )
+}
+
+fn translate_cached_mesh(base: &TessellatedMesh, dx: Scalar, dy: Scalar) -> TessellatedMesh {
+    if dx == 0.0 && dy == 0.0 {
+        return base.clone();
+    }
+    let vertices = base
+        .vertices
+        .iter()
+        .map(|v| Vertex2D::new(v.position[0] + dx, v.position[1] + dy))
+        .collect();
+    TessellatedMesh {
+        vertices,
+        indices: base.indices.clone(),
+    }
+}
+
+fn cached_circle_fill_mesh_arc(radius: Scalar, scale: Scalar) -> Arc<TessellatedMesh> {
+    let eff_scale = scale.max(1.0);
+    let q_scale = (eff_scale * 16.0).round().max(1.0) as u32;
+    let key = CircleMeshCacheKey {
+        radius_bits: radius.to_bits(),
+        quantized_scale: q_scale,
+        is_stroke: false,
+        stroke_width_bits: 0,
+    };
+    GEOMETRY_MESH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(found) = cache.circles.get(&key) {
+            return Arc::clone(found);
+        }
+        if cache.circles.len() >= MAX_GEOMETRY_MESH_CACHE_ENTRIES {
+            cache.circles.clear();
+        }
+        let mesh = CircleGeometry::new(Point::ZERO, radius).get_mesh(q_scale as Scalar / 16.0);
+        let arc = Arc::new(mesh);
+        cache.circles.insert(key, Arc::clone(&arc));
+        arc
+    })
+}
+
+fn cached_circle_stroke_mesh_arc(
+    radius: Scalar,
+    stroke_w: Scalar,
+    scale: Scalar,
+) -> Arc<TessellatedMesh> {
+    let eff_scale = scale.max(1.0);
+    let q_scale = (eff_scale * 16.0).round().max(1.0) as u32;
+    let key = CircleMeshCacheKey {
+        radius_bits: radius.to_bits(),
+        quantized_scale: q_scale,
+        is_stroke: true,
+        stroke_width_bits: stroke_w.to_bits(),
+    };
+    GEOMETRY_MESH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(found) = cache.circles.get(&key) {
+            return Arc::clone(found);
+        }
+        if cache.circles.len() >= MAX_GEOMETRY_MESH_CACHE_ENTRIES {
+            cache.circles.clear();
+        }
+        let mesh = CircleGeometry::new(Point::ZERO, radius)
+            .get_stroked_mesh(stroke_w, q_scale as Scalar / 16.0);
+        let arc = Arc::new(mesh);
+        cache.circles.insert(key, Arc::clone(&arc));
+        arc
+    })
+}
+
+fn cached_path_fill_mesh(path: &Path, scale: Scalar) -> (TessellatedMesh, FillTessellationKind) {
+    let eff_scale = scale.max(1.0);
+    let cid = path.cache_id();
+    if cid == 0 {
+        return Tessellator::tessellate_fill_classified(path, eff_scale);
+    }
+    let q_scale = (eff_scale * 16.0).round().max(1.0) as u32;
+    let quantized_tol = (q_scale as Scalar / 16.0).max(1.0);
+    let key = PathMeshCacheKey {
+        path_cache_id: cid,
+        fill_type: encode_fill_type(path.get_fill_type()),
+        quantized_scale: q_scale,
+        is_stroke: false,
+        stroke_width_bits: 0,
+        stroke_cap: 0,
+        stroke_join: 0,
+        stroke_miter_bits: 0,
+    };
+    GEOMETRY_MESH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((found_arc, found_kind)) = cache.paths.get(&key) {
+            return (
+                (**found_arc).clone(),
+                found_kind.unwrap_or(FillTessellationKind::PslgGeneral),
+            );
+        }
+        if !cache.seen_path_ids.contains(&cid) {
+            if cache.seen_path_ids.len() >= MAX_SEEN_PATH_IDS {
+                cache.seen_path_ids.clear();
+            }
+            cache.seen_path_ids.insert(cid);
+            drop(cache);
+            return Tessellator::tessellate_fill_classified(path, quantized_tol);
+        }
+        drop(cache);
+        let (mesh, kind) = Tessellator::tessellate_fill_classified(path, quantized_tol);
+        let arc = Arc::new(mesh);
+        let mut cache = cell.borrow_mut();
+        if cache.paths.len() >= MAX_GEOMETRY_MESH_CACHE_ENTRIES {
+            cache.paths.clear();
+        }
+        cache.paths.insert(key, (Arc::clone(&arc), Some(kind)));
+        ((*arc).clone(), kind)
+    })
+}
+
+fn cached_path_stroke_mesh(
+    path: &Path,
+    stroke: StrokeParameters,
+    scale: Scalar,
+) -> TessellatedMesh {
+    let cid = path.cache_id();
+    if cid == 0 {
+        return Tessellator::tessellate_stroke(path, stroke, scale);
+    }
+    let q_scale = (scale * 16.0).round().max(1.0) as u32;
+    let quantized_tol = (q_scale as Scalar / 16.0).max(1e-4);
+    let key = PathMeshCacheKey {
+        path_cache_id: cid,
+        fill_type: encode_fill_type(path.get_fill_type()),
+        quantized_scale: q_scale,
+        is_stroke: true,
+        stroke_width_bits: stroke.width.to_bits(),
+        stroke_cap: encode_cap(stroke.cap),
+        stroke_join: encode_join(stroke.join),
+        stroke_miter_bits: stroke.miter_limit.to_bits(),
+    };
+    GEOMETRY_MESH_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((found_arc, _)) = cache.paths.get(&key) {
+            return (**found_arc).clone();
+        }
+        if !cache.seen_path_ids.contains(&cid) {
+            if cache.seen_path_ids.len() >= MAX_SEEN_PATH_IDS {
+                cache.seen_path_ids.clear();
+            }
+            cache.seen_path_ids.insert(cid);
+            drop(cache);
+            return Tessellator::tessellate_stroke(path, stroke, quantized_tol);
+        }
+        drop(cache);
+        let mesh = Tessellator::tessellate_stroke(path, stroke, quantized_tol);
+        let arc = Arc::new(mesh);
+        let mut cache = cell.borrow_mut();
+        if cache.paths.len() >= MAX_GEOMETRY_MESH_CACHE_ENTRIES {
+            cache.paths.clear();
+        }
+        cache.paths.insert(key, (Arc::clone(&arc), None));
+        (*arc).clone()
+    })
 }
 
 /// Converts an `impeller_path::Path` into a dashed `impeller_path::Path` using `kurbo::dash`.
@@ -943,6 +1592,8 @@ struct CanvasState {
     transform: Matrix,
     clip_rects: Vec<Rect>,
     has_explicit_clip: bool,
+    layer_start_cmd_index: Option<usize>,
+    layer_paint: Option<Paint>,
 }
 
 #[derive(Clone, Debug)]
@@ -962,9 +1613,11 @@ pub struct Canvas {
     stack: Vec<CanvasState>,
     commands: Vec<DrawCommand>,
     typographer: Option<TypographerContext>,
-    glyph_batches: Vec<PendingGlyphBatch>,
     cached_alpha_atlas: Option<(u64, Arc<GlyphAtlas>)>,
     cached_color_atlas: Option<(u64, Arc<GlyphAtlas>)>,
+    default_alpha_atlas: Option<Arc<GlyphAtlas>>,
+    default_color_atlas: Option<Arc<GlyphAtlas>>,
+    replay_stats: CanvasReplayStats,
 }
 
 impl Canvas {
@@ -973,12 +1626,7 @@ impl Canvas {
         Self::with_cull_rect(width, height, clear_color, cull_rect)
     }
 
-    pub fn with_cull_rect(
-        width: u32,
-        height: u32,
-        clear_color: Color,
-        cull_rect: Rect,
-    ) -> Self {
+    pub fn with_cull_rect(width: u32, height: u32, clear_color: Color, cull_rect: Rect) -> Self {
         let canvas_bounds = Rect::from_xywh(0.0, 0.0, width as Scalar, height as Scalar);
         let initial_clip = intersect_rects(canvas_bounds, cull_rect)
             .into_iter()
@@ -992,12 +1640,62 @@ impl Canvas {
                 transform: Matrix::IDENTITY,
                 clip_rects: initial_clip,
                 has_explicit_clip: false,
+                layer_start_cmd_index: None,
+                layer_paint: None,
             }],
             commands: Vec::new(),
             typographer: None,
-            glyph_batches: Vec::new(),
             cached_alpha_atlas: None,
             cached_color_atlas: None,
+            default_alpha_atlas: None,
+            default_color_atlas: None,
+            replay_stats: CanvasReplayStats::default(),
+        }
+    }
+
+    pub const fn replay_stats(&self) -> CanvasReplayStats {
+        self.replay_stats
+    }
+
+    pub fn set_default_glyph_atlases(
+        &mut self,
+        alpha: Option<Arc<GlyphAtlas>>,
+        color: Option<Arc<GlyphAtlas>>,
+    ) {
+        self.default_alpha_atlas = alpha;
+        self.default_color_atlas = color;
+    }
+
+    /// Resets the canvas for a new frame while retaining internal `commands` and `stack` capacities.
+    pub fn reset(&mut self, width: u32, height: u32, clear_color: Color) {
+        self.width = width;
+        self.height = height;
+        self.clear_color = clear_color;
+        self.replay_stats = CanvasReplayStats::default();
+        let canvas_bounds = Rect::from_xywh(0.0, 0.0, width as Scalar, height as Scalar);
+        self.initial_cull_rect = canvas_bounds;
+        self.commands.clear();
+        self.stack.truncate(1);
+        if let Some(root) = self.stack.first_mut() {
+            root.transform = Matrix::IDENTITY;
+            root.clip_rects.clear();
+            if let Some(clip) = intersect_rects(canvas_bounds, canvas_bounds) {
+                root.clip_rects.push(clip);
+            }
+            root.has_explicit_clip = false;
+            root.layer_start_cmd_index = None;
+            root.layer_paint = None;
+        } else {
+            let initial_clip = intersect_rects(canvas_bounds, canvas_bounds)
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.stack.push(CanvasState {
+                transform: Matrix::IDENTITY,
+                clip_rects: initial_clip,
+                has_explicit_clip: false,
+                layer_start_cmd_index: None,
+                layer_paint: None,
+            });
         }
     }
 
@@ -1047,6 +1745,23 @@ impl Canvas {
         self.typographer_mut().shape_text(s, style, origin)
     }
 
+    pub fn sync_glyph_atlases_with_arcs(
+        &mut self,
+        alpha_arc: &Arc<GlyphAtlas>,
+        color_arc: &Arc<GlyphAtlas>,
+    ) {
+        for cmd in &mut self.commands {
+            if let DrawCommand::GlyphAtlas(batch) = cmd {
+                if batch.alpha_atlas.is_none() && batch.quads.iter().any(|q| !q.is_color) {
+                    batch.alpha_atlas = Some(Arc::clone(alpha_arc));
+                }
+                if batch.color_atlas.is_none() && batch.quads.iter().any(|q| q.is_color) {
+                    batch.color_atlas = Some(Arc::clone(color_arc));
+                }
+            }
+        }
+    }
+
     pub fn sync_glyph_atlases_with(&mut self, typographer: &TypographerContext) {
         let alpha_gen = typographer.alpha_atlas.generation;
         let alpha_arc = match &self.cached_alpha_atlas {
@@ -1068,22 +1783,68 @@ impl Canvas {
             }
         };
 
-        for cmd in &mut self.commands {
-            if let DrawCommand::GlyphAtlas(batch) = cmd {
-                if batch.quads.iter().any(|q| !q.is_color) {
-                    batch.alpha_atlas = Some(Arc::clone(&alpha_arc));
-                }
-                if batch.quads.iter().any(|q| q.is_color) {
-                    batch.color_atlas = Some(Arc::clone(&color_arc));
-                }
-            }
-        }
+        self.sync_glyph_atlases_with_arcs(&alpha_arc, &color_arc);
     }
 
-    pub fn emit_glyph_quads_batch(
+    fn resolve_clip_targets(
+        &self,
+        local_bounds: Option<Rect>,
+        transform: &Matrix,
+    ) -> Vec<Option<Rect>> {
+        let Some(top) = self.stack.last() else {
+            return Vec::new();
+        };
+        if top.clip_rects.is_empty() {
+            return Vec::new();
+        }
+        let canvas_rect = Rect::from_xywh(0.0, 0.0, self.width as Scalar, self.height as Scalar);
+        let Some(canvas_bounds) = intersect_rects(canvas_rect, self.initial_cull_rect) else {
+            return Vec::new();
+        };
+
+        let Some(lb) = local_bounds else {
+            return if top.has_explicit_clip {
+                top.clip_rects.iter().copied().map(Some).collect()
+            } else {
+                vec![None]
+            };
+        };
+
+        if lb.is_empty() {
+            return Vec::new();
+        }
+        let dev_bounds = transform_rect(transform, lb);
+        if intersect_rects(dev_bounds, canvas_bounds).is_none() {
+            return Vec::new();
+        }
+        if !top.has_explicit_clip {
+            return vec![None];
+        }
+
+        let mut targets = Vec::with_capacity(top.clip_rects.len());
+        let mut emitted_unclipped = false;
+        for clip in &top.clip_rects {
+            if intersect_rects(dev_bounds, *clip).is_none() {
+                continue;
+            }
+            if rect_contains_rect(*clip, dev_bounds) {
+                if !emitted_unclipped {
+                    targets.push(None);
+                    emitted_unclipped = true;
+                }
+            } else {
+                targets.push(Some(*clip));
+            }
+        }
+        targets
+    }
+
+    pub fn emit_glyph_quads_slice_with_offset(
         &mut self,
-        quads: Vec<AtlasGlyphQuad>,
+        quads: &[AtlasGlyphQuad],
+        offset: Point,
         transform: Matrix,
+        blend_mode: BlendMode,
         use_linear_filter: bool,
     ) {
         if quads.is_empty() {
@@ -1095,32 +1856,205 @@ impl Canvas {
         if top.clip_rects.is_empty() {
             return;
         }
-        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
-            top.clip_rects.iter().copied().map(Some).collect()
-        } else {
-            vec![None]
+        let canvas_rect = Rect::from_xywh(0.0, 0.0, self.width as Scalar, self.height as Scalar);
+        let Some(canvas_bounds) = intersect_rects(canvas_rect, self.initial_cull_rect) else {
+            return;
         };
-        for clip_rect in clip_targets {
-            let command_index = self.commands.len();
-            self.glyph_batches.push(PendingGlyphBatch {
-                command_index,
-                transform,
-                quads: quads.clone(),
-                blend_mode: BlendMode::SrcOver,
-                clip_rect,
-            });
+
+        let shift_quad = |q: &AtlasGlyphQuad| -> AtlasGlyphQuad {
+            if offset.x == 0.0 && offset.y == 0.0 {
+                *q
+            } else {
+                AtlasGlyphQuad {
+                    dest_rect: Rect::from_xywh(
+                        q.dest_rect.get_left() + offset.x,
+                        q.dest_rect.get_top() + offset.y,
+                        q.dest_rect.get_width(),
+                        q.dest_rect.get_height(),
+                    ),
+                    atlas_rect: q.atlas_rect,
+                    color: q.color,
+                    is_color: q.is_color,
+                }
+            }
+        };
+
+        if !top.has_explicit_clip {
+            let mut surviving = Vec::with_capacity(quads.len());
+            let mut uses_alpha = false;
+            let mut uses_color = false;
+            for q in quads {
+                let shifted = shift_quad(q);
+                let dev_r = transform_rect(&transform, shifted.dest_rect);
+                if intersect_rects(dev_r, canvas_bounds).is_some() {
+                    if shifted.is_color {
+                        uses_color = true;
+                    } else {
+                        uses_alpha = true;
+                    }
+                    surviving.push(shifted);
+                }
+            }
+            if surviving.is_empty() {
+                return;
+            }
+            let alpha_atlas = if uses_alpha {
+                self.default_alpha_atlas.clone()
+            } else {
+                None
+            };
+            let color_atlas = if uses_color {
+                self.default_color_atlas.clone()
+            } else {
+                None
+            };
             self.commands.push(DrawCommand::GlyphAtlas(
                 GlyphAtlasBatch::new(
-                    quads.clone(),
+                    surviving,
                     transform,
+                    alpha_atlas,
+                    color_atlas,
+                    blend_mode,
                     None,
-                    None,
-                    BlendMode::SrcOver,
-                    clip_rect,
+                )
+                .with_linear_filter(use_linear_filter),
+            ));
+            return;
+        }
+
+        if top.clip_rects.len() == 1 {
+            let Some(effective_clip) = intersect_rects(top.clip_rects[0], canvas_bounds) else {
+                return;
+            };
+            let mut surviving = Vec::with_capacity(quads.len());
+            let mut all_contained = true;
+            let mut uses_alpha = false;
+            let mut uses_color = false;
+            for q in quads {
+                let shifted = shift_quad(q);
+                let dev_r = transform_rect(&transform, shifted.dest_rect);
+                if intersect_rects(dev_r, effective_clip).is_some() {
+                    if !rect_contains_rect(effective_clip, dev_r) {
+                        all_contained = false;
+                    }
+                    if shifted.is_color {
+                        uses_color = true;
+                    } else {
+                        uses_alpha = true;
+                    }
+                    surviving.push(shifted);
+                }
+            }
+            if surviving.is_empty() {
+                return;
+            }
+            let effective_scissor = if all_contained {
+                None
+            } else {
+                Some(effective_clip)
+            };
+            let alpha_atlas = if uses_alpha {
+                self.default_alpha_atlas.clone()
+            } else {
+                None
+            };
+            let color_atlas = if uses_color {
+                self.default_color_atlas.clone()
+            } else {
+                None
+            };
+            self.commands.push(DrawCommand::GlyphAtlas(
+                GlyphAtlasBatch::new(
+                    surviving,
+                    transform,
+                    alpha_atlas,
+                    color_atlas,
+                    blend_mode,
+                    effective_scissor,
+                )
+                .with_linear_filter(use_linear_filter),
+            ));
+            return;
+        }
+
+        for clip in &top.clip_rects {
+            let Some(effective_clip) = intersect_rects(*clip, canvas_bounds) else {
+                continue;
+            };
+            let mut surviving = Vec::new();
+            let mut all_contained = true;
+            let mut uses_alpha = false;
+            let mut uses_color = false;
+            for q in quads {
+                let shifted = shift_quad(q);
+                let dev_r = transform_rect(&transform, shifted.dest_rect);
+                if intersect_rects(dev_r, effective_clip).is_some() {
+                    if !rect_contains_rect(effective_clip, dev_r) {
+                        all_contained = false;
+                    }
+                    if shifted.is_color {
+                        uses_color = true;
+                    } else {
+                        uses_alpha = true;
+                    }
+                    surviving.push(shifted);
+                }
+            }
+            if surviving.is_empty() {
+                continue;
+            }
+            let effective_scissor = if all_contained {
+                None
+            } else {
+                Some(effective_clip)
+            };
+            let alpha_atlas = if uses_alpha {
+                self.default_alpha_atlas.clone()
+            } else {
+                None
+            };
+            let color_atlas = if uses_color {
+                self.default_color_atlas.clone()
+            } else {
+                None
+            };
+            self.commands.push(DrawCommand::GlyphAtlas(
+                GlyphAtlasBatch::new(
+                    surviving,
+                    transform,
+                    alpha_atlas,
+                    color_atlas,
+                    blend_mode,
+                    effective_scissor,
                 )
                 .with_linear_filter(use_linear_filter),
             ));
         }
+    }
+
+    fn emit_glyph_quads_with_blend(
+        &mut self,
+        quads: Vec<AtlasGlyphQuad>,
+        transform: Matrix,
+        blend_mode: BlendMode,
+        use_linear_filter: bool,
+    ) {
+        self.emit_glyph_quads_slice_with_offset(
+            &quads,
+            Point::new(0.0, 0.0),
+            transform,
+            blend_mode,
+            use_linear_filter,
+        );
+    }
+
+    pub fn emit_glyph_quads_batch(
+        &mut self,
+        quads: Vec<AtlasGlyphQuad>,
+        transform: Matrix,
+        use_linear_filter: bool,
+    ) {
+        self.emit_glyph_quads_with_blend(quads, transform, BlendMode::SrcOver, use_linear_filter);
     }
 
     fn sync_glyph_atlases(&mut self) {
@@ -1186,14 +2120,122 @@ impl Canvas {
     }
 
     pub fn save(&mut self) {
-        if let Some(top) = self.stack.last().cloned() {
-            self.stack.push(top);
+        if let Some(top) = self.stack.last() {
+            self.stack.push(CanvasState {
+                transform: top.transform,
+                clip_rects: top.clip_rects.clone(),
+                has_explicit_clip: top.has_explicit_clip,
+                layer_start_cmd_index: None,
+                layer_paint: None,
+            });
+        }
+    }
+
+    pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<&Paint>) {
+        let start_idx = self.commands.len();
+        if let Some(top) = self.stack.last() {
+            self.stack.push(CanvasState {
+                transform: top.transform,
+                clip_rects: top.clip_rects.clone(),
+                has_explicit_clip: top.has_explicit_clip,
+                layer_start_cmd_index: Some(start_idx),
+                layer_paint: paint.cloned(),
+            });
+        }
+        if let Some(b) = bounds {
+            if !b.is_empty() {
+                self.clip_rect(b);
+            }
         }
     }
 
     pub fn restore(&mut self) -> bool {
         if self.stack.len() > 1 {
-            self.stack.pop();
+            if let Some(popped) = self.stack.pop() {
+                if let (Some(start_idx), Some(layer_paint)) =
+                    (popped.layer_start_cmd_index, popped.layer_paint)
+                {
+                    let layer_alpha = layer_paint.color.alpha.clamp(0.0, 1.0);
+                    let layer_cf = layer_paint.color_filter.as_ref();
+                    let override_blend = (layer_paint.blend_mode != BlendMode::SrcOver)
+                        .then_some(layer_paint.blend_mode);
+
+                    for cmd in self.commands.iter_mut().skip(start_idx) {
+                        match cmd {
+                            DrawCommand::SolidFill {
+                                color, blend_mode, ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    *color = cf.apply(*color);
+                                }
+                                color.alpha = (color.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::LinearGradientFill {
+                                gradient,
+                                blend_mode,
+                                ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    for stop in &mut gradient.stops {
+                                        stop.color = cf.apply(stop.color);
+                                    }
+                                }
+                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::RadialGradientFill {
+                                gradient,
+                                blend_mode,
+                                ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    for stop in &mut gradient.stops {
+                                        stop.color = cf.apply(stop.color);
+                                    }
+                                }
+                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::RRectBlur {
+                                params, blend_mode, ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    params.color = cf.apply(params.color);
+                                }
+                                params.color.alpha =
+                                    (params.color.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::GlyphAtlas(batch) => {
+                                if let Some(cf) = layer_cf {
+                                    for q in &mut batch.quads {
+                                        q.color = cf.apply(q.color);
+                                    }
+                                }
+                                batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    batch.blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::TextureFill(batch) => {
+                                batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    batch.blend_mode = bm;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             true
         } else {
             false
@@ -1263,9 +2305,7 @@ impl Canvas {
 
     pub fn clip_path(&mut self, path: &Path, op: ClipOperation) {
         let tx = self.get_current_transform();
-        let transformed = path
-            .get_transformed_bounding_box(&tx)
-            .unwrap_or(Rect::ZERO);
+        let transformed = path.get_transformed_bounding_box(&tx).unwrap_or(Rect::ZERO);
         self.apply_device_clip_rect(transformed, op);
     }
 
@@ -1300,7 +2340,12 @@ impl Canvas {
         }
     }
 
-    fn emit_mesh_with_transform(&mut self, mesh: TessellatedMesh, transform: Matrix, paint: &Paint) {
+    fn emit_mesh_with_transform(
+        &mut self,
+        mesh: TessellatedMesh,
+        transform: Matrix,
+        paint: &Paint,
+    ) {
         self.emit_mesh_with_transform_and_coverage(mesh, transform, paint, 1.0);
     }
 
@@ -1311,34 +2356,41 @@ impl Canvas {
         paint: &Paint,
         coverage: Scalar,
     ) {
-        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        let clip_targets = self.resolve_clip_targets(None, &transform);
+        self.emit_mesh_with_clip_targets(mesh, transform, paint, coverage, &clip_targets);
+    }
+
+    fn emit_mesh_with_clip_targets(
+        &mut self,
+        mesh: TessellatedMesh,
+        transform: Matrix,
+        paint: &Paint,
+        coverage: Scalar,
+        clip_targets: &[Option<Rect>],
+    ) {
+        if clip_targets.is_empty() || mesh.vertices.is_empty() || mesh.indices.is_empty() {
             return;
         }
         let cov = coverage.clamp(0.0, 1.0);
         if cov <= 0.0 {
             return;
         }
-        let Some(top) = self.stack.last() else {
-            return;
-        };
-        if top.clip_rects.is_empty() {
-            return;
-        }
 
-        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
-            top.clip_rects.iter().copied().map(Some).collect()
-        } else {
-            vec![None]
-        };
-
-        for clip_rect in clip_targets {
+        let mut mesh_opt = Some(mesh);
+        let last_idx = clip_targets.len() - 1;
+        for (i, &clip_rect) in clip_targets.iter().enumerate() {
+            let cur_mesh = if i == last_idx {
+                mesh_opt.take().unwrap_or_default()
+            } else {
+                mesh_opt.as_ref().cloned().unwrap_or_default()
+            };
             match paint.effective_color_source() {
                 Some(ColorSource::LinearGradient(grad)) => {
                     let mut normalized = grad.clone();
                     normalized.stops = Paint::convert_stops(&grad.stops);
                     normalized.alpha = (normalized.alpha * cov).clamp(0.0, 1.0);
                     self.commands.push(DrawCommand::LinearGradientFill {
-                        mesh: mesh.clone(),
+                        mesh: cur_mesh,
                         transform,
                         gradient: normalized,
                         blend_mode: paint.blend_mode,
@@ -1350,18 +2402,51 @@ impl Canvas {
                     normalized.stops = Paint::convert_stops(&grad.stops);
                     normalized.alpha = (normalized.alpha * cov).clamp(0.0, 1.0);
                     self.commands.push(DrawCommand::RadialGradientFill {
-                        mesh: mesh.clone(),
+                        mesh: cur_mesh,
                         transform,
                         gradient: normalized,
                         blend_mode: paint.blend_mode,
                         clip_rect,
                     });
                 }
+                Some(ColorSource::Image {
+                    texture,
+                    tile_mode_x,
+                    tile_mode_y,
+                    matrix,
+                    linear_filter,
+                }) => {
+                    let inv_w = 1.0 / (texture.width.max(1) as Scalar);
+                    let inv_h = 1.0 / (texture.height.max(1) as Scalar);
+                    let uv_mat = invert_matrix(matrix).unwrap_or(Matrix::IDENTITY);
+                    let vertices: Vec<UvVertex> = cur_mesh
+                        .vertices
+                        .iter()
+                        .map(|v| {
+                            let pt =
+                                uv_mat.transform_point(Point::new(v.position[0], v.position[1]));
+                            UvVertex::new(v.position[0], v.position[1], pt.x * inv_w, pt.y * inv_h)
+                        })
+                        .collect();
+                    self.commands
+                        .push(DrawCommand::TextureFill(TextureFillBatch {
+                            vertices,
+                            indices: cur_mesh.indices,
+                            transform,
+                            texture: texture.clone(),
+                            alpha: (paint.color.alpha * cov).clamp(0.0, 1.0),
+                            tile_mode_x: *tile_mode_x,
+                            tile_mode_y: *tile_mode_y,
+                            linear_filter: *linear_filter,
+                            blend_mode: paint.blend_mode,
+                            clip_rect,
+                        }));
+                }
                 Some(ColorSource::Solid(_)) | None => {
                     let mut color = paint.effective_solid_color();
                     color.alpha = (color.alpha * cov).clamp(0.0, 1.0);
                     self.commands.push(DrawCommand::SolidFill {
-                        mesh: mesh.clone(),
+                        mesh: cur_mesh,
                         transform,
                         color,
                         blend_mode: paint.blend_mode,
@@ -1419,27 +2504,62 @@ impl Canvas {
     }
 
     pub fn draw_path(&mut self, path: &Path, paint: &Paint) {
+        let Some(raw_bbox) = path.get_bounding_box() else {
+            return;
+        };
         let transform = self.get_current_transform();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
         match paint.style {
             DrawStyle::Fill => {
-                let mesh = FillPathGeometry::new(path.clone()).get_mesh(scale.max(1.0));
-                self.emit_mesh(mesh, paint);
+                let clip_targets = self.resolve_clip_targets(Some(raw_bbox), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                self.replay_stats.path_fill_count += 1;
+                let (mesh, kind) = cached_path_fill_mesh(path, scale);
+                match kind {
+                    FillTessellationKind::ConvexFast
+                    | FillTessellationKind::PslgSimpleConvex
+                    | FillTessellationKind::PslgDisjointConvex => {
+                        self.replay_stats.path_convex_fast_count += 1;
+                    }
+                    FillTessellationKind::PslgGeneral => {
+                        self.replay_stats.path_pslg_count += 1;
+                    }
+                }
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, 1.0, &clip_targets);
             }
             DrawStyle::Stroke => {
                 let width = paint.effective_stroke_width();
+                let eff_w = width.max(1.0 / scale);
+                let miter_mult = if paint.stroke_join == Join::Miter {
+                    paint.stroke_miter.max(1.0)
+                } else {
+                    1.0
+                };
+                let cap_mult = if paint.stroke_cap == Cap::Square {
+                    std::f32::consts::SQRT_2
+                } else {
+                    1.0
+                };
+                let pad = eff_w * 0.5 * miter_mult.max(cap_mult);
+                let local_bounds = expand_rect(raw_bbox, pad);
+                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                self.replay_stats.path_stroke_count += 1;
                 let cov = compute_stroke_alpha_coverage(&transform, width);
-                let mesh = StrokePathGeometry::new(
-                    path.clone(),
-                    StrokeParameters {
-                        width,
-                        cap: paint.stroke_cap,
-                        join: paint.stroke_join,
-                        miter_limit: paint.stroke_miter,
-                    },
-                )
-                .get_mesh(scale);
-                self.emit_mesh_with_transform_and_coverage(mesh, transform, paint, cov);
+                let stroke = StrokeParameters {
+                    width,
+                    cap: paint.stroke_cap,
+                    join: paint.stroke_join,
+                    miter_limit: paint.stroke_miter,
+                };
+                let mesh = cached_path_stroke_mesh(path, stroke, scale);
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, cov, &clip_targets);
             }
         }
     }
@@ -1458,9 +2578,76 @@ impl Canvas {
             );
             return;
         }
-        let mut pb = PathBuilder::new();
-        pb.add_rect(rect);
-        self.draw_path(&pb.build(FillType::NonZero), paint);
+        let transform = self.get_current_transform();
+        match paint.style {
+            DrawStyle::Fill => {
+                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let l = rect.get_left();
+                let t = rect.get_top();
+                let r = rect.get_right();
+                let b = rect.get_bottom();
+                let mesh = TessellatedMesh {
+                    vertices: vec![
+                        Vertex2D::new(l, t),
+                        Vertex2D::new(r, t),
+                        Vertex2D::new(r, b),
+                        Vertex2D::new(l, b),
+                    ],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                };
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, 1.0, &clip_targets);
+            }
+            DrawStyle::Stroke => {
+                let scale = transform.get_max_basis_length_xy().max(1e-4);
+                let width = paint.effective_stroke_width();
+                let stroke_w = width.max(1.0 / scale);
+                let half_w = stroke_w * 0.5;
+                if paint.stroke_join == Join::Miter
+                    && paint.stroke_miter >= std::f32::consts::SQRT_2
+                    && rect.get_width() > stroke_w
+                    && rect.get_height() > stroke_w
+                {
+                    let local_bounds = expand_rect(rect, half_w);
+                    let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                    if clip_targets.is_empty() {
+                        self.replay_stats.culled_count += 1;
+                        return;
+                    }
+                    let l = rect.get_left();
+                    let t = rect.get_top();
+                    let r = rect.get_right();
+                    let b = rect.get_bottom();
+                    let mesh = TessellatedMesh {
+                        vertices: vec![
+                            Vertex2D::new(l - half_w, t - half_w),
+                            Vertex2D::new(r + half_w, t - half_w),
+                            Vertex2D::new(r + half_w, b + half_w),
+                            Vertex2D::new(l - half_w, b + half_w),
+                            Vertex2D::new(l + half_w, t + half_w),
+                            Vertex2D::new(r - half_w, t + half_w),
+                            Vertex2D::new(r - half_w, b - half_w),
+                            Vertex2D::new(l + half_w, b - half_w),
+                        ],
+                        indices: vec![
+                            0, 1, 5, 0, 5, 4, // Top
+                            1, 2, 6, 1, 6, 5, // Right
+                            2, 3, 7, 2, 7, 6, // Bottom
+                            3, 0, 4, 3, 4, 7, // Left
+                        ],
+                    };
+                    let cov = compute_stroke_alpha_coverage(&transform, width);
+                    self.emit_mesh_with_clip_targets(mesh, transform, paint, cov, &clip_targets);
+                } else {
+                    let mut pb = PathBuilder::new();
+                    pb.add_rect(rect);
+                    self.draw_path(&pb.build(FillType::NonZero), paint);
+                }
+            }
+        }
     }
 
     pub fn draw_rrect(&mut self, rect: Rect, radii: RoundingRadii, paint: &Paint) {
@@ -1480,22 +2667,47 @@ impl Canvas {
         }
         let transform = self.get_current_transform();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
+        let dx = rect.get_left();
+        let dy = rect.get_top();
+        let w = rect.get_width();
+        let h = rect.get_height();
+        let needs_local_uv = paint_uses_local_coords_for_shader(paint);
+        let (eff_rect, draw_tx) = if needs_local_uv || (dx == 0.0 && dy == 0.0) {
+            (rect, transform)
+        } else {
+            (
+                Rect::from_xywh(0.0, 0.0, w, h),
+                transform * Matrix::make_translation(dx, dy, 0.0),
+            )
+        };
         match paint.style {
             DrawStyle::Fill => {
-                let mesh = RoundRectGeometry::new(rect, radii).get_mesh(scale.max(1.0));
-                self.emit_mesh(mesh, paint);
+                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let mesh = RoundRectGeometry::new(eff_rect, radii).get_mesh(scale.max(1.0));
+                self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, 1.0, &clip_targets);
             }
             DrawStyle::Stroke => {
                 let width = paint.effective_stroke_width();
+                let stroke_w = width.max(1.0 / scale);
+                let local_bounds = expand_rect(rect, stroke_w * 0.5);
+                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
                 let cov = compute_stroke_alpha_coverage(&transform, width);
                 let stroke = StrokeParameters {
-                    width: width.max(1.0 / scale),
+                    width: stroke_w,
                     cap: paint.stroke_cap,
                     join: paint.stroke_join,
                     miter_limit: paint.stroke_miter,
                 };
-                let mesh = RoundRectGeometry::new(rect, radii).get_stroked_mesh(stroke, scale);
-                self.emit_mesh_with_transform_and_coverage(mesh, transform, paint, cov);
+                let mesh = RoundRectGeometry::new(eff_rect, radii).get_stroked_mesh(stroke, scale);
+                self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, cov, &clip_targets);
             }
         }
     }
@@ -1508,6 +2720,42 @@ impl Canvas {
         inner_radii: RoundingRadii,
         paint: &Paint,
     ) {
+        if paint.style == DrawStyle::Fill {
+            if outer_rect.is_empty() {
+                return;
+            }
+            let transform = self.get_current_transform();
+            let clip_targets = self.resolve_clip_targets(Some(outer_rect), &transform);
+            if clip_targets.is_empty() {
+                self.replay_stats.culled_count += 1;
+                return;
+            }
+            let scale = transform.get_max_basis_length_xy().max(1.0);
+            let needs_local_uv = paint_uses_local_coords_for_shader(paint);
+            let dx = outer_rect.get_left();
+            let dy = outer_rect.get_top();
+            let (eff_outer, eff_inner, draw_tx) = if needs_local_uv || (dx == 0.0 && dy == 0.0) {
+                (outer_rect, inner_rect, transform)
+            } else {
+                (
+                    Rect::from_xywh(0.0, 0.0, outer_rect.get_width(), outer_rect.get_height()),
+                    Rect::from_xywh(
+                        inner_rect.get_left() - dx,
+                        inner_rect.get_top() - dy,
+                        inner_rect.get_width(),
+                        inner_rect.get_height(),
+                    ),
+                    transform * Matrix::make_translation(dx, dy, 0.0),
+                )
+            };
+            if let Some(mesh) =
+                DiffRoundRectGeometry::new(eff_outer, outer_radii, eff_inner, inner_radii)
+                    .get_mesh(scale)
+            {
+                self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, 1.0, &clip_targets);
+                return;
+            }
+        }
         let mut pb = PathBuilder::new();
         pb.add_rounded_rect(outer_rect, outer_radii);
         pb.add_rounded_rect(inner_rect, inner_radii);
@@ -1528,24 +2776,48 @@ impl Canvas {
             self.draw_circle(center, radius, paint);
             return;
         }
-        let mut pb = PathBuilder::new();
-        pb.add_oval(rect);
-        self.draw_path(&pb.build(FillType::NonZero), paint);
+        let transform = self.get_current_transform();
+        let scale = transform.get_max_basis_length_xy().max(1e-4);
+        match paint.style {
+            DrawStyle::Fill => {
+                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let mesh = EllipseGeometry::new(rect).get_mesh(scale.max(1.0));
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, 1.0, &clip_targets);
+            }
+            DrawStyle::Stroke => {
+                let stroke_w = paint.effective_stroke_width().max(1.0 / scale);
+                let local_bounds = expand_rect(rect, stroke_w * 0.5);
+                if self
+                    .resolve_clip_targets(Some(local_bounds), &transform)
+                    .is_empty()
+                {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let mut pb = PathBuilder::new();
+                pb.add_oval(rect);
+                self.draw_path(&pb.build(FillType::NonZero), paint);
+            }
+        }
     }
 
     pub fn draw_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
         if radius <= 0.0 {
             return;
         }
+        let circle_rect = Rect::from_xywh(
+            center.x - radius,
+            center.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        );
         if paint.is_shadow_blur_draw_operation() {
-            let rect = Rect::from_xywh(
-                center.x - radius,
-                center.y - radius,
-                radius * 2.0,
-                radius * 2.0,
-            );
             self.draw_rrect_shadow_with_blend(
-                rect,
+                circle_rect,
                 radius,
                 paint.mask_blur_sigma,
                 paint.effective_solid_color(),
@@ -1553,16 +2825,53 @@ impl Canvas {
             );
             return;
         }
-        let scale = self.get_current_transform().get_max_basis_length_xy().max(1.0);
+        let transform = self.get_current_transform();
+        let scale = transform.get_max_basis_length_xy().max(1.0);
+        let dx = center.x;
+        let dy = center.y;
+        let needs_local_uv = paint_uses_local_coords_for_shader(paint);
         match paint.style {
             DrawStyle::Fill => {
-                let mesh = CircleGeometry::new(center, radius).get_mesh(scale);
-                self.emit_mesh(mesh, paint);
+                let clip_targets = self.resolve_clip_targets(Some(circle_rect), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let base_arc = cached_circle_fill_mesh_arc(radius, scale);
+                let (mesh, draw_tx) = if needs_local_uv {
+                    (translate_cached_mesh(&base_arc, dx, dy), transform)
+                } else if dx == 0.0 && dy == 0.0 {
+                    ((*base_arc).clone(), transform)
+                } else {
+                    (
+                        (*base_arc).clone(),
+                        transform * Matrix::make_translation(dx, dy, 0.0),
+                    )
+                };
+                self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, 1.0, &clip_targets);
             }
             DrawStyle::Stroke => {
-                let mut pb = PathBuilder::new();
-                pb.add_circle(center, radius);
-                self.draw_path(&pb.build(FillType::NonZero), paint);
+                let width = paint.effective_stroke_width();
+                let stroke_w = width.max(1.0 / scale);
+                let local_bounds = expand_rect(circle_rect, stroke_w * 0.5);
+                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let cov = compute_stroke_alpha_coverage(&transform, width);
+                let base_arc = cached_circle_stroke_mesh_arc(radius, stroke_w, scale);
+                let (mesh, draw_tx) = if needs_local_uv {
+                    (translate_cached_mesh(&base_arc, dx, dy), transform)
+                } else if dx == 0.0 && dy == 0.0 {
+                    ((*base_arc).clone(), transform)
+                } else {
+                    (
+                        (*base_arc).clone(),
+                        transform * Matrix::make_translation(dx, dy, 0.0),
+                    )
+                };
+                self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, cov, &clip_targets);
             }
         }
     }
@@ -1578,21 +2887,66 @@ impl Canvas {
         if oval_bounds.is_empty() || sweep.0.abs() <= Scalar::EPSILON {
             return;
         }
-        let mut pb = PathBuilder::new();
-        pb.add_arc(oval_bounds, start, sweep, use_center);
-        if paint.style == DrawStyle::Fill && !use_center {
-            pb.close();
+        let transform = self.get_current_transform();
+        let scale = transform.get_max_basis_length_xy().max(1e-4);
+        let arc_geom = ArcGeometry::new(oval_bounds, start, sweep, use_center);
+        match paint.style {
+            DrawStyle::Fill => {
+                let clip_targets =
+                    self.resolve_clip_targets(Some(oval_bounds.get_positive()), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let mesh = arc_geom.get_mesh(scale.max(1.0));
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, 1.0, &clip_targets);
+            }
+            DrawStyle::Stroke => {
+                let width = paint.effective_stroke_width();
+                let stroke_w = width.max(1.0 / scale);
+                let local_bounds = expand_rect(
+                    oval_bounds.get_positive(),
+                    stroke_w * 0.5 * std::f32::consts::SQRT_2,
+                );
+                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                if clip_targets.is_empty() {
+                    self.replay_stats.culled_count += 1;
+                    return;
+                }
+                let cov = compute_stroke_alpha_coverage(&transform, width);
+                let mesh = arc_geom.get_stroked_mesh(
+                    StrokeParameters {
+                        width: stroke_w,
+                        cap: paint.stroke_cap,
+                        join: paint.stroke_join,
+                        miter_limit: paint.stroke_miter,
+                    },
+                    scale,
+                );
+                self.emit_mesh_with_clip_targets(mesh, transform, paint, cov, &clip_targets);
+            }
         }
-        self.draw_path(&pb.build(FillType::NonZero), paint);
     }
 
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
         let transform = self.get_current_transform();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
         let width = paint.effective_stroke_width();
+        let pad = width.max(1.0 / scale) * 0.75;
+        let local_bounds = Rect::from_ltrb(
+            p0.x.min(p1.x) - pad,
+            p0.y.min(p1.y) - pad,
+            p0.x.max(p1.x) + pad,
+            p0.y.max(p1.y) + pad,
+        );
+        let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+        if clip_targets.is_empty() {
+            self.replay_stats.culled_count += 1;
+            return;
+        }
         let cov = compute_stroke_alpha_coverage(&transform, width);
         let mesh = LineGeometry::new(p0, p1, width, paint.stroke_cap).get_mesh(scale);
-        self.emit_mesh_with_transform_and_coverage(mesh, transform, paint, cov);
+        self.emit_mesh_with_clip_targets(mesh, transform, paint, cov, &clip_targets);
     }
 
     pub fn draw_dashed_line(
@@ -1621,7 +2975,8 @@ impl Canvas {
             let end_dist = (dist + on_length).min(total_len);
             let seg_p0 = p0 + dir * dist;
             let seg_p1 = p0 + dir * end_dist;
-            let seg_mesh = LineGeometry::new(seg_p0, seg_p1, width, paint.stroke_cap).get_mesh(scale);
+            let seg_mesh =
+                LineGeometry::new(seg_p0, seg_p1, width, paint.stroke_cap).get_mesh(scale);
             let base = combined.vertices.len() as u32;
             combined.vertices.extend(seg_mesh.vertices);
             combined
@@ -1648,7 +3003,8 @@ impl Canvas {
             match point_style {
                 PointStyle::Round => self.draw_circle(pt, radius, &fill_paint),
                 PointStyle::Square => {
-                    let r = Rect::from_xywh(pt.x - radius, pt.y - radius, radius * 2.0, radius * 2.0);
+                    let r =
+                        Rect::from_xywh(pt.x - radius, pt.y - radius, radius * 2.0, radius * 2.0);
                     self.draw_rect(r, &fill_paint);
                 }
             }
@@ -1662,7 +3018,13 @@ impl Canvas {
         blur_sigma: Scalar,
         color: Color,
     ) {
-        self.draw_rrect_shadow_with_blend(rect, corner_radius, blur_sigma, color, BlendMode::SrcOver);
+        self.draw_rrect_shadow_with_blend(
+            rect,
+            corner_radius,
+            blur_sigma,
+            color,
+            BlendMode::SrcOver,
+        );
     }
 
     pub fn draw_rrect_shadow_with_blend(
@@ -1673,27 +3035,22 @@ impl Canvas {
         color: Color,
         blend_mode: BlendMode,
     ) {
-        let Some(top) = self.stack.last() else {
-            return;
+        let params = RRectBlurParams {
+            rect,
+            corner_radius,
+            blur_sigma,
+            color,
         };
-        if top.clip_rects.is_empty() {
+        let transform = self.get_current_transform();
+        let clip_targets = self.resolve_clip_targets(Some(params.coverage_rect()), &transform);
+        if clip_targets.is_empty() {
+            self.replay_stats.culled_count += 1;
             return;
         }
-        let transform = top.transform;
-        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
-            top.clip_rects.iter().copied().map(Some).collect()
-        } else {
-            vec![None]
-        };
         for clip_rect in clip_targets {
             self.commands.push(DrawCommand::RRectBlur {
                 transform,
-                params: RRectBlurParams {
-                    rect,
-                    corner_radius,
-                    blur_sigma,
-                    color,
-                },
+                params,
                 blend_mode,
                 clip_rect,
             });
@@ -1746,11 +3103,6 @@ impl Canvas {
         if top.clip_rects.is_empty() {
             return;
         }
-        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
-            top.clip_rects.iter().copied().map(Some).collect()
-        } else {
-            vec![None]
-        };
 
         let paint_color = paint.effective_solid_color();
         let use_paint_override = paint.color != Color::BLACK
@@ -1785,28 +3137,16 @@ impl Canvas {
             });
         }
 
-        for clip_rect in clip_targets {
-            let command_index = self.commands.len();
-            self.glyph_batches.push(PendingGlyphBatch {
-                command_index,
-                transform,
-                quads: adjusted_quads.clone(),
-                blend_mode: paint.blend_mode,
-                clip_rect,
-            });
-            self.commands.push(DrawCommand::GlyphAtlas(
-                GlyphAtlasBatch::new(
-                    adjusted_quads.clone(),
-                    transform,
-                    None,
-                    None,
-                    paint.blend_mode,
-                    clip_rect,
-                )
-                .with_linear_filter(use_linear_filter),
-            ));
+        let prev_len = self.commands.len();
+        self.emit_glyph_quads_with_blend(
+            adjusted_quads,
+            transform,
+            paint.blend_mode,
+            use_linear_filter,
+        );
+        if self.commands.len() > prev_len {
+            self.sync_glyph_atlases();
         }
-        self.sync_glyph_atlases();
     }
 
     pub fn draw_text(&mut self, text: &str, style: TextStyle, origin: Point) {
@@ -1909,6 +3249,471 @@ impl Canvas {
         self.draw_path(&path, paint);
     }
 
+    fn emit_paragraph_quads(&mut self, paragraph: &Paragraph, offset: Point) {
+        if paragraph.quads.is_empty() {
+            return;
+        }
+        let Some(top) = self.stack.last() else {
+            return;
+        };
+        if top.clip_rects.is_empty() {
+            self.replay_stats.culled_count += 1;
+            return;
+        }
+        let canvas_rect = Rect::from_xywh(0.0, 0.0, self.width as Scalar, self.height as Scalar);
+        let Some(canvas_bounds) = intersect_rects(canvas_rect, self.initial_cull_rect) else {
+            self.replay_stats.culled_count += 1;
+            return;
+        };
+
+        let transform = top.transform;
+        let is_unit_translation = (transform.e(0, 0) - 1.0).abs() <= 1e-3
+            && (transform.e(1, 1) - 1.0).abs() <= 1e-3
+            && transform.e(0, 1).abs() <= 1e-3
+            && transform.e(1, 0).abs() <= 1e-3
+            && !transform.has_perspective_2d();
+
+        if let Some(qb) = paragraph.quad_bounds {
+            if !qb.is_empty() {
+                let shifted_bounds = Rect::from_xywh(
+                    qb.get_left() + offset.x,
+                    qb.get_top() + offset.y,
+                    qb.get_width(),
+                    qb.get_height(),
+                );
+                let dev_bounds = transform_rect(&transform, shifted_bounds);
+                let shift_all_quads =
+                    |quads: &[AtlasGlyphQuad], off: Point| -> Vec<AtlasGlyphQuad> {
+                        if off.x == 0.0 && off.y == 0.0 {
+                            quads.to_vec()
+                        } else {
+                            quads
+                                .iter()
+                                .map(|q| AtlasGlyphQuad {
+                                    dest_rect: Rect::from_xywh(
+                                        q.dest_rect.get_left() + off.x,
+                                        q.dest_rect.get_top() + off.y,
+                                        q.dest_rect.get_width(),
+                                        q.dest_rect.get_height(),
+                                    ),
+                                    atlas_rect: q.atlas_rect,
+                                    color: q.color,
+                                    is_color: q.is_color,
+                                })
+                                .collect()
+                        }
+                    };
+
+                if !top.has_explicit_clip {
+                    if intersect_rects(dev_bounds, canvas_bounds).is_none() {
+                        self.replay_stats.culled_count += 1;
+                        return;
+                    }
+                    if rect_contains_rect(canvas_bounds, dev_bounds) {
+                        let surviving = shift_all_quads(&paragraph.quads, offset);
+                        let alpha_atlas = if paragraph.uses_alpha {
+                            self.default_alpha_atlas.clone()
+                        } else {
+                            None
+                        };
+                        let color_atlas = if paragraph.uses_color {
+                            self.default_color_atlas.clone()
+                        } else {
+                            None
+                        };
+                        self.commands.push(DrawCommand::GlyphAtlas(
+                            GlyphAtlasBatch::new(
+                                surviving,
+                                transform,
+                                alpha_atlas,
+                                color_atlas,
+                                BlendMode::SrcOver,
+                                None,
+                            )
+                            .with_linear_filter(!is_unit_translation),
+                        ));
+                        if self.typographer.is_some() {
+                            self.sync_glyph_atlases();
+                        }
+                        return;
+                    }
+                } else if top.clip_rects.len() == 1 {
+                    let Some(effective_clip) = intersect_rects(top.clip_rects[0], canvas_bounds)
+                    else {
+                        self.replay_stats.culled_count += 1;
+                        return;
+                    };
+                    if intersect_rects(dev_bounds, effective_clip).is_none() {
+                        self.replay_stats.culled_count += 1;
+                        return;
+                    }
+                    if rect_contains_rect(effective_clip, dev_bounds) {
+                        let surviving = shift_all_quads(&paragraph.quads, offset);
+                        let alpha_atlas = if paragraph.uses_alpha {
+                            self.default_alpha_atlas.clone()
+                        } else {
+                            None
+                        };
+                        let color_atlas = if paragraph.uses_color {
+                            self.default_color_atlas.clone()
+                        } else {
+                            None
+                        };
+                        self.commands.push(DrawCommand::GlyphAtlas(
+                            GlyphAtlasBatch::new(
+                                surviving,
+                                transform,
+                                alpha_atlas,
+                                color_atlas,
+                                BlendMode::SrcOver,
+                                None,
+                            )
+                            .with_linear_filter(!is_unit_translation),
+                        ));
+                        if self.typographer.is_some() {
+                            self.sync_glyph_atlases();
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        let prev_len = self.commands.len();
+        self.emit_glyph_quads_slice_with_offset(
+            &paragraph.quads,
+            offset,
+            transform,
+            BlendMode::SrcOver,
+            !is_unit_translation,
+        );
+        if self.commands.len() > prev_len {
+            if self.typographer.is_some() {
+                self.sync_glyph_atlases();
+            }
+        } else {
+            self.replay_stats.culled_count += 1;
+        }
+    }
+
+    pub fn draw_paragraph(&mut self, paragraph: &Paragraph, offset: Point) {
+        let bg_count = paragraph
+            .background_rects
+            .len()
+            .saturating_sub(paragraph.decoration_rects.len());
+        for &(rect, color) in paragraph.background_rects.iter().take(bg_count) {
+            let shifted = Rect::from_xywh(
+                rect.get_left() + offset.x,
+                rect.get_top() + offset.y,
+                rect.get_width(),
+                rect.get_height(),
+            );
+            self.draw_rect(shifted, &Paint::fill(color));
+        }
+
+        self.emit_paragraph_quads(paragraph, offset);
+
+        for &(rect, color) in &paragraph.decoration_rects {
+            let shifted = Rect::from_xywh(
+                rect.get_left() + offset.x,
+                rect.get_top() + offset.y,
+                rect.get_width(),
+                rect.get_height(),
+            );
+            self.draw_rect(shifted, &Paint::fill(color));
+        }
+    }
+
+    pub fn draw_image(
+        &mut self,
+        image: &ImageTexture,
+        offset: Point,
+        paint: &Paint,
+        linear_filter: bool,
+    ) {
+        let src = Rect::from_xywh(0.0, 0.0, image.width as Scalar, image.height as Scalar);
+        let dst = Rect::from_xywh(
+            offset.x,
+            offset.y,
+            image.width as Scalar,
+            image.height as Scalar,
+        );
+        self.draw_image_rect(image, src, dst, paint, linear_filter);
+    }
+
+    pub fn draw_image_rect(
+        &mut self,
+        image: &ImageTexture,
+        src: Rect,
+        dst: Rect,
+        paint: &Paint,
+        linear_filter: bool,
+    ) {
+        if src.is_empty() || dst.is_empty() || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let transform = self.get_current_transform();
+        let clip_targets = self.resolve_clip_targets(Some(dst), &transform);
+        if clip_targets.is_empty() {
+            self.replay_stats.culled_count += 1;
+            return;
+        }
+        let alpha = paint.color.alpha.clamp(0.0, 1.0);
+        for clip_rect in clip_targets {
+            self.commands
+                .push(DrawCommand::TextureFill(TextureFillBatch::from_rect(
+                    src,
+                    dst,
+                    transform,
+                    image.clone(),
+                    alpha,
+                    linear_filter,
+                    paint.blend_mode,
+                    clip_rect,
+                )));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_atlas(
+        &mut self,
+        atlas: &ImageTexture,
+        rst_transforms: &[[Scalar; 4]],
+        tex_rects: &[Rect],
+        _colors: Option<&[Color]>,
+        blend_mode: BlendMode,
+        _cull_rect: Option<Rect>,
+        paint: Option<&Paint>,
+        linear_filter: bool,
+    ) {
+        let count = rst_transforms.len().min(tex_rects.len());
+        if count == 0 || atlas.width == 0 || atlas.height == 0 {
+            return;
+        }
+        let Some(top) = self.stack.last() else {
+            return;
+        };
+        if top.clip_rects.is_empty() {
+            return;
+        }
+        let transform = top.transform;
+        let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
+            top.clip_rects.iter().copied().map(Some).collect()
+        } else {
+            vec![None]
+        };
+
+        let inv_w = 1.0 / (atlas.width.max(1) as Scalar);
+        let inv_h = 1.0 / (atlas.height.max(1) as Scalar);
+        let mut vertices = Vec::with_capacity(count * 4);
+        let mut indices = Vec::with_capacity(count * 6);
+
+        for i in 0..count {
+            let [scos, ssin, tx, ty] = rst_transforms[i];
+            let tr = tex_rects[i];
+            let w = tr.get_width();
+            let h = tr.get_height();
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            let u0 = tr.get_left() * inv_w;
+            let v0 = tr.get_top() * inv_h;
+            let u1 = tr.get_right() * inv_w;
+            let v1 = tr.get_bottom() * inv_h;
+
+            let base = vertices.len() as u32;
+            vertices.push(UvVertex::new(tx, ty, u0, v0));
+            vertices.push(UvVertex::new(tx + scos * w, ty + ssin * w, u1, v0));
+            vertices.push(UvVertex::new(
+                tx + scos * w - ssin * h,
+                ty + ssin * w + scos * h,
+                u1,
+                v1,
+            ));
+            vertices.push(UvVertex::new(tx - ssin * h, ty + scos * h, u0, v1));
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        if vertices.is_empty() {
+            return;
+        }
+        let alpha = paint.map_or(1.0, |p| p.color.alpha.clamp(0.0, 1.0));
+        let effective_blend = paint.map_or(blend_mode, |p| p.blend_mode);
+
+        for clip_rect in clip_targets {
+            self.commands
+                .push(DrawCommand::TextureFill(TextureFillBatch {
+                    vertices: vertices.clone(),
+                    indices: indices.clone(),
+                    transform,
+                    texture: atlas.clone(),
+                    alpha,
+                    tile_mode_x: TileMode::Clamp,
+                    tile_mode_y: TileMode::Clamp,
+                    linear_filter,
+                    blend_mode: effective_blend,
+                    clip_rect,
+                }));
+        }
+    }
+
+    pub fn draw_vertices(
+        &mut self,
+        positions: &[Point],
+        tex_coords: Option<&[Point]>,
+        colors: Option<&[Color]>,
+        indices: &[u16],
+        blend_mode: BlendMode,
+        paint: &Paint,
+    ) {
+        if positions.len() < 3 {
+            return;
+        }
+        let tri_indices: Vec<u32> = if indices.is_empty() {
+            (0..positions.len() as u32).collect()
+        } else {
+            indices
+                .iter()
+                .copied()
+                .map(u32::from)
+                .filter(|&idx| (idx as usize) < positions.len())
+                .collect()
+        };
+        if tri_indices.len() < 3 {
+            return;
+        }
+
+        let transform = self.get_current_transform();
+        if let Some(ColorSource::Image {
+            texture,
+            tile_mode_x,
+            tile_mode_y,
+            matrix,
+            linear_filter,
+        }) = paint.effective_color_source()
+        {
+            let Some(top) = self.stack.last() else {
+                return;
+            };
+            if top.clip_rects.is_empty() {
+                return;
+            }
+            let clip_targets: Vec<Option<Rect>> = if top.has_explicit_clip {
+                top.clip_rects.iter().copied().map(Some).collect()
+            } else {
+                vec![None]
+            };
+            let inv_w = 1.0 / (texture.width.max(1) as Scalar);
+            let inv_h = 1.0 / (texture.height.max(1) as Scalar);
+            let uv_mat = invert_matrix(matrix).unwrap_or(Matrix::IDENTITY);
+            let vertices: Vec<UvVertex> = positions
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| {
+                    let uv_pt = tex_coords
+                        .and_then(|tcs| tcs.get(i).copied())
+                        .unwrap_or_else(|| uv_mat.transform_point(p));
+                    UvVertex::new(p.x, p.y, uv_pt.x * inv_w, uv_pt.y * inv_h)
+                })
+                .collect();
+            for clip_rect in clip_targets {
+                self.commands
+                    .push(DrawCommand::TextureFill(TextureFillBatch {
+                        vertices: vertices.clone(),
+                        indices: tri_indices.clone(),
+                        transform,
+                        texture: texture.clone(),
+                        alpha: paint.color.alpha.clamp(0.0, 1.0),
+                        tile_mode_x: *tile_mode_x,
+                        tile_mode_y: *tile_mode_y,
+                        linear_filter: *linear_filter,
+                        blend_mode: paint.blend_mode,
+                        clip_rect,
+                    }));
+            }
+            return;
+        }
+
+        if let Some(v_colors) = colors {
+            if v_colors.len() >= positions.len() {
+                for &[t0, t1, t2] in tri_indices.as_chunks::<3>().0 {
+                    let (i0, i1, i2) = (t0 as usize, t1 as usize, t2 as usize);
+                    let avg = (v_colors[i0] + v_colors[i1] + v_colors[i2]) * (1.0 / 3.0);
+                    let tri_color = if blend_mode == BlendMode::Dst {
+                        avg
+                    } else if blend_mode == BlendMode::Src {
+                        paint.effective_solid_color()
+                    } else {
+                        avg.blend(paint.effective_solid_color(), blend_mode)
+                    };
+                    let mut tri_paint = paint.clone();
+                    tri_paint.color = tri_color;
+                    tri_paint.shader = None;
+                    tri_paint.color_source = None;
+                    let mesh = TessellatedMesh {
+                        vertices: vec![
+                            Vertex2D::from_point(positions[i0]),
+                            Vertex2D::from_point(positions[i1]),
+                            Vertex2D::from_point(positions[i2]),
+                        ],
+                        indices: vec![0, 1, 2],
+                    };
+                    self.emit_mesh_with_transform(mesh, transform, &tri_paint);
+                }
+                return;
+            }
+        }
+
+        let mesh = TessellatedMesh {
+            vertices: positions
+                .iter()
+                .copied()
+                .map(Vertex2D::from_point)
+                .collect(),
+            indices: tri_indices,
+        };
+        self.emit_mesh_with_transform(mesh, transform, paint);
+    }
+
+    pub fn draw_shadow(
+        &mut self,
+        path: &Path,
+        color: Color,
+        elevation: Scalar,
+        transparent_occluder: bool,
+        device_pixel_ratio: Scalar,
+    ) {
+        if elevation <= 0.0 || color.alpha <= 0.0 {
+            return;
+        }
+        let Some(bounds) = path.get_bounding_box() else {
+            return;
+        };
+        if bounds.is_empty() {
+            return;
+        }
+        let dpr = device_pixel_ratio.max(1.0);
+        let sigma = (0.5 * elevation * dpr).clamp(0.5, 64.0);
+        let dy = (elevation * 0.5).clamp(0.5, 24.0);
+        let shadow_rect = Rect::from_xywh(
+            bounds.get_left(),
+            bounds.get_top() + dy,
+            bounds.get_width(),
+            bounds.get_height(),
+        );
+        let corner_radius = (bounds.get_width().min(bounds.get_height()) * 0.1).min(12.0);
+        let alpha_scale = if transparent_occluder { 0.5 } else { 0.35 };
+        let shadow_color = color.with_alpha((color.alpha * alpha_scale).clamp(0.0, 1.0));
+        self.draw_rrect_shadow(shadow_rect, corner_radius, sigma, shadow_color);
+    }
+
+    pub fn draw_picture(&mut self, picture: &DisplayList) {
+        let base_count = self.get_save_count();
+        self.save();
+        self.draw_display_list(picture);
+        self.restore_to_count(base_count);
+    }
+
     /// Renders one of the 6 `flutter-wasm-compare` `PolymorphicCard` categories (`polymorphic_widgets.dart`)
     /// inside `rect` using CTM `translate`/`scale` and `clip_rect`:
     /// - `0`: `WAVE #<index>` sparkline + `MaterialIcon::ShowChart`
@@ -1955,7 +3760,12 @@ impl Canvas {
                     },
                     Point::new(8.0, 8.0),
                 );
-                self.draw_icon(MaterialIcon::ShowChart, 14.0, orange, Point::new(118.0, 7.0));
+                self.draw_icon(
+                    MaterialIcon::ShowChart,
+                    14.0,
+                    orange,
+                    Point::new(118.0, 7.0),
+                );
 
                 let x0 = 8.0;
                 let y0 = 26.0;
@@ -2029,11 +3839,7 @@ impl Canvas {
                     * 0.5)
                     .clamp(0.15, 0.95);
 
-                self.draw_circle(
-                    Point::new(22.0, 40.0),
-                    12.0,
-                    &Paint::stroke(track, 3.2),
-                );
+                self.draw_circle(Point::new(22.0, 40.0), 12.0, &Paint::stroke(track, 3.2));
                 self.draw_arc(
                     Rect::from_xywh(10.0, 28.0, 24.0, 24.0),
                     Radians(-std::f32::consts::FRAC_PI_2),
@@ -2160,7 +3966,7 @@ impl Canvas {
     }
 
     pub fn glyph_batches(&self) -> &[PendingGlyphBatch] {
-        &self.glyph_batches
+        &[]
     }
 
     pub fn draw_display_list(&mut self, display_list: &DisplayList) {
@@ -2465,8 +4271,8 @@ pub fn draw_showcase_scene(canvas: &mut Canvas) {
         let mut pb = PathBuilder::new();
         for i in 0..5 {
             let idx = (i * 2) % 5;
-            let angle = -std::f32::consts::FRAC_PI_2
-                + (idx as Scalar) * 2.0 * std::f32::consts::PI / 5.0;
+            let angle =
+                -std::f32::consts::FRAC_PI_2 + (idx as Scalar) * 2.0 * std::f32::consts::PI / 5.0;
             let pt = Point::new(cx + outer_r * angle.cos(), cy + outer_r * angle.sin());
             if i == 0 {
                 pb.move_to(pt);
@@ -2590,8 +4396,16 @@ pub fn draw_showcase_scene(canvas: &mut Canvas) {
         canvas.draw_line(Point::new(52.0, y), Point::new(168.0, y), &stroke_paint);
     }
     let rail_paint = Paint::stroke(Color::new(1.0, 1.0, 1.0, 0.45), 2.0);
-    canvas.draw_line(Point::new(52.0, 342.0), Point::new(52.0, 438.0), &rail_paint);
-    canvas.draw_line(Point::new(168.0, 342.0), Point::new(168.0, 438.0), &rail_paint);
+    canvas.draw_line(
+        Point::new(52.0, 342.0),
+        Point::new(52.0, 438.0),
+        &rail_paint,
+    );
+    canvas.draw_line(
+        Point::new(168.0, 342.0),
+        Point::new(168.0, 438.0),
+        &rail_paint,
+    );
 
     // Join showcase on the right side of Q3: Miter (sharp), Round, Bevel
     let joins = [
@@ -2631,13 +4445,11 @@ pub fn draw_showcase_scene(canvas: &mut Canvas) {
 
     // Curved dashed path along bottom of Q3 using kurbo::dash
     let mut dash_curve_pb = PathBuilder::new();
-    dash_curve_pb
-        .move_to(Point::new(36.0, 562.0))
-        .cubic_to(
-            Point::new(120.0, 544.0),
-            Point::new(280.0, 578.0),
-            Point::new(364.0, 558.0),
-        );
+    dash_curve_pb.move_to(Point::new(36.0, 562.0)).cubic_to(
+        Point::new(120.0, 544.0),
+        Point::new(280.0, 578.0),
+        Point::new(364.0, 558.0),
+    );
     canvas.draw_dashed_path(
         &dash_curve_pb.build(FillType::NonZero),
         0.0,
@@ -2819,7 +4631,8 @@ fn append_filled_rrect_mesh(mesh: &mut TessellatedMesh, rect: Rect, rx: Scalar, 
     let base = mesh.vertices.len() as u32;
     mesh.vertices.extend_from_slice(&pts);
     for i in 1..19u32 {
-        mesh.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+        mesh.indices
+            .extend_from_slice(&[base, base + i, base + i + 1]);
     }
 }
 
@@ -2865,8 +4678,7 @@ fn append_stroked_rrect_mesh(
         let i0 = o0 + 1;
         let o1 = base + next * 2;
         let i1 = o1 + 1;
-        mesh.indices
-            .extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
+        mesh.indices.extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
     }
 }
 
@@ -2883,7 +4695,8 @@ fn append_filled_circle_mesh(mesh: &mut TessellatedMesh, center: Point, radius: 
             .push(Vertex2D::new(center.x + radius * c, center.y + radius * s));
     }
     for i in 1..(N as u32 - 1) {
-        mesh.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+        mesh.indices
+            .extend_from_slice(&[base, base + i, base + i + 1]);
     }
 }
 
@@ -2922,16 +4735,11 @@ fn append_stroked_arc_mesh(
         let i0 = o0 + 1;
         let o1 = base + (i + 1) * 2;
         let i1 = o1 + 1;
-        mesh.indices
-            .extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
+        mesh.indices.extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
     }
 }
 
-fn append_stroked_polyline_mesh(
-    mesh: &mut TessellatedMesh,
-    points: &[Point],
-    stroke_w: Scalar,
-) {
+fn append_stroked_polyline_mesh(mesh: &mut TessellatedMesh, points: &[Point], stroke_w: Scalar) {
     if points.len() < 2 || stroke_w <= 0.0 {
         return;
     }
@@ -3025,7 +4833,9 @@ impl<'a> FrameLabelShaper<'a> {
         }
 
         let dev_clip = clip_bounds.map(|r| {
-            let p0 = self.base_tx.transform_point(Point::new(r.get_left(), r.get_top()));
+            let p0 = self
+                .base_tx
+                .transform_point(Point::new(r.get_left(), r.get_top()));
             let p1 = self
                 .base_tx
                 .transform_point(Point::new(r.get_right(), r.get_bottom()));
@@ -3114,8 +4924,8 @@ pub fn draw_morphing_grid_workload(
 
     let t = (anim_value * 2.0 * std::f32::consts::PI).sin();
     let dynamic_aspect = (width / height) * (1.0 + 0.35 * t);
-    let columns = ((node_count as Scalar * dynamic_aspect).sqrt().round() as usize)
-        .clamp(1, node_count);
+    let columns =
+        ((node_count as Scalar * dynamic_aspect).sqrt().round() as usize).clamp(1, node_count);
     let rows = node_count.div_ceil(columns);
 
     let min_cell_extent: Scalar = 8.0;
@@ -3261,11 +5071,10 @@ pub fn draw_morphing_grid_workload(
             }
             1 => {
                 // CORE gauge card
-                let gauge_frac = ((anim_value * 3.0 * std::f32::consts::PI
-                    + (index as Scalar) * 1.2)
-                    .sin()
-                    + 1.0)
-                    * 0.5;
+                let gauge_frac =
+                    ((anim_value * 3.0 * std::f32::consts::PI + (index as Scalar) * 1.2).sin()
+                        + 1.0)
+                        * 0.5;
                 let bar_rect = Rect::from_xywh(
                     x + 8.0 * sx,
                     y + 62.0 * sy,
@@ -3321,12 +5130,11 @@ pub fn draw_morphing_grid_workload(
             }
             2 => {
                 // SYNC circular + linear progress card
-                let progress = (((anim_value * 2.0 * std::f32::consts::PI
-                    + (index as Scalar) * 0.5)
-                    .cos()
-                    + 1.0)
-                    * 0.5)
-                    .clamp(0.15, 0.95);
+                let progress =
+                    (((anim_value * 2.0 * std::f32::consts::PI + (index as Scalar) * 0.5).cos()
+                        + 1.0)
+                        * 0.5)
+                        .clamp(0.15, 0.95);
                 let center = Point::new(x + 22.0 * sx, y + 40.0 * sy);
                 let arc_segs = if node_count > 400 { 8 } else { 14 };
                 append_stroked_arc_mesh(
@@ -3347,12 +5155,8 @@ pub fn draw_morphing_grid_workload(
                     (3.2 * avg_scale).max(1.0),
                     arc_segs,
                 );
-                let bar_track = Rect::from_xywh(
-                    x + 42.0 * sx,
-                    y + 44.0 * sy,
-                    86.0 * sx,
-                    (5.0 * sy).max(1.0),
-                );
+                let bar_track =
+                    Rect::from_xywh(x + 42.0 * sx, y + 44.0 * sy, 86.0 * sx, (5.0 * sy).max(1.0));
                 let bar_fill = Rect::from_xywh(
                     x + 42.0 * sx,
                     y + 44.0 * sy,
@@ -3383,12 +5187,8 @@ pub fn draw_morphing_grid_workload(
             }
             3 => {
                 // Node amber pill chip card
-                let chip_rect = Rect::from_xywh(
-                    x + 20.0 * sx,
-                    y + 24.0 * sy,
-                    100.0 * sx,
-                    32.0 * sy,
-                );
+                let chip_rect =
+                    Rect::from_xywh(x + 20.0 * sx, y + 24.0 * sy, 100.0 * sx, 32.0 * sy);
                 append_filled_rrect_mesh(&mut amber_fill_mesh, chip_rect, 16.0 * sx, 16.0 * sy);
                 if draw_borders {
                     append_stroked_rrect_mesh(
@@ -3434,8 +5234,8 @@ pub fn draw_morphing_grid_workload(
             }
             4 => {
                 // TH status card
-                let active = (anim_value * 4.0 * std::f32::consts::PI + (index as Scalar)).sin()
-                    > 0.0;
+                let active =
+                    (anim_value * 4.0 * std::f32::consts::PI + (index as Scalar)).sin() > 0.0;
                 let color = if active { green_active } else { dim_inactive };
                 let target_mesh = if active {
                     &mut green_status_mesh
@@ -3483,12 +5283,7 @@ pub fn draw_morphing_grid_workload(
             }
             _ => {
                 // WASM teal box card
-                let box_rect = Rect::from_xywh(
-                    x + 16.0 * sx,
-                    y + 24.0 * sy,
-                    108.0 * sx,
-                    32.0 * sy,
-                );
+                let box_rect = Rect::from_xywh(x + 16.0 * sx, y + 24.0 * sy, 108.0 * sx, 32.0 * sy);
                 append_filled_rrect_mesh(&mut teal_fill_mesh, box_rect, 5.0 * sx, 5.0 * sy);
                 if draw_borders {
                     append_stroked_rrect_mesh(
@@ -3703,7 +5498,8 @@ pub fn draw_bouncy_workload(
             append_stroked_rrect_mesh(&mut pane_border_mesh, pane, 6.0, 6.0, 1.0);
         }
 
-        let draw_glyphs = pw >= 28.0 && ph >= 16.0 && (node_count <= 300 || (pw >= 38.0 && ph >= 20.0));
+        let draw_glyphs =
+            pw >= 28.0 && ph >= 16.0 && (node_count <= 300 || (pw >= 38.0 && ph >= 20.0));
         let clip = Some(pane);
 
         match node_index % 7 {
@@ -3844,7 +5640,8 @@ pub fn draw_bouncy_workload(
                 let rad = (pw.min(ph) * 0.28).clamp(3.0, 13.0);
                 let progress = 0.25
                     + 0.65
-                        * ((anim_value * 2.0 * std::f32::consts::PI + (node_index as Scalar)).sin()
+                        * ((anim_value * 2.0 * std::f32::consts::PI + (node_index as Scalar))
+                            .sin()
                             * 0.5
                             + 0.5);
                 let arc_center = if pw > 74.0 {
@@ -4087,9 +5884,8 @@ pub fn verify_showcase_pixels(
                 sum_g += g as u64;
                 sum_b += b as u64;
 
-                let diff = (r as i32 - bg_r).abs()
-                    + (g as i32 - bg_g).abs()
-                    + (b as i32 - bg_b).abs();
+                let diff =
+                    (r as i32 - bg_r).abs() + (g as i32 - bg_g).abs() + (b as i32 - bg_b).abs();
                 if diff > 6 {
                     non_bg += 1;
                 }
@@ -4167,9 +5963,7 @@ mod tests {
             std::sync::OnceLock::new();
         RENDERER
             .get_or_init(|| {
-                std::sync::Mutex::new(
-                    WgpuRenderer::new_headless().expect("headless wgpu renderer"),
-                )
+                std::sync::Mutex::new(WgpuRenderer::new_headless().expect("headless wgpu renderer"))
             })
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4262,7 +6056,9 @@ mod tests {
         assert!(paint.get_stroke().is_none());
 
         paint.style = DrawStyle::Stroke;
-        let stroke = paint.get_stroke().expect("stroke parameters when DrawStyle::Stroke");
+        let stroke = paint
+            .get_stroke()
+            .expect("stroke parameters when DrawStyle::Stroke");
         assert_eq!(stroke.cap, Cap::Round);
         assert_eq!(stroke.join, Join::Round);
         assert_eq!(stroke.width, 20.0);
@@ -4338,7 +6134,9 @@ mod tests {
             Rect::from_xywh(24.0, 24.0, 80.0, 80.0),
             &Paint::fill(Color::BLUE),
         );
-        let rgba = canvas.render_to_pixels(&renderer).expect("render colored rect");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render colored rect");
         assert_eq!(get_pixel(&rgba, 128, 64, 64), [0, 0, 255, 255]);
         assert_eq!(get_pixel(&rgba, 128, 8, 8), [0, 0, 0, 255]);
     }
@@ -4353,7 +6151,9 @@ mod tests {
         paint.invert_colors = true;
         canvas.draw_paint(&paint);
 
-        let rgba = canvas.render_to_pixels(&renderer).expect("render draw_paint");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render draw_paint");
         let px = get_pixel(&rgba, 64, 48, 48);
         assert_eq!(px[0], 0);
         assert!(px[1] >= 200);
@@ -4392,9 +6192,21 @@ mod tests {
         let left = get_pixel(&rgba, 120, 10, 40);
         let mid = get_pixel(&rgba, 120, 60, 40);
         let right = get_pixel(&rgba, 120, 110, 40);
-        assert!(left[0] > 230 && left[2] < 25, "left clamped to red: {:?}", left);
-        assert!(mid[0] > 90 && mid[2] > 90, "mid interpolated purple: {:?}", mid);
-        assert!(right[2] > 230 && right[0] < 25, "right clamped to blue: {:?}", right);
+        assert!(
+            left[0] > 230 && left[2] < 25,
+            "left clamped to red: {:?}",
+            left
+        );
+        assert!(
+            mid[0] > 90 && mid[2] > 90,
+            "mid interpolated purple: {:?}",
+            mid
+        );
+        assert!(
+            right[2] > 230 && right[0] < 25,
+            "right clamped to blue: {:?}",
+            right
+        );
     }
 
     /// C++ source: aiks_unittests.cc:CanRenderRadialGradientWithDitheringEnabled
@@ -4446,7 +6258,9 @@ mod tests {
         canvas.clip_rect(Rect::from_xywh(50.0, 50.0, 60.0, 60.0));
 
         // Intersection of [20..90, 20..90] and [50..110, 50..110] is [50..90, 50..90]
-        let cull = canvas.get_current_local_cull_rect().expect("non-empty clip");
+        let cull = canvas
+            .get_current_local_cull_rect()
+            .expect("non-empty clip");
         assert_relative_eq!(cull.get_left(), 50.0, epsilon = 1e-4);
         assert_relative_eq!(cull.get_top(), 50.0, epsilon = 1e-4);
         assert_relative_eq!(cull.get_right(), 90.0, epsilon = 1e-4);
@@ -4456,7 +6270,9 @@ mod tests {
             Rect::from_xywh(0.0, 0.0, 120.0, 120.0),
             &Paint::fill(Color::GREEN),
         );
-        let rgba = canvas.render_to_pixels(&renderer).expect("render nested clips");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render nested clips");
         assert_eq!(get_pixel(&rgba, 120, 70, 70), [0, 255, 0, 255]);
         assert_eq!(get_pixel(&rgba, 120, 35, 35), [0, 0, 0, 255]);
         assert_eq!(get_pixel(&rgba, 120, 100, 100), [0, 0, 0, 255]);
@@ -4505,7 +6321,9 @@ mod tests {
         canvas.restore();
 
         canvas.draw_paint(&Paint::fill(Color::GREEN));
-        let rgba = canvas.render_to_pixels(&renderer).expect("render clip restore");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render clip restore");
         assert_eq!(get_pixel(&rgba, 100, 50, 50), [0, 255, 0, 255]);
     }
 
@@ -4572,7 +6390,10 @@ mod tests {
             .move_to(Point::new(60.0, 100.0))
             .line_to(Point::new(60.0, 130.0));
 
-        canvas.draw_path(&pb.build(FillType::NonZero), &Paint::stroke(Color::RED, 10.0));
+        canvas.draw_path(
+            &pb.build(FillType::NonZero),
+            &Paint::stroke(Color::RED, 10.0),
+        );
         let rgba = canvas
             .render_to_pixels(&renderer)
             .expect("render three strokes");
@@ -4602,7 +6423,9 @@ mod tests {
         );
         canvas.draw_display_list(&dl.build());
 
-        let rgba = canvas.render_to_pixels(&renderer).expect("render blend modes");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render blend modes");
         // Left only -> RED
         assert_eq!(get_pixel(&rgba, 160, 45, 60), [255, 0, 0, 255]);
         // Overlap at (80, 60) -> RED + GREEN = YELLOW
@@ -4622,17 +6445,27 @@ mod tests {
             10.0,
             Color::WHITE,
         );
-        let rgba = canvas.render_to_pixels(&renderer).expect("render rrect shadow");
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render rrect shadow");
         let center = get_pixel(&rgba, 160, 80, 80);
         let border = get_pixel(&rgba, 160, 40, 80);
         let outside = get_pixel(&rgba, 160, 4, 4);
-        assert!(center[0] > 235, "center of shadow should be bright: {:?}", center);
+        assert!(
+            center[0] > 235,
+            "center of shadow should be bright: {:?}",
+            center
+        );
         assert!(
             border[0] > 60 && border[0] < 200,
             "border should have partial Gaussian falloff: {:?}",
             border
         );
-        assert!(outside[0] < 10, "far outside should be near zero: {:?}", outside);
+        assert!(
+            outside[0] < 10,
+            "far outside should be near zero: {:?}",
+            outside
+        );
     }
 
     /// C++ source: aiks_unittests.cc:ShowcaseMultiQuadrantRender
@@ -4670,7 +6503,9 @@ mod tests {
             .render_to_pixels(&renderer)
             .expect("render shaped text");
         let green_pixels = rgba
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[1] > 80 && px[0] < 30 && px[2] < 30)
             .count();
         assert!(
@@ -4802,7 +6637,9 @@ mod tests {
             .render_to_pixels(&renderer)
             .expect("render stroked glyph path");
         let yellow_px = rgba
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 180 && px[1] > 180 && px[2] < 30)
             .count();
         assert!(
@@ -5039,5 +6876,489 @@ mod tests {
                 non_bg
             );
         }
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderSaveLayerWithOpacityAndColorFilter
+    #[test]
+    fn test_can_render_save_layer_with_opacity_and_color_filter() {
+        let renderer = shared_test_renderer();
+        let mut canvas = Canvas::new(100, 100, Color::BLACK);
+
+        let layer_paint = Paint::fill(Color::new(1.0, 1.0, 1.0, 0.5))
+            .with_color_filter(ColorFilter::Mode(Color::GREEN, BlendMode::SrcIn));
+        canvas.save_layer(
+            Some(Rect::from_xywh(10.0, 10.0, 80.0, 80.0)),
+            Some(&layer_paint),
+        );
+        canvas.draw_rect(
+            Rect::from_xywh(20.0, 20.0, 60.0, 60.0),
+            &Paint::fill(Color::RED),
+        );
+        canvas.restore();
+
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render save_layer");
+        let center_px = get_pixel(&rgba, 100, 50, 50);
+        assert_eq!(center_px[0], 0, "red should be replaced by green filter");
+        assert!(
+            center_px[1] >= 120 && center_px[1] <= 135,
+            "green channel should be ~50% opacity over black, got {:?}",
+            center_px
+        );
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderParagraphImageAtlasVerticesAndShadow
+    #[test]
+    fn test_can_render_paragraph_image_atlas_vertices_and_shadow() {
+        let renderer = shared_test_renderer();
+        let mut canvas = Canvas::new(240, 180, Color::BLACK);
+
+        // 1. draw_paragraph with multi-span RichTextStyle + underline decoration
+        let mut para_style = ParagraphStyle::default();
+        para_style.default_text_style.set_font_size(18.0);
+        para_style.default_text_style.set_color(Color::WHITE);
+        let mut pb = ParagraphBuilder::new(para_style);
+        let mut span_style = RichTextStyle::default();
+        span_style.set_font_size(18.0);
+        span_style.set_color(Color::new(0.0, 1.0, 1.0, 1.0));
+        span_style.decoration = 0x1;
+        pb.push_style(span_style);
+        pb.add_text("Impeller");
+        pb.pop();
+        let mut para = pb.build();
+        para.layout(canvas.typographer_mut(), 200.0);
+        canvas.draw_paragraph(&para, Point::new(10.0, 10.0));
+
+        // 2. draw_image_rect & draw_atlas with a 2x2 solid RGBA texture
+        let tex = ImageTexture::new(
+            77,
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        );
+        canvas.draw_image_rect(
+            &tex,
+            Rect::from_xywh(0.0, 0.0, 2.0, 2.0),
+            Rect::from_xywh(10.0, 60.0, 40.0, 40.0),
+            &Paint::fill(Color::WHITE),
+            false,
+        );
+        canvas.draw_atlas(
+            &tex,
+            &[[10.0, 0.0, 60.0, 60.0]],
+            &[Rect::from_xywh(0.0, 0.0, 2.0, 2.0)],
+            None,
+            BlendMode::SrcOver,
+            None,
+            None,
+            false,
+        );
+
+        // 3. draw_vertices triangle
+        canvas.draw_vertices(
+            &[
+                Point::new(120.0, 60.0),
+                Point::new(170.0, 60.0),
+                Point::new(145.0, 110.0),
+            ],
+            None,
+            Some(&[Color::GREEN, Color::GREEN, Color::GREEN]),
+            &[0, 1, 2],
+            BlendMode::Dst,
+            &Paint::fill(Color::WHITE),
+        );
+
+        // 4. draw_shadow + draw_picture
+        let mut shadow_pb = PathBuilder::new();
+        shadow_pb.add_rect(Rect::from_xywh(180.0, 60.0, 40.0, 40.0));
+        let shadow_path = shadow_pb.build(FillType::NonZero);
+        let mut dl_builder = DisplayListBuilder::new();
+        dl_builder.draw_shadow(shadow_path, Color::YELLOW, 6.0, true, 1.0);
+        let pic = Arc::new(dl_builder.build());
+        canvas.draw_picture(&pic);
+
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render paragraph, image, atlas, vertices, and shadow");
+        // Verify draw_image_rect red quad at (30, 80)
+        assert_eq!(get_pixel(&rgba, 240, 30, 80), [255, 0, 0, 255]);
+        // Verify draw_vertices green triangle at (145, 75)
+        let tri_px = get_pixel(&rgba, 240, 145, 75);
+        assert!(
+            tri_px[1] > 200 && tri_px[0] < 20,
+            "expected green triangle pixel, got {:?}",
+            tri_px
+        );
+    }
+
+    /// C++ source: aiks_unittests.cc:PreTessellationClipCullingAndScissorElision
+    #[test]
+    fn test_pre_tessellation_clip_culling_and_scissor_elision() {
+        let mut canvas = Canvas::new(200, 200, Color::BLACK);
+        let fill_paint = Paint::fill(Color::RED);
+        let stroke_paint = Paint::stroke(Color::GREEN, 4.0);
+        let radii = RoundingRadii::from_single_radius(6.0);
+
+        let mut para_style = ParagraphStyle::default();
+        para_style.default_text_style.set_font_size(14.0);
+        para_style.default_text_style.set_color(Color::WHITE);
+        let mut pb = ParagraphBuilder::new(para_style);
+        pb.add_text("Clip");
+        let mut para = pb.build();
+        para.layout(canvas.typographer_mut(), 80.0);
+
+        // 1. Offscreen frustum culling: primitives outside 200x200 emit 0 commands.
+        canvas.draw_rect(Rect::from_xywh(250.0, 10.0, 40.0, 40.0), &fill_paint);
+        canvas.draw_rrect(Rect::from_xywh(-60.0, 10.0, 40.0, 40.0), radii, &fill_paint);
+        canvas.draw_circle(Point::new(100.0, 260.0), 20.0, &fill_paint);
+        canvas.draw_paragraph(&para, Point::new(250.0, 250.0));
+        assert_eq!(
+            canvas.commands().len(),
+            0,
+            "offscreen primitives must be culled before tessellation"
+        );
+
+        // 2. Explicit clip rect [20, 20, 120, 120]:
+        let clip_box = Rect::from_xywh(20.0, 20.0, 100.0, 100.0);
+        canvas.save();
+        canvas.clip_rect(clip_box);
+
+        // 2a. Primitives outside clip_box (still inside canvas) are culled before tessellation.
+        canvas.draw_rect(Rect::from_xywh(130.0, 30.0, 40.0, 40.0), &fill_paint);
+        canvas.draw_rrect(Rect::from_xywh(130.0, 30.0, 40.0, 40.0), radii, &fill_paint);
+        canvas.draw_circle(Point::new(160.0, 60.0), 15.0, &fill_paint);
+        canvas.draw_paragraph(&para, Point::new(140.0, 40.0));
+        assert_eq!(
+            canvas.commands().len(),
+            0,
+            "clipped-out primitives must emit 0 commands"
+        );
+
+        // 2b. Interior primitives strictly inside clip_box elide hardware scissor (clip_rect == None).
+        canvas.draw_rect(Rect::from_xywh(30.0, 30.0, 20.0, 20.0), &fill_paint);
+        canvas.draw_rect(Rect::from_xywh(60.0, 30.0, 20.0, 20.0), &stroke_paint);
+        canvas.draw_rrect(Rect::from_xywh(30.0, 60.0, 30.0, 20.0), radii, &fill_paint);
+        canvas.draw_circle(Point::new(95.0, 70.0), 10.0, &fill_paint);
+        canvas.draw_paragraph(&para, Point::new(30.0, 90.0));
+        assert_eq!(canvas.commands().len(), 5);
+        for (idx, cmd) in canvas.commands().iter().enumerate() {
+            assert_eq!(
+                cmd.clip_rect(),
+                None,
+                "interior command #{idx} strictly inside clip_box should elide scissor"
+            );
+        }
+
+        // Verify fast-path draw_rect vertex/index counts (4v/6i fill, 8v/24i miter stroke).
+        if let DrawCommand::SolidFill { mesh, .. } = &canvas.commands()[0] {
+            assert_eq!(mesh.vertices.len(), 4);
+            assert_eq!(mesh.indices.len(), 6);
+        } else {
+            panic!("expected SolidFill for fast-path filled draw_rect");
+        }
+        if let DrawCommand::SolidFill { mesh, .. } = &canvas.commands()[1] {
+            assert_eq!(mesh.vertices.len(), 8);
+            assert_eq!(mesh.indices.len(), 24);
+        } else {
+            panic!("expected SolidFill for fast-path stroked draw_rect");
+        }
+
+        // 2c. Straddling primitives intersecting clip_box boundary keep hardware scissor Some(clip_box).
+        canvas.draw_rrect(Rect::from_xywh(10.0, 30.0, 30.0, 20.0), radii, &fill_paint);
+        canvas.draw_paragraph(&para, Point::new(18.0, 90.0));
+        assert_eq!(canvas.commands().len(), 7);
+        assert_eq!(canvas.commands()[5].clip_rect(), Some(clip_box));
+        assert_eq!(canvas.commands()[6].clip_rect(), Some(clip_box));
+
+        canvas.restore();
+    }
+
+    /// C++ source: aiks_unittests.cc:SinglePassParagraphQuadEmitAndCanvasReset
+    #[test]
+    fn test_single_pass_paragraph_quad_emit_and_canvas_reset() {
+        let mut canvas = Canvas::new(160, 120, Color::BLACK);
+        let quads = [
+            AtlasGlyphQuad {
+                dest_rect: Rect::from_xywh(0.0, 0.0, 12.0, 14.0),
+                atlas_rect: Rect::from_xywh(1.0, 1.0, 12.0, 14.0),
+                color: Color::WHITE,
+                is_color: false,
+            },
+            AtlasGlyphQuad {
+                dest_rect: Rect::from_xywh(200.0, 0.0, 12.0, 14.0),
+                atlas_rect: Rect::from_xywh(14.0, 1.0, 12.0, 14.0),
+                color: Color::WHITE,
+                is_color: false,
+            },
+        ];
+
+        canvas.save();
+        canvas.clip_rect(Rect::from_xywh(10.0, 10.0, 100.0, 80.0));
+        canvas.translate(5.0, 5.0);
+        canvas.emit_glyph_quads_slice_with_offset(
+            &quads,
+            Point::new(20.0, 25.0),
+            canvas.get_current_transform(),
+            BlendMode::SrcOver,
+            false,
+        );
+        assert_eq!(canvas.commands().len(), 1);
+        if let DrawCommand::GlyphAtlas(batch) = &canvas.commands()[0] {
+            // Only the first quad survives after shifting by (20, 25) + translate(5, 5) -> [25, 30, 37, 44].
+            assert_eq!(batch.quads.len(), 1);
+            assert_eq!(
+                batch.quads[0].dest_rect,
+                Rect::from_xywh(20.0, 25.0, 12.0, 14.0)
+            );
+            // Strictly contained inside clip [10, 10, 110, 90], so scissor is elided.
+            assert_eq!(batch.clip_rect, None);
+        } else {
+            panic!("expected GlyphAtlas command");
+        }
+
+        // Push additional commands and stack frames, then verify Canvas::reset retains capacities.
+        for i in 0..8 {
+            canvas.draw_rect(
+                Rect::from_xywh(12.0 + i as Scalar * 4.0, 12.0, 3.0, 3.0),
+                &Paint::fill(Color::RED),
+            );
+        }
+        let cmd_cap_before = canvas.commands.capacity();
+        let stack_cap_before = canvas.stack.capacity();
+        assert!(cmd_cap_before >= 9);
+        assert!(stack_cap_before >= 2);
+
+        canvas.reset(320, 240, Color::BLUE);
+        assert_eq!(canvas.width(), 320);
+        assert_eq!(canvas.height(), 240);
+        assert_eq!(canvas.clear_color(), Color::BLUE);
+        assert_eq!(canvas.commands().len(), 0);
+        assert_eq!(canvas.get_save_count(), 1);
+        assert_eq!(canvas.get_current_transform(), Matrix::IDENTITY);
+        assert_eq!(canvas.get_current_clip(), None);
+        assert!(canvas.commands.capacity() >= cmd_cap_before);
+        assert!(canvas.stack.capacity() >= stack_cap_before);
+    }
+
+    /// C++ source: aiks_unittests.cc:CachedPathStrokedCircleAnalyticArcAndParagraphAabb
+    #[test]
+    fn test_phase9_cached_path_stroked_circle_analytic_arc_and_paragraph_aabb() {
+        let mut canvas = Canvas::new(240, 200, Color::BLACK);
+
+        // 1. Default glyph atlases + paragraph-level AABB fast-path:
+        let mut para_style = ParagraphStyle::default();
+        para_style.default_text_style.set_font_size(14.0);
+        para_style.default_text_style.set_color(Color::WHITE);
+        let mut pb = ParagraphBuilder::new(para_style);
+        pb.add_text("Fast");
+        let mut para = pb.build();
+        let mut typo = TypographerContext::new();
+        para.layout(&mut typo, 100.0);
+        assert!(para.quad_bounds.is_some());
+        assert!(para.uses_alpha);
+
+        let alpha_arc = Arc::new(typo.alpha_atlas.descriptor_without_pixels());
+        let color_arc = Arc::new(typo.color_atlas.descriptor_without_pixels());
+        canvas
+            .set_default_glyph_atlases(Some(Arc::clone(&alpha_arc)), Some(Arc::clone(&color_arc)));
+
+        canvas.save();
+        canvas.clip_rect(Rect::from_xywh(10.0, 10.0, 120.0, 80.0));
+        canvas.draw_paragraph(&para, Point::new(20.0, 20.0));
+        // Offscreen paragraph culled in O(1) via quad_bounds:
+        canvas.draw_paragraph(&para, Point::new(150.0, 20.0));
+        canvas.restore();
+
+        assert_eq!(canvas.commands().len(), 1);
+        if let DrawCommand::GlyphAtlas(batch) = &canvas.commands()[0] {
+            assert_eq!(
+                batch.clip_rect, None,
+                "interior paragraph should elide scissor"
+            );
+            assert!(
+                batch
+                    .alpha_atlas
+                    .as_ref()
+                    .is_some_and(|a| Arc::ptr_eq(a, &alpha_arc)),
+                "paragraph fast-path must pre-bind default_alpha_atlas"
+            );
+        } else {
+            panic!("expected GlyphAtlas command");
+        }
+
+        // 2. Origin-centered stroked circle + analytic arc + cached path:
+        canvas.draw_circle(
+            Point::new(60.0, 140.0),
+            20.0,
+            &Paint::stroke(Color::GREEN, 3.0),
+        );
+        canvas.draw_arc(
+            Rect::from_xywh(100.0, 120.0, 40.0, 40.0),
+            Radians(0.0),
+            Radians(std::f32::consts::PI),
+            true,
+            &Paint::fill(Color::RED),
+        );
+        let mut path_pb = PathBuilder::new();
+        path_pb.move_to(Point::new(160.0, 120.0));
+        path_pb.line_to(Point::new(200.0, 120.0));
+        path_pb.line_to(Point::new(180.0, 160.0));
+        path_pb.close();
+        let tri_path = path_pb.build(FillType::NonZero);
+        assert!(tri_path.cache_id() != 0);
+        canvas.draw_path(&tri_path, &Paint::fill(Color::BLUE));
+        canvas.draw_path(&tri_path, &Paint::fill(Color::BLUE));
+        assert_eq!(canvas.commands().len(), 5);
+
+        // Verify origin-centered circle transform maps Point::ZERO to (60, 140):
+        if let DrawCommand::SolidFill { transform, .. } = &canvas.commands()[1] {
+            let p = transform.transform_point(Point::ZERO);
+            assert!((p.x - 60.0).abs() <= 1e-4);
+            assert!((p.y - 140.0).abs() <= 1e-4);
+        } else {
+            panic!("expected SolidFill for stroked circle");
+        }
+    }
+
+    /// C++ source: aiks_unittests.cc:DiffRoundRectFastPathAndCanvasReplayStats
+    #[test]
+    fn test_phase10_diff_rrect_fast_path_and_replay_stats() {
+        let mut builder = DisplayListBuilder::new();
+        let outer = Rect::from_xywh(20.0, 30.0, 120.0, 80.0);
+        let inner = Rect::from_xywh(24.0, 34.0, 112.0, 72.0);
+        // 1. Nested rounded border -> analytic DiffRoundRectGeometry fast-path:
+        builder.draw_diff_rrect(
+            outer,
+            RoundingRadii::from_single_radius(12.0),
+            inner,
+            RoundingRadii::from_single_radius(8.0),
+            Paint::fill(Color::RED),
+        );
+        // 2. Non-nested / poking corner -> PSLG fallback:
+        builder.draw_diff_rrect(
+            outer,
+            RoundingRadii::from_single_radius(36.0),
+            Rect::from_xywh(21.0, 31.0, 118.0, 78.0),
+            RoundingRadii::from_single_radius(0.0),
+            Paint::fill(Color::BLUE),
+        );
+        // 3. RRect + Path + SaveLayer + Restore:
+        builder.save_layer(Some(outer), None);
+        builder.draw_rrect(
+            outer,
+            RoundingRadii::from_single_radius(10.0),
+            Paint::fill(Color::GREEN),
+        );
+        let mut pb = PathBuilder::new();
+        pb.add_rect(Rect::from_xywh(40.0, 50.0, 30.0, 20.0));
+        builder.draw_path(pb.build(FillType::NonZero), Paint::fill(Color::WHITE));
+        builder.restore();
+
+        let dl = builder.build();
+        let mut canvas = Canvas::new(240, 200, Color::BLACK);
+        canvas.draw_display_list(&dl);
+
+        let stats = canvas.replay_stats();
+        assert_eq!(stats.op_count, 6);
+        assert_eq!(stats.drrect_count, 2);
+        assert_eq!(stats.rrect_count, 1);
+        assert_eq!(stats.path_count, 1);
+        assert_eq!(stats.save_layer_count, 1);
+        assert_eq!(stats.paragraph_count, 0);
+        assert_eq!(stats.picture_count, 0);
+
+        // First command is the origin-shifted analytic DiffRoundRectGeometry SolidFill:
+        if let DrawCommand::SolidFill { transform, .. } = &canvas.commands()[0] {
+            let p = transform.transform_point(Point::ZERO);
+            assert!((p.x - 20.0).abs() <= 1e-4);
+            assert!((p.y - 30.0).abs() <= 1e-4);
+        } else {
+            panic!("expected SolidFill for analytic DiffRoundRectGeometry");
+        }
+
+        // Reset clears replay_stats:
+        canvas.reset(240, 200, Color::BLACK);
+        assert_eq!(canvas.replay_stats(), CanvasReplayStats::default());
+    }
+
+    /// C++ source: aiks_unittests.cc:OneHitPathMeshFilterAndSubOpReplayStats
+    #[test]
+    fn test_phase11_one_hit_path_filter_and_sub_op_telemetry() {
+        GEOMETRY_MESH_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            cache.paths.clear();
+            cache.seen_path_ids.clear();
+        });
+
+        // 1. Convex polygon path -> 1-hit seen_path_ids filter on first draw, cached on second:
+        let mut pb_convex = PathBuilder::new();
+        pb_convex.move_to(Point::new(10.0, 10.0));
+        pb_convex.line_to(Point::new(60.0, 10.0));
+        pb_convex.line_to(Point::new(35.0, 50.0));
+        pb_convex.close();
+        let convex_path = pb_convex.build(FillType::NonZero);
+        let cid = convex_path.cache_id();
+        assert_ne!(cid, 0);
+
+        let mut canvas = Canvas::new(200, 200, Color::BLACK);
+        canvas.draw_path(&convex_path, &Paint::fill(Color::RED));
+
+        GEOMETRY_MESH_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            assert!(
+                cache.seen_path_ids.contains(&cid),
+                "first draw must record cid in seen_path_ids"
+            );
+            assert!(
+                !cache.paths.keys().any(|k| k.path_cache_id == cid),
+                "first draw must NOT insert 1-hit animated path into cache.paths"
+            );
+        });
+
+        // Second draw of the same Path caches it in cache.paths:
+        canvas.draw_path(&convex_path, &Paint::fill(Color::RED));
+        GEOMETRY_MESH_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            assert!(
+                cache.paths.keys().any(|k| k.path_cache_id == cid),
+                "second draw of static path must insert mesh into cache.paths"
+            );
+        });
+
+        // 2. Concave / self-intersecting path -> PslgGeneral:
+        let mut pb_concave = PathBuilder::new();
+        pb_concave.move_to(Point::new(10.0, 70.0));
+        pb_concave.line_to(Point::new(70.0, 70.0));
+        pb_concave.line_to(Point::new(40.0, 90.0));
+        pb_concave.line_to(Point::new(70.0, 110.0));
+        pb_concave.line_to(Point::new(10.0, 110.0));
+        pb_concave.close();
+        let concave_path = pb_concave.build(FillType::NonZero);
+        canvas.draw_path(&concave_path, &Paint::fill(Color::GREEN));
+
+        // 3. Stroked path:
+        canvas.draw_path(&convex_path, &Paint::stroke(Color::BLUE, 3.0));
+
+        // 4. Culled draws outside 200x200 viewport:
+        canvas.draw_rect(
+            Rect::from_xywh(500.0, 500.0, 40.0, 40.0),
+            &Paint::fill(Color::WHITE),
+        );
+        let mut pb_offscreen = PathBuilder::new();
+        pb_offscreen.add_rect(Rect::from_xywh(-200.0, -200.0, 50.0, 50.0));
+        canvas.draw_path(
+            &pb_offscreen.build(FillType::NonZero),
+            &Paint::fill(Color::WHITE),
+        );
+
+        let stats = canvas.replay_stats();
+        assert_eq!(stats.path_fill_count, 3);
+        assert_eq!(stats.path_convex_fast_count, 2);
+        assert_eq!(stats.path_pslg_count, 1);
+        assert_eq!(stats.path_stroke_count, 1);
+        assert_eq!(stats.culled_count, 2);
     }
 }

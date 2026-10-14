@@ -156,24 +156,51 @@ impl Neg for Trig {
     }
 }
 
+const MAX_CACHED_TRIG_DIVISIONS: usize = 64;
+
+static CACHED_TRIGS: std::sync::OnceLock<Vec<Vec<Trig>>> = std::sync::OnceLock::new();
+
+fn build_trig_vec(divisions: usize) -> Vec<Trig> {
+    let divisions = divisions.max(1);
+    let mut entries = Vec::with_capacity(divisions + 1);
+    let angle_scale = std::f64::consts::FRAC_PI_2 / (divisions as f64);
+    entries.push(Trig::new(1.0, 0.0));
+    for i in 1..divisions {
+        entries.push(Trig::from_radians((i as f64) * angle_scale));
+    }
+    entries.push(Trig::new(0.0, 1.0));
+    entries
+}
+
 /// Quarter-circle sample table matching `Tessellator::Trigs` in `tessellator.h`.
 /// Always contains `divisions + 1 >= 2` entries from `(1, 0)` at 0 deg to `(0, 1)` at 90 deg.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trigs {
-    entries: Vec<Trig>,
+    entries: std::borrow::Cow<'static, [Trig]>,
 }
 
 impl Trigs {
     pub fn from_divisions(divisions: usize) -> Self {
         let divisions = divisions.max(1);
-        let mut entries = Vec::with_capacity(divisions + 1);
-        let angle_scale = std::f64::consts::FRAC_PI_2 / (divisions as f64);
-        entries.push(Trig::new(1.0, 0.0));
-        for i in 1..divisions {
-            entries.push(Trig::from_radians((i as f64) * angle_scale));
+        if divisions <= MAX_CACHED_TRIG_DIVISIONS {
+            let table = CACHED_TRIGS.get_or_init(|| {
+                (0..=MAX_CACHED_TRIG_DIVISIONS)
+                    .map(|d| {
+                        if d == 0 {
+                            Vec::new()
+                        } else {
+                            build_trig_vec(d)
+                        }
+                    })
+                    .collect()
+            });
+            return Self {
+                entries: std::borrow::Cow::Borrowed(&table[divisions]),
+            };
         }
-        entries.push(Trig::new(0.0, 1.0));
-        Self { entries }
+        Self {
+            entries: std::borrow::Cow::Owned(build_trig_vec(divisions)),
+        }
     }
 
     pub fn from_pixel_radius(pixel_radius: Scalar) -> Self {

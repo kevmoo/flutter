@@ -4,8 +4,8 @@ use crate::stroke::{
 };
 use crate::trigs::{compute_quadrant_divisions, Trigs};
 use crate::{StrokeParameters, TessellatedMesh, Tessellator, Vertex2D};
-use impeller_geometry::{Matrix, Point, Rect, Scalar, Size, K_EH_CLOSE_ENOUGH};
-use impeller_path::{Cap, Join, Path, RoundingRadii};
+use impeller_geometry::{Matrix, Point, Radians, Rect, Scalar, Size, K_EH_CLOSE_ENOUGH};
+use impeller_path::{Cap, FillType, Join, Path, PathBuilder, RoundingRadii};
 
 #[inline]
 pub(crate) fn is_translation_scale_only(m: &Matrix) -> bool {
@@ -635,6 +635,35 @@ impl RoundRectGeometry {
         let right = self.rect.get_right();
         let bottom = self.rect.get_bottom();
 
+        if norm.top_left == norm.top_right
+            && norm.top_left == norm.bottom_left
+            && norm.top_left == norm.bottom_right
+        {
+            let radii = norm.top_left;
+            let inner_left = left + radii.width;
+            let inner_top = top + radii.height;
+            let inner_right = right - radii.width;
+            let inner_bottom = bottom - radii.height;
+            let mut strip = Vec::with_capacity(trigs.len() * 4);
+
+            for &trig in trigs.as_slice() {
+                let offset = trig.scale_radii(radii);
+                strip.push(Point::new(inner_left - offset.x, inner_bottom + offset.y));
+                strip.push(Point::new(inner_left - offset.x, inner_top - offset.y));
+            }
+
+            for &trig in trigs.as_slice() {
+                let offset = Point::new(
+                    (trig.sin * radii.width as f64) as Scalar,
+                    (trig.cos * radii.height as f64) as Scalar,
+                );
+                strip.push(Point::new(inner_right + offset.x, inner_bottom + offset.y));
+                strip.push(Point::new(inner_right + offset.x, inner_top - offset.y));
+            }
+
+            return strip_points_to_mesh(&strip);
+        }
+
         let mut contour = Vec::with_capacity(trigs.len() * 4);
         let push_unique = |pts: &mut Vec<Point>, p: Point| {
             if pts
@@ -1126,5 +1155,494 @@ impl EllipseGeometry {
 
     pub fn get_coverage(&self, transform: &Matrix) -> Option<Rect> {
         Some(transform_rect_bounds(transform, self.bounds))
+    }
+}
+
+/// Ported from `ArcGeometry` in `arc_geometry.cc` (extended for elliptical `oval_bounds`).
+pub struct ArcGeometry {
+    pub oval_bounds: Rect,
+    pub start: Radians,
+    pub sweep: Radians,
+    pub use_center: bool,
+}
+
+impl ArcGeometry {
+    pub fn new(oval_bounds: Rect, start: Radians, sweep: Radians, use_center: bool) -> Self {
+        Self {
+            oval_bounds,
+            start,
+            sweep,
+            use_center,
+        }
+    }
+
+    pub fn get_mesh(&self, scale: Scalar) -> TessellatedMesh {
+        let bounds = self.oval_bounds.get_positive();
+        if bounds.is_empty()
+            || !self.start.0.is_finite()
+            || !self.sweep.0.is_finite()
+            || self.sweep.0.abs() <= 1e-6
+        {
+            return TessellatedMesh::default();
+        }
+
+        let scale = scale.max(1.0);
+        let rx = bounds.get_width() * 0.5;
+        let ry = bounds.get_height() * 0.5;
+        let center = Point::new(bounds.get_left() + rx, bounds.get_top() + ry);
+
+        let sweep_rad = self
+            .sweep
+            .0
+            .clamp(-std::f32::consts::TAU, std::f32::consts::TAU);
+        let sweep_abs = sweep_rad.abs();
+        let full_circle = sweep_abs >= std::f32::consts::TAU - 1e-5;
+        if full_circle {
+            return EllipseGeometry::new(bounds).get_mesh(scale);
+        }
+
+        let max_radius = rx.max(ry);
+        let quad_divs = compute_quadrant_divisions(scale * max_radius);
+        let quadrants = (sweep_abs / std::f32::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+        let steps = (quad_divs * quadrants).max(2);
+
+        let start_f64 = self.start.0 as f64;
+        let step_f64 = (sweep_rad as f64) / (steps as f64);
+        let (mut sin_a, mut cos_a) = start_f64.sin_cos();
+        let (sin_step, cos_step) = step_f64.sin_cos();
+
+        if self.use_center {
+            let mut vertices = Vec::with_capacity(steps + 2);
+            let mut indices = Vec::with_capacity(steps * 3);
+            vertices.push(Vertex2D::from_point(center));
+            for i in 0..=steps {
+                let p = Point::new(
+                    center.x + (cos_a as Scalar) * rx,
+                    center.y + (sin_a as Scalar) * ry,
+                );
+                vertices.push(Vertex2D::from_point(p));
+                if i > 0 {
+                    indices.push(0);
+                    indices.push(i as u32);
+                    indices.push((i + 1) as u32);
+                }
+                let next_cos = cos_a * cos_step - sin_a * sin_step;
+                let next_sin = sin_a * cos_step + cos_a * sin_step;
+                cos_a = next_cos;
+                sin_a = next_sin;
+            }
+            TessellatedMesh { vertices, indices }
+        } else {
+            let mut vertices = Vec::with_capacity(steps + 1);
+            let mut indices = Vec::with_capacity((steps - 1) * 3);
+            for i in 0..=steps {
+                let p = Point::new(
+                    center.x + (cos_a as Scalar) * rx,
+                    center.y + (sin_a as Scalar) * ry,
+                );
+                vertices.push(Vertex2D::from_point(p));
+                if i >= 2 {
+                    indices.push(0);
+                    indices.push((i - 1) as u32);
+                    indices.push(i as u32);
+                }
+                let next_cos = cos_a * cos_step - sin_a * sin_step;
+                let next_sin = sin_a * cos_step + cos_a * sin_step;
+                cos_a = next_cos;
+                sin_a = next_sin;
+            }
+            TessellatedMesh { vertices, indices }
+        }
+    }
+
+    pub fn get_stroked_mesh(&self, stroke: StrokeParameters, scale: Scalar) -> TessellatedMesh {
+        let bounds = self.oval_bounds.get_positive();
+        if bounds.is_empty()
+            || stroke.width < 0.0
+            || scale <= 0.0
+            || !self.start.0.is_finite()
+            || !self.sweep.0.is_finite()
+            || self.sweep.0.abs() <= 1e-6
+        {
+            return TessellatedMesh::default();
+        }
+
+        let scale = scale.max(1.0);
+        let min_size = K_MIN_STROKE_SIZE / scale;
+        let half_width = stroke.width.max(min_size) * 0.5;
+        let rx = bounds.get_width() * 0.5;
+        let ry = bounds.get_height() * 0.5;
+        let center = Point::new(bounds.get_left() + rx, bounds.get_top() + ry);
+        let is_circle = (rx - ry).abs() <= 1e-4;
+
+        let sweep_rad = self
+            .sweep
+            .0
+            .clamp(-std::f32::consts::TAU, std::f32::consts::TAU);
+        let sweep_abs = sweep_rad.abs();
+        let full_circle = sweep_abs >= std::f32::consts::TAU - 1e-5;
+
+        if full_circle && is_circle {
+            let strip = generate_stroked_circle_strip(scale, center, rx, half_width);
+            return strip_points_to_mesh(&strip);
+        }
+
+        let max_radius = rx.max(ry) + half_width;
+        let quad_divs = compute_quadrant_divisions(scale * max_radius);
+        let quadrants = (sweep_abs / std::f32::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+        let steps = (quad_divs * quadrants).max(2);
+
+        let start_f64 = self.start.0 as f64;
+        let step_f64 = (sweep_rad as f64) / (steps as f64);
+        let (mut sin_a, mut cos_a) = start_f64.sin_cos();
+        let (sin_step, cos_step) = step_f64.sin_cos();
+
+        if self.use_center && !full_circle {
+            let mut pb = PathBuilder::new();
+            pb.move_to(center);
+            for _ in 0..=steps {
+                let p = Point::new(
+                    center.x + (cos_a as Scalar) * rx,
+                    center.y + (sin_a as Scalar) * ry,
+                );
+                pb.line_to(p);
+                let next_cos = cos_a * cos_step - sin_a * sin_step;
+                let next_sin = sin_a * cos_step + cos_a * sin_step;
+                cos_a = next_cos;
+                sin_a = next_sin;
+            }
+            pb.close();
+            let path = pb.build(FillType::NonZero);
+            return Tessellator::tessellate_stroke(&path, stroke, scale);
+        }
+
+        let unit_normal = |c: Scalar, s: Scalar| -> Point {
+            if is_circle {
+                Point::new(c, s)
+            } else {
+                let nx = ry * c;
+                let ny = rx * s;
+                let len = (nx * nx + ny * ny).sqrt();
+                if len > 1e-8 {
+                    Point::new(nx / len, ny / len)
+                } else {
+                    Point::new(c, s)
+                }
+            }
+        };
+
+        let sign: Scalar = if sweep_rad >= 0.0 { 1.0 } else { -1.0 };
+        let cap_trigs = if !full_circle && stroke.cap == Cap::Round {
+            Some(Trigs::from_divisions(compute_quadrant_divisions(
+                scale * half_width,
+            )))
+        } else {
+            None
+        };
+        let cap_extra = match (&cap_trigs, !full_circle && stroke.cap == Cap::Square) {
+            (Some(t), _) => t.len() * 4,
+            (None, true) => 4,
+            (None, false) => 0,
+        };
+
+        let mut strip = Vec::with_capacity((steps + 1) * 2 + cap_extra);
+
+        let c0 = cos_a as Scalar;
+        let s0 = sin_a as Scalar;
+        let p0 = Point::new(center.x + c0 * rx, center.y + s0 * ry);
+        let n0 = unit_normal(c0, s0);
+        let t0 = Point::new(-n0.y * sign, n0.x * sign);
+
+        if !full_circle {
+            match stroke.cap {
+                Cap::Butt => {}
+                Cap::Square => {
+                    let ext = t0 * half_width;
+                    let across = n0 * half_width;
+                    strip.push(p0 + across - ext);
+                    strip.push(p0 - across - ext);
+                }
+                Cap::Round => {
+                    if let Some(ref trigs) = cap_trigs {
+                        let along = t0 * half_width;
+                        let across = n0 * half_width;
+                        for &trig in trigs.as_slice() {
+                            let tc = trig.cos as Scalar;
+                            let ts = trig.sin as Scalar;
+                            strip.push(p0 - along * tc + across * ts);
+                            strip.push(p0 - along * tc - across * ts);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut last_p = p0;
+        let mut last_n = n0;
+        for i in 0..=steps {
+            let c = cos_a as Scalar;
+            let s = sin_a as Scalar;
+            let p = Point::new(center.x + c * rx, center.y + s * ry);
+            let n = unit_normal(c, s);
+            let outer_p = p + n * half_width;
+            let inner_p = if is_circle && half_width >= rx {
+                center
+            } else {
+                p - n * half_width
+            };
+            strip.push(outer_p);
+            strip.push(inner_p);
+            if i == steps {
+                last_p = p;
+                last_n = n;
+            } else {
+                let next_cos = cos_a * cos_step - sin_a * sin_step;
+                let next_sin = sin_a * cos_step + cos_a * sin_step;
+                cos_a = next_cos;
+                sin_a = next_sin;
+            }
+        }
+
+        if full_circle {
+            if strip.len() >= 2 {
+                let first_outer = strip[0];
+                let first_inner = strip[1];
+                strip.push(first_outer);
+                strip.push(first_inner);
+            }
+        } else {
+            let tn = Point::new(-last_n.y * sign, last_n.x * sign);
+            match stroke.cap {
+                Cap::Butt => {}
+                Cap::Square => {
+                    let ext = tn * half_width;
+                    let across = last_n * half_width;
+                    strip.push(last_p + across + ext);
+                    strip.push(last_p - across + ext);
+                }
+                Cap::Round => {
+                    if let Some(ref trigs) = cap_trigs {
+                        let along = tn * half_width;
+                        let across = last_n * half_width;
+                        for &trig in trigs.as_slice() {
+                            let tc = trig.cos as Scalar;
+                            let ts = trig.sin as Scalar;
+                            strip.push(last_p + along * ts + across * tc);
+                            strip.push(last_p + along * ts - across * tc);
+                        }
+                    }
+                }
+            }
+        }
+
+        strip_points_to_mesh(&strip)
+    }
+
+    pub fn get_coverage(&self, transform: &Matrix) -> Option<Rect> {
+        Some(transform_rect_bounds(
+            transform,
+            self.oval_bounds.get_positive(),
+        ))
+    }
+
+    pub fn get_stroked_coverage(&self, stroke_width: Scalar, transform: &Matrix) -> Option<Rect> {
+        let half_width = stroke_width.max(0.0) * 0.5;
+        let b = self.oval_bounds.get_positive();
+        let outer = Rect::from_ltrb(
+            b.get_left() - half_width,
+            b.get_top() - half_width,
+            b.get_right() + half_width,
+            b.get_bottom() + half_width,
+        );
+        Some(transform_rect_bounds(transform, outer))
+    }
+}
+
+/// Analytic nested rounded-rectangle ring geometry (`outer` minus `inner`) matching
+/// Flutter `Canvas::drawDRRect` / `BoxDecoration` borders.
+pub struct DiffRoundRectGeometry {
+    pub outer_rect: Rect,
+    pub outer_radii: RoundingRadii,
+    pub inner_rect: Rect,
+    pub inner_radii: RoundingRadii,
+}
+
+impl DiffRoundRectGeometry {
+    pub const fn new(
+        outer_rect: Rect,
+        outer_radii: RoundingRadii,
+        inner_rect: Rect,
+        inner_radii: RoundingRadii,
+    ) -> Self {
+        Self {
+            outer_rect,
+            outer_radii,
+            inner_rect,
+            inner_radii,
+        }
+    }
+
+    pub fn get_mesh(&self, scale: Scalar) -> Option<TessellatedMesh> {
+        if self.outer_rect.is_empty() {
+            return Some(TessellatedMesh::default());
+        }
+        if self.inner_rect.is_empty() {
+            return Some(RoundRectGeometry::new(self.outer_rect, self.outer_radii).get_mesh(scale));
+        }
+
+        let outer_rect = self.outer_rect.get_positive();
+        let inner_rect = self.inner_rect.get_positive();
+        if !rect_contains_rect(outer_rect, inner_rect) {
+            return None;
+        }
+
+        let scale = scale.max(1.0);
+        let outer_radii = normalize_round_rect_radii(outer_rect, self.outer_radii);
+        let inner_radii = normalize_round_rect_radii(inner_rect, self.inner_radii);
+
+        let out_tl_c = Point::new(
+            outer_rect.get_left() + outer_radii.top_left.width,
+            outer_rect.get_top() + outer_radii.top_left.height,
+        );
+        let in_tl_c = Point::new(
+            inner_rect.get_left() + inner_radii.top_left.width,
+            inner_rect.get_top() + inner_radii.top_left.height,
+        );
+        let out_tr_c = Point::new(
+            outer_rect.get_right() - outer_radii.top_right.width,
+            outer_rect.get_top() + outer_radii.top_right.height,
+        );
+        let in_tr_c = Point::new(
+            inner_rect.get_right() - inner_radii.top_right.width,
+            inner_rect.get_top() + inner_radii.top_right.height,
+        );
+        let out_br_c = Point::new(
+            outer_rect.get_right() - outer_radii.bottom_right.width,
+            outer_rect.get_bottom() - outer_radii.bottom_right.height,
+        );
+        let in_br_c = Point::new(
+            inner_rect.get_right() - inner_radii.bottom_right.width,
+            inner_rect.get_bottom() - inner_radii.bottom_right.height,
+        );
+        let out_bl_c = Point::new(
+            outer_rect.get_left() + outer_radii.bottom_left.width,
+            outer_rect.get_bottom() - outer_radii.bottom_left.height,
+        );
+        let in_bl_c = Point::new(
+            inner_rect.get_left() + inner_radii.bottom_left.width,
+            inner_rect.get_bottom() - inner_radii.bottom_left.height,
+        );
+
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let out_tl_mid = Point::new(
+            out_tl_c.x - k * outer_radii.top_left.width,
+            out_tl_c.y - k * outer_radii.top_left.height,
+        );
+        let in_tl_mid = Point::new(
+            in_tl_c.x - k * inner_radii.top_left.width,
+            in_tl_c.y - k * inner_radii.top_left.height,
+        );
+        let out_tr_mid = Point::new(
+            out_tr_c.x + k * outer_radii.top_right.width,
+            out_tr_c.y - k * outer_radii.top_right.height,
+        );
+        let in_tr_mid = Point::new(
+            in_tr_c.x + k * inner_radii.top_right.width,
+            in_tr_c.y - k * inner_radii.top_right.height,
+        );
+        let out_br_mid = Point::new(
+            out_br_c.x + k * outer_radii.bottom_right.width,
+            out_br_c.y + k * outer_radii.bottom_right.height,
+        );
+        let in_br_mid = Point::new(
+            in_br_c.x + k * inner_radii.bottom_right.width,
+            in_br_c.y + k * inner_radii.bottom_right.height,
+        );
+        let out_bl_mid = Point::new(
+            out_bl_c.x - k * outer_radii.bottom_left.width,
+            out_bl_c.y + k * outer_radii.bottom_left.height,
+        );
+        let in_bl_mid = Point::new(
+            in_bl_c.x - k * inner_radii.bottom_left.width,
+            in_bl_c.y + k * inner_radii.bottom_left.height,
+        );
+
+        let tl_ok = in_tl_mid.x >= out_tl_mid.x - 1e-4 && in_tl_mid.y >= out_tl_mid.y - 1e-4;
+        let tr_ok = in_tr_mid.x <= out_tr_mid.x + 1e-4 && in_tr_mid.y >= out_tr_mid.y - 1e-4;
+        let br_ok = in_br_mid.x <= out_br_mid.x + 1e-4 && in_br_mid.y <= out_br_mid.y + 1e-4;
+        let bl_ok = in_bl_mid.x >= out_bl_mid.x - 1e-4 && in_bl_mid.y <= out_bl_mid.y + 1e-4;
+        if !(tl_ok && tr_ok && br_ok && bl_ok) {
+            return None;
+        }
+
+        let max_r = max_corner_radius(outer_radii).max(max_corner_radius(inner_radii));
+        let divisions = compute_round_rect_divisions(scale, max_r);
+        let trigs = Trigs::from_divisions(divisions);
+        let mut strip = Vec::with_capacity(trigs.len() * 8 + 2);
+
+        // 1. Top-Left
+        for &trig in trigs.as_slice() {
+            let c = trig.cos as Scalar;
+            let s = trig.sin as Scalar;
+            strip.push(Point::new(
+                out_tl_c.x - c * outer_radii.top_left.width,
+                out_tl_c.y - s * outer_radii.top_left.height,
+            ));
+            strip.push(Point::new(
+                in_tl_c.x - c * inner_radii.top_left.width,
+                in_tl_c.y - s * inner_radii.top_left.height,
+            ));
+        }
+
+        // 2. Top-Right
+        for &trig in trigs.as_slice() {
+            let c = trig.cos as Scalar;
+            let s = trig.sin as Scalar;
+            strip.push(Point::new(
+                out_tr_c.x + s * outer_radii.top_right.width,
+                out_tr_c.y - c * outer_radii.top_right.height,
+            ));
+            strip.push(Point::new(
+                in_tr_c.x + s * inner_radii.top_right.width,
+                in_tr_c.y - c * inner_radii.top_right.height,
+            ));
+        }
+
+        // 3. Bottom-Right
+        for &trig in trigs.as_slice() {
+            let c = trig.cos as Scalar;
+            let s = trig.sin as Scalar;
+            strip.push(Point::new(
+                out_br_c.x + c * outer_radii.bottom_right.width,
+                out_br_c.y + s * outer_radii.bottom_right.height,
+            ));
+            strip.push(Point::new(
+                in_br_c.x + c * inner_radii.bottom_right.width,
+                in_br_c.y + s * inner_radii.bottom_right.height,
+            ));
+        }
+
+        // 4. Bottom-Left
+        for &trig in trigs.as_slice() {
+            let c = trig.cos as Scalar;
+            let s = trig.sin as Scalar;
+            strip.push(Point::new(
+                out_bl_c.x - s * outer_radii.bottom_left.width,
+                out_bl_c.y + c * outer_radii.bottom_left.height,
+            ));
+            strip.push(Point::new(
+                in_bl_c.x - s * inner_radii.bottom_left.width,
+                in_bl_c.y + c * inner_radii.bottom_left.height,
+            ));
+        }
+
+        if strip.len() >= 2 {
+            let first_outer = strip[0];
+            let first_inner = strip[1];
+            strip.push(first_outer);
+            strip.push(first_inner);
+        }
+
+        Some(strip_points_to_mesh(&strip))
     }
 }

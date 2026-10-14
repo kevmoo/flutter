@@ -258,8 +258,8 @@ fn golden_asymmetric_rrect_and_circle_analytical_sdf_parity() {
                         px as Scalar + (sx as Scalar + 0.5) * 0.25,
                         py as Scalar + (sy as Scalar + 0.5) * 0.25,
                     );
-                    let in_circle =
-                        (sample - circle_center).get_length_squared() <= circle_radius * circle_radius;
+                    let in_circle = (sample - circle_center).get_length_squared()
+                        <= circle_radius * circle_radius;
                     let in_rrect = point_in_asymmetric_rrect(sample, rrect_bounds, rrect_radii);
                     if in_circle || in_rrect {
                         hits += 1;

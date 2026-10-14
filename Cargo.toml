@@ -9,6 +9,7 @@ members = [
     "crates/impeller_wgpu",
     "crates/impeller_canvas",
     "crates/impeller_web",
+    "crates/impeller_skwasm_ffi",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ web-sys = { version = "0.3", features = [
     "Document",
     "Element",
     "HtmlCanvasElement",
+    "ImageBitmap",
     "OffscreenCanvas",
     "Performance",
     "Window",
@@ -48,3 +50,4 @@ impeller_typographer = { path = "crates/impeller_typographer" }
 impeller_wgpu = { path = "crates/impeller_wgpu" }
 impeller_canvas = { path = "crates/impeller_canvas" }
 impeller_web = { path = "crates/impeller_web" }
+impeller_skwasm_ffi = { path = "crates/impeller_skwasm_ffi" }

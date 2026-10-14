@@ -48,7 +48,12 @@ fn rect_center(r: Rect) -> Point {
 
 #[inline]
 fn rect_shift(r: Rect, dx: Scalar, dy: Scalar) -> Rect {
-    Rect::from_xywh(r.origin.x + dx, r.origin.y + dy, r.size.width, r.size.height)
+    Rect::from_xywh(
+        r.origin.x + dx,
+        r.origin.y + dy,
+        r.size.width,
+        r.size.height,
+    )
 }
 
 #[inline]
@@ -134,12 +139,7 @@ impl RoundingRadii {
         Self::make_radii(radii)
     }
 
-    pub const fn make_nine_patch(
-        left: Scalar,
-        top: Scalar,
-        right: Scalar,
-        bottom: Scalar,
-    ) -> Self {
+    pub const fn make_nine_patch(left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Self {
         Self {
             top_left: Size::new(left, top),
             top_right: Size::new(right, top),
@@ -338,7 +338,10 @@ impl RoundRect {
     }
 
     pub fn from_rect_xy(rect: Rect, x_radius: Scalar, y_radius: Scalar) -> Self {
-        Self::from_rect_radii(rect, RoundingRadii::make_radii(Size::new(x_radius, y_radius)))
+        Self::from_rect_radii(
+            rect,
+            RoundingRadii::make_radii(Size::new(x_radius, y_radius)),
+        )
     }
 
     pub fn make_rect_xy(rect: Rect, x_radius: Scalar, y_radius: Scalar) -> Self {
@@ -462,13 +465,7 @@ impl RoundRect {
         self.expand_ltrb(horizontal, vertical, horizontal, vertical)
     }
 
-    pub fn expand_ltrb(
-        &self,
-        left: Scalar,
-        top: Scalar,
-        right: Scalar,
-        bottom: Scalar,
-    ) -> Self {
+    pub fn expand_ltrb(&self, left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Self {
         Self::from_rect_radii(
             rect_expand_ltrb(self.bounds, left, top, right, bottom),
             self.radii,
@@ -724,12 +721,8 @@ pub struct QuadPathComponent {
 
 pub type QuadraticPathComponent = QuadPathComponent;
 
-fn quadratic_path_bounding_populate_values(
-    values: &mut Vec<Scalar>,
-    p1: Scalar,
-    cp: Scalar,
-    p2: Scalar,
-) {
+#[inline]
+fn visit_quadratic_extrema_t(p1: Scalar, cp: Scalar, p2: Scalar, mut visit: impl FnMut(Scalar)) {
     // Derivative of (1-t)^2*p1 + 2*(1-t)*t*cp + t^2*p2 is:
     // 2 * ((p1 - 2*cp + p2)*t + (cp - p1)) = 0
     // => t = (p1 - cp) / (p1 - 2*cp + p2)
@@ -739,8 +732,17 @@ fn quadratic_path_bounding_populate_values(
     }
     let t = (p1 - cp) / denom;
     if (0.0..=1.0).contains(&t) {
-        values.push(t);
+        visit(t);
     }
+}
+
+fn quadratic_path_bounding_populate_values(
+    values: &mut Vec<Scalar>,
+    p1: Scalar,
+    cp: Scalar,
+    p2: Scalar,
+) {
+    visit_quadratic_extrema_t(p1, cp, p2, |t| values.push(t));
 }
 
 impl QuadPathComponent {
@@ -944,12 +946,13 @@ pub struct CubicPathComponent {
     pub p2: Point,
 }
 
-fn cubic_path_bounding_populate_values(
-    values: &mut Vec<Scalar>,
+#[inline]
+fn visit_cubic_extrema_t(
     p1: Scalar,
     p2: Scalar,
     p3: Scalar,
     p4: Scalar,
+    mut visit: impl FnMut(Scalar),
 ) {
     let a = 3.0 * (-p1 + 3.0 * p2 - 3.0 * p3 + p4);
     let b = 6.0 * (p1 - 2.0 * p2 + p3);
@@ -961,7 +964,7 @@ fn cubic_path_bounding_populate_values(
         }
         let t = -c / b;
         if (0.0..=1.0).contains(&t) {
-            values.push(t);
+            visit(t);
         }
         return;
     }
@@ -981,16 +984,26 @@ fn cubic_path_bounding_populate_values(
     {
         let t = q / a;
         if (0.0..=1.0).contains(&t) {
-            values.push(t);
+            visit(t);
         }
     }
 
     if q.abs() >= 1e-12 {
         let t = c / q;
         if (0.0..=1.0).contains(&t) {
-            values.push(t);
+            visit(t);
         }
     }
+}
+
+fn cubic_path_bounding_populate_values(
+    values: &mut Vec<Scalar>,
+    p1: Scalar,
+    p2: Scalar,
+    p3: Scalar,
+    p4: Scalar,
+) {
+    visit_cubic_extrema_t(p1, p2, p3, p4, |t| values.push(t));
 }
 
 impl CubicPathComponent {
@@ -1185,16 +1198,97 @@ impl PathPolyline {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+static NEXT_PATH_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_path_cache_id() -> u64 {
+    NEXT_PATH_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn compute_path_bounds(components: &[PathComponent]) -> Option<Rect> {
+    let mut min_x = Scalar::INFINITY;
+    let mut min_y = Scalar::INFINITY;
+    let mut max_x = Scalar::NEG_INFINITY;
+    let mut max_y = Scalar::NEG_INFINITY;
+    let mut found = false;
+
+    let mut clamp = |p: Point| {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+        found = true;
+    };
+
+    for comp in components {
+        match comp {
+            PathComponent::Contour(_) => {}
+            PathComponent::Linear(l) => {
+                clamp(l.p1);
+                clamp(l.p2);
+            }
+            PathComponent::Quad(q) => {
+                clamp(q.p1);
+                clamp(q.p2);
+                visit_quadratic_extrema_t(q.p1.x, q.cp.x, q.p2.x, |t| clamp(q.solve(t)));
+                visit_quadratic_extrema_t(q.p1.y, q.cp.y, q.p2.y, |t| clamp(q.solve(t)));
+            }
+            PathComponent::Cubic(c) => {
+                clamp(c.p1);
+                clamp(c.p2);
+                visit_cubic_extrema_t(c.p1.x, c.cp1.x, c.cp2.x, c.p2.x, |t| clamp(c.solve(t)));
+                visit_cubic_extrema_t(c.p1.y, c.cp1.y, c.cp2.y, c.p2.y, |t| clamp(c.solve(t)));
+            }
+        }
+    }
+
+    if !found {
+        None
+    } else {
+        Some(Rect::from_xywh(min_x, min_y, max_x - min_x, max_y - min_y))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Path {
     pub components: Vec<PathComponent>,
     pub fill_type: FillType,
     pub convexity: Convexity,
+    cache_id: u64,
+    cached_bounds: Option<Rect>,
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Self) -> bool {
+        self.components == other.components
+            && self.fill_type == other.fill_type
+            && self.convexity == other.convexity
+    }
 }
 
 impl Path {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn from_parts(
+        components: Vec<PathComponent>,
+        fill_type: FillType,
+        convexity: Convexity,
+    ) -> Self {
+        let cached_bounds = compute_path_bounds(&components);
+        Self {
+            components,
+            fill_type,
+            convexity,
+            cache_id: next_path_cache_id(),
+            cached_bounds,
+        }
+    }
+
+    #[inline]
+    pub fn cache_id(&self) -> u64 {
+        self.cache_id
     }
 
     pub fn get_fill_type(&self) -> FillType {
@@ -1375,46 +1469,9 @@ impl Path {
         PathPolyline { points, contours }
     }
 
+    #[inline]
     pub fn get_bounding_box(&self) -> Option<Rect> {
-        let mut min_x = Scalar::INFINITY;
-        let mut min_y = Scalar::INFINITY;
-        let mut max_x = Scalar::NEG_INFINITY;
-        let mut max_y = Scalar::NEG_INFINITY;
-        let mut found = false;
-
-        let mut clamp = |p: Point| {
-            min_x = min_x.min(p.x);
-            min_y = min_y.min(p.y);
-            max_x = max_x.max(p.x);
-            max_y = max_y.max(p.y);
-            found = true;
-        };
-
-        for comp in &self.components {
-            match comp {
-                PathComponent::Contour(_) => {}
-                PathComponent::Linear(l) => {
-                    clamp(l.p1);
-                    clamp(l.p2);
-                }
-                PathComponent::Quad(q) => {
-                    for p in q.extrema() {
-                        clamp(p);
-                    }
-                }
-                PathComponent::Cubic(c) => {
-                    for p in c.extrema() {
-                        clamp(p);
-                    }
-                }
-            }
-        }
-
-        if !found {
-            None
-        } else {
-            Some(Rect::from_xywh(min_x, min_y, max_x - min_x, max_y - min_y))
-        }
+        self.cached_bounds
     }
 
     pub fn get_transformed_bounding_box(&self, transform: &Matrix) -> Option<Rect> {
@@ -1470,11 +1527,7 @@ impl Path {
                 }),
             })
             .collect();
-        Self {
-            components,
-            fill_type: self.fill_type,
-            convexity: self.convexity,
-        }
+        Self::from_parts(components, self.fill_type, self.convexity)
     }
 
     pub fn transform(&self, matrix: &Matrix) -> Self {
@@ -1503,11 +1556,7 @@ impl Path {
                 }),
             })
             .collect();
-        Self {
-            components,
-            fill_type: self.fill_type,
-            convexity: self.convexity,
-        }
+        Self::from_parts(components, self.fill_type, self.convexity)
     }
 }
 
@@ -1555,6 +1604,16 @@ impl PathBuilder {
         self.convexity
     }
 
+    pub const fn current_point(&self) -> Point {
+        self.current
+    }
+
+    fn has_any_segments(&self) -> bool {
+        self.components
+            .iter()
+            .any(|c| !matches!(c, PathComponent::Contour(_)))
+    }
+
     fn add_contour_component(&mut self, destination: Point, is_closed: bool) {
         if matches!(self.components.last(), Some(PathComponent::Contour(_))) {
             self.components[self.current_contour_location] =
@@ -1582,6 +1641,7 @@ impl PathBuilder {
     }
 
     fn add_linear_component(&mut self, p1: Point, p2: Point) {
+        self.convexity = Convexity::Unknown;
         self.components
             .push(PathComponent::Linear(LinearPathComponent { p1, p2 }));
     }
@@ -1596,6 +1656,7 @@ impl PathBuilder {
     }
 
     fn add_quadratic_component(&mut self, p1: Point, cp: Point, p2: Point) {
+        self.convexity = Convexity::Unknown;
         self.components
             .push(PathComponent::Quad(QuadPathComponent { p1, cp, p2 }));
     }
@@ -1617,6 +1678,7 @@ impl PathBuilder {
     }
 
     fn add_cubic_component(&mut self, p1: Point, cp1: Point, cp2: Point, p2: Point) {
+        self.convexity = Convexity::Unknown;
         self.components
             .push(PathComponent::Cubic(CubicPathComponent {
                 p1,
@@ -1820,6 +1882,7 @@ impl PathBuilder {
     }
 
     pub fn add_rect(&mut self, rect: Rect) -> &mut Self {
+        let was_empty = !self.has_any_segments();
         let origin = rect.origin;
         let size = rect.size;
         let tl = origin;
@@ -1827,7 +1890,11 @@ impl PathBuilder {
         let br = Point::new(origin.x + size.width, origin.y + size.height);
         let bl = Point::new(origin.x, origin.y + size.height);
 
-        self.move_to(tl).line_to(tr).line_to(br).line_to(bl).close()
+        self.move_to(tl).line_to(tr).line_to(br).line_to(bl).close();
+        if was_empty && !rect.is_empty() {
+            self.convexity = Convexity::Convex;
+        }
+        self
     }
 
     pub fn add_circle(&mut self, center: Point, radius: Scalar) -> &mut Self {
@@ -1840,6 +1907,7 @@ impl PathBuilder {
     }
 
     pub fn add_oval(&mut self, container: Rect) -> &mut Self {
+        let was_empty = !self.has_any_segments();
         let c = rect_center(container);
         let r = c - container.origin;
         let m = r * K_ARC_APPROXIMATION_MAGIC;
@@ -1879,7 +1947,11 @@ impl PathBuilder {
         );
 
         self.current = Point::new(c.x, c.y - r.y);
-        self.close()
+        self.close();
+        if was_empty && !container.is_empty() {
+            self.convexity = Convexity::Convex;
+        }
+        self
     }
 
     pub fn add_rounded_rect(&mut self, rect: Rect, radii: RoundingRadii) -> &mut Self {
@@ -1893,6 +1965,7 @@ impl PathBuilder {
             return self.add_rect(rect);
         }
 
+        let was_empty = !self.has_any_segments();
         let rect_origin = rect.origin;
         let rect_size = rect.size;
 
@@ -1954,7 +2027,11 @@ impl PathBuilder {
         self.add_rounded_rect_top_left(rect, radii);
 
         self.current = Point::new(rect_origin.x + radii.top_left.width, rect_origin.y);
-        self.close()
+        self.close();
+        if was_empty && !rect.is_empty() {
+            self.convexity = Convexity::Convex;
+        }
+        self
     }
 
     fn add_rounded_rect_top_left(&mut self, rect: Rect, radii: RoundingRadii) {
@@ -2088,7 +2165,201 @@ impl PathBuilder {
         self
     }
 
+    pub fn arc_to_oval(
+        &mut self,
+        oval_bounds: Rect,
+        start: Radians,
+        sweep: Radians,
+        force_move_to: bool,
+    ) -> &mut Self {
+        if oval_bounds.is_empty() || !start.0.is_finite() || !sweep.0.is_finite() {
+            return self;
+        }
+
+        let dir: Scalar = if sweep.0 >= 0.0 { 1.0 } else { -1.0 };
+        let mut rem = sweep.0.abs().min(std::f32::consts::TAU);
+        let center = rect_center(oval_bounds);
+        let radius = center - oval_bounds.origin;
+        let mut cur_angle = start.0;
+        let mut p1_unit = Point::new(cur_angle.cos(), cur_angle.sin());
+        let first_pt = Point::new(
+            center.x + p1_unit.x * radius.x,
+            center.y + p1_unit.y * radius.y,
+        );
+
+        let current_contour_has_segments = !matches!(
+            self.components.last(),
+            None | Some(PathComponent::Contour(_))
+        );
+        if force_move_to || !current_contour_has_segments {
+            self.move_to(first_pt);
+        } else {
+            self.add_linear_component_if_needed(self.current, first_pt);
+            self.current = first_pt;
+        }
+
+        while rem > 1e-5 {
+            let step = rem.min(std::f32::consts::FRAC_PI_2);
+            let next_angle = cur_angle + dir * step;
+            let p2_unit = Point::new(next_angle.cos(), next_angle.sin());
+            let t1 = Point::new(-dir * p1_unit.y, dir * p1_unit.x);
+            let t2 = Point::new(-dir * p2_unit.y, dir * p2_unit.x);
+            let k = (4.0 / 3.0) * (step * 0.25).tan();
+
+            let p1 = Point::new(
+                center.x + p1_unit.x * radius.x,
+                center.y + p1_unit.y * radius.y,
+            );
+            let p2 = Point::new(
+                center.x + p2_unit.x * radius.x,
+                center.y + p2_unit.y * radius.y,
+            );
+            let cp1 = Point::new(p1.x + t1.x * radius.x * k, p1.y + t1.y * radius.y * k);
+            let cp2 = Point::new(p2.x - t2.x * radius.x * k, p2.y - t2.y * radius.y * k);
+
+            self.add_cubic_component(p1, cp1, cp2, p2);
+            self.current = p2;
+            cur_angle = next_angle;
+            rem -= step;
+            p1_unit = p2_unit;
+        }
+
+        self
+    }
+
+    pub fn svg_arc_to(
+        &mut self,
+        radii: Size,
+        x_axis_rotation_deg: Scalar,
+        large_arc: bool,
+        sweep_clockwise: bool,
+        end_point: Point,
+    ) -> &mut Self {
+        let p0 = self.current;
+        if (end_point - p0).get_length_squared() <= 1e-10 {
+            return self;
+        }
+
+        let current_contour_has_segments = !matches!(
+            self.components.last(),
+            None | Some(PathComponent::Contour(_))
+        );
+        if !current_contour_has_segments {
+            self.move_to(p0);
+        }
+
+        if !radii.width.is_finite()
+            || !radii.height.is_finite()
+            || radii.width.abs() <= 1e-6
+            || radii.height.abs() <= 1e-6
+        {
+            return self.line_to(end_point);
+        }
+
+        let mut rx = (radii.width as f64).abs();
+        let mut ry = (radii.height as f64).abs();
+        let phi = (x_axis_rotation_deg as f64).to_radians();
+        let (sin_phi, cos_phi) = phi.sin_cos();
+
+        let dx2 = ((p0.x as f64) - (end_point.x as f64)) * 0.5;
+        let dy2 = ((p0.y as f64) - (end_point.y as f64)) * 0.5;
+        let x1p = cos_phi * dx2 + sin_phi * dy2;
+        let y1p = -sin_phi * dx2 + cos_phi * dy2;
+
+        let x1p_sq = x1p * x1p;
+        let y1p_sq = y1p * y1p;
+        let lambda = x1p_sq / (rx * rx) + y1p_sq / (ry * ry);
+        if lambda > 1.0 {
+            let s = lambda.sqrt();
+            rx *= s;
+            ry *= s;
+        }
+
+        let rx_sq = rx * rx;
+        let ry_sq = ry * ry;
+        let sign = if large_arc == sweep_clockwise {
+            -1.0
+        } else {
+            1.0
+        };
+        let num = (rx_sq * ry_sq - rx_sq * y1p_sq - ry_sq * x1p_sq).max(0.0);
+        let den = rx_sq * y1p_sq + ry_sq * x1p_sq;
+        let coef = if den > 1e-18 {
+            sign * (num / den).sqrt()
+        } else {
+            0.0
+        };
+        let cxp = coef * (rx * y1p / ry);
+        let cyp = coef * (-ry * x1p / rx);
+
+        let mx = ((p0.x as f64) + (end_point.x as f64)) * 0.5;
+        let my = ((p0.y as f64) + (end_point.y as f64)) * 0.5;
+        let cx = cos_phi * cxp - sin_phi * cyp + mx;
+        let cy = sin_phi * cxp + cos_phi * cyp + my;
+
+        let unit_vec_angle = |ux: f64, uy: f64, vx: f64, vy: f64| -> f64 {
+            (ux * vy - uy * vx).atan2(ux * vx + uy * vy)
+        };
+
+        let ux = (x1p - cxp) / rx;
+        let uy = (y1p - cyp) / ry;
+        let vx = (-x1p - cxp) / rx;
+        let vy = (-y1p - cyp) / ry;
+
+        let theta1 = unit_vec_angle(1.0, 0.0, ux, uy);
+        let mut delta_theta = unit_vec_angle(ux, uy, vx, vy);
+        if !sweep_clockwise && delta_theta > 0.0 {
+            delta_theta -= std::f64::consts::TAU;
+        } else if sweep_clockwise && delta_theta < 0.0 {
+            delta_theta += std::f64::consts::TAU;
+        }
+
+        let segments = ((delta_theta.abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).max(1);
+        let step_angle = delta_theta / (segments as f64);
+        let k = (4.0 / 3.0) * (step_angle * 0.25).tan();
+
+        let map_ellipse = |u_x: f64, u_y: f64| -> Point {
+            let ex = rx * u_x;
+            let ey = ry * u_y;
+            Point::new(
+                (cx + cos_phi * ex - sin_phi * ey) as Scalar,
+                (cy + sin_phi * ex + cos_phi * ey) as Scalar,
+            )
+        };
+
+        for i in 0..segments {
+            let a1 = theta1 + (i as f64) * step_angle;
+            let a2 = if i + 1 == segments {
+                theta1 + delta_theta
+            } else {
+                theta1 + ((i + 1) as f64) * step_angle
+            };
+            let (s1, c1) = a1.sin_cos();
+            let (s2, c2) = a2.sin_cos();
+
+            let seg_p1 = if i == 0 { p0 } else { map_ellipse(c1, s1) };
+            let seg_p2 = if i + 1 == segments {
+                end_point
+            } else {
+                map_ellipse(c2, s2)
+            };
+            let seg_cp1 = map_ellipse(c1 - k * s1, s1 + k * c1);
+            let seg_cp2 = map_ellipse(c2 + k * s2, s2 - k * c2);
+
+            self.add_cubic_component(seg_p1, seg_cp1, seg_cp2, seg_p2);
+        }
+
+        self.current = end_point;
+        self
+    }
+
     pub fn add_path(&mut self, path: &Path) -> &mut Self {
+        let was_empty = !self.has_any_segments();
+        self.convexity = if was_empty && path.convexity == Convexity::Convex {
+            Convexity::Convex
+        } else {
+            Convexity::Unknown
+        };
         for comp in &path.components {
             if matches!(comp, PathComponent::Contour(_)) {
                 self.current_contour_location = self.components.len();
@@ -2128,6 +2399,9 @@ impl PathBuilder {
     }
 
     pub fn transform(&mut self, matrix: &Matrix) -> &mut Self {
+        if matrix.m[3] != 0.0 || matrix.m[7] != 0.0 || matrix.m[11] != 0.0 {
+            self.convexity = Convexity::Unknown;
+        }
         for comp in &mut self.components {
             match comp {
                 PathComponent::Contour(c) => {
@@ -2160,11 +2434,11 @@ impl PathBuilder {
     }
 
     pub fn take_path(&mut self, fill_type: FillType) -> Path {
-        let path = Path {
-            components: std::mem::take(&mut self.components),
+        let path = Path::from_parts(
+            std::mem::take(&mut self.components),
             fill_type,
-            convexity: self.convexity,
-        };
+            self.convexity,
+        );
         self.current = Point::ZERO;
         self.subpath_start = Point::ZERO;
         self.current_contour_location = 0;
@@ -2175,11 +2449,7 @@ impl PathBuilder {
     }
 
     pub fn build(&self, fill_type: FillType) -> Path {
-        Path {
-            components: self.components.clone(),
-            fill_type,
-            convexity: self.convexity,
-        }
+        Path::from_parts(self.components.clone(), fill_type, self.convexity)
     }
 }
 
@@ -2549,7 +2819,9 @@ mod tests {
     #[test]
     fn test_path_horizontal_line() {
         let mut builder = PathBuilder::new();
-        let path = builder.horizontal_line_to(10.0).take_path(FillType::NonZero);
+        let path = builder
+            .horizontal_line_to(10.0)
+            .take_path(FillType::NonZero);
         assert_eq!(
             path.components[1],
             PathComponent::Linear(LinearPathComponent::new(
@@ -3160,8 +3432,7 @@ mod tests {
     /// C++ source: round_rect_unittests.cc:RectXYConstructor
     #[test]
     fn test_round_rect_rect_xy_constructor() {
-        let round_rect =
-            RoundRect::from_rect_xy(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0), 2.0, 3.0);
+        let round_rect = RoundRect::from_rect_xy(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0), 2.0, 3.0);
         assert!(!round_rect.is_empty());
         assert!(!round_rect.is_rect());
         assert!(!round_rect.is_oval());
@@ -3175,10 +3446,8 @@ mod tests {
     /// C++ source: round_rect_unittests.cc:RectSizeConstructor
     #[test]
     fn test_round_rect_rect_size_constructor() {
-        let round_rect = RoundRect::from_rect_size(
-            Rect::from_ltrb(10.0, 10.0, 20.0, 20.0),
-            Size::new(2.0, 3.0),
-        );
+        let round_rect =
+            RoundRect::from_rect_size(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0), Size::new(2.0, 3.0));
         assert!(!round_rect.is_empty());
         assert!(!round_rect.is_rect());
         assert!(!round_rect.is_oval());
@@ -3502,9 +3771,8 @@ mod tests {
         );
 
         let sqrt2 = std::f32::consts::SQRT_2;
-        let coord = |radius: Scalar| -> Scalar {
-            50.0 - radius + radius * sqrt2 / 2.0 - K_EH_CLOSE_ENOUGH
-        };
+        let coord =
+            |radius: Scalar| -> Scalar { 50.0 - radius + radius * sqrt2 / 2.0 - K_EH_CLOSE_ENOUGH };
         let coord_in = |radius: Scalar| -> Scalar { coord(radius) - K_EH_CLOSE_ENOUGH };
         let coord_out = |radius: Scalar| -> Scalar { coord(radius) + 2.0 * K_EH_CLOSE_ENOUGH };
 
@@ -3516,5 +3784,200 @@ mod tests {
         assert!(!round_rect.contains(Point::new(-coord_out(6.0), coord_out(7.0))));
         assert!(round_rect.contains(Point::new(coord_in(8.0), coord_in(9.0))));
         assert!(!round_rect.contains(Point::new(coord_out(8.0), coord_out(9.0))));
+    }
+
+    /// C++ source: path_unittests.cc:PathCacheIdAndCachedBoundingBox
+    #[test]
+    fn test_path_cache_id_and_cached_bounds() {
+        let empty = Path::default();
+        assert_eq!(empty.cache_id(), 0);
+        assert_eq!(empty.get_bounding_box(), None);
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(10.0, 20.0));
+        pb.quadratic_curve_to(Point::new(50.0, -20.0), Point::new(90.0, 20.0));
+        pb.cubic_curve_to(
+            Point::new(90.0, 60.0),
+            Point::new(10.0, 60.0),
+            Point::new(10.0, 20.0),
+        );
+        pb.close();
+
+        let p1 = pb.build(FillType::NonZero);
+        let p2 = pb.build(FillType::NonZero);
+        assert!(p1.cache_id() >= 1);
+        assert!(p2.cache_id() > p1.cache_id());
+        assert_eq!(p1, p2);
+        assert_eq!(p1.get_bounding_box(), p2.get_bounding_box());
+
+        let bounds = p1.get_bounding_box().expect("non-empty bounds");
+        assert_abs_diff_eq!(bounds.get_left(), 10.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(bounds.get_top(), 0.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(bounds.get_right(), 90.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(bounds.get_bottom(), 50.0, epsilon = 1e-4);
+
+        let shifted = p1.shift(Point::new(5.0, -3.0));
+        assert!(shifted.cache_id() > p2.cache_id());
+        let shifted_bounds = shifted.get_bounding_box().expect("shifted bounds");
+        assert_abs_diff_eq!(shifted_bounds.get_left(), 15.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(shifted_bounds.get_top(), -3.0, epsilon = 1e-4);
+    }
+
+    /// C++ source: path_unittests.cc:PathBuilderTracksSingleContourConvexity
+    #[test]
+    fn test_path_builder_convexity_tracking() {
+        let rect = Rect::from_xywh(10.0, 20.0, 80.0, 50.0);
+
+        let mut pb_rect = PathBuilder::new();
+        pb_rect.add_rect(rect);
+        assert_eq!(pb_rect.get_convexity(), Convexity::Convex);
+        assert!(pb_rect.build(FillType::NonZero).is_convex());
+
+        pb_rect.add_rect(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(pb_rect.get_convexity(), Convexity::Unknown);
+        assert!(!pb_rect.build(FillType::NonZero).is_convex());
+
+        let mut pb_oval = PathBuilder::new();
+        pb_oval.add_oval(rect);
+        assert_eq!(pb_oval.get_convexity(), Convexity::Convex);
+        pb_oval.line_to(Point::new(0.0, 0.0));
+        assert_eq!(pb_oval.get_convexity(), Convexity::Unknown);
+
+        let mut pb_rrect = PathBuilder::new();
+        pb_rrect.add_rounded_rect(rect, RoundingRadii::from_single_radius(12.0));
+        assert_eq!(pb_rrect.get_convexity(), Convexity::Convex);
+
+        // Affine transform preserves Convexity::Convex; perspective transform resets to Unknown.
+        pb_rrect.transform(&Matrix::make_translation(5.0, 5.0, 0.0));
+        assert_eq!(pb_rrect.get_convexity(), Convexity::Convex);
+
+        let mut perspective = Matrix::IDENTITY;
+        perspective.m[3] = 0.01;
+        pb_rrect.transform(&perspective);
+        assert_eq!(pb_rrect.get_convexity(), Convexity::Unknown);
+    }
+
+    /// C++ source: path_unittests.cc:ArcToOvalPreservesSingleContourAndNegativeSweep
+    #[test]
+    fn test_arc_to_oval_preserves_single_contour_and_negative_sweep() {
+        let mut pb = PathBuilder::new();
+        let pi = std::f32::consts::PI;
+        let half_pi = std::f32::consts::FRAC_PI_2;
+
+        // Build a 4-corner pill / slider shape using arc_to_oval(..., false)
+        pb.arc_to_oval(
+            Rect::from_xywh(0.0, 0.0, 20.0, 20.0),
+            Radians(pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(80.0, 0.0, 20.0, 20.0),
+            Radians(-half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(80.0, 20.0, 20.0, 20.0),
+            Radians(0.0),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(0.0, 20.0, 20.0, 20.0),
+            Radians(half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.close();
+
+        let path = pb.build(FillType::NonZero);
+        assert!(path.is_single_contour());
+        let polyline = path.create_polyline(1.0);
+        assert_eq!(polyline.contours.len(), 1);
+        assert!(polyline.contours[0].is_closed);
+
+        // Verify negative sweep preserves direction: from pi/2 sweeping -pi/2 ends at 0 (point (20, 10)).
+        let mut pb_neg = PathBuilder::new();
+        pb_neg.arc_to_oval(
+            Rect::from_xywh(0.0, 0.0, 20.0, 20.0),
+            Radians(half_pi),
+            Radians(-half_pi),
+            true,
+        );
+        assert_point_near(pb_neg.current_point(), Point::new(20.0, 10.0));
+    }
+
+    /// C++ source: path_unittests.cc:SvgArcToMaintainsContourContinuity
+    #[test]
+    fn test_svg_arc_to_maintains_contour_continuity() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(10.0, 0.0));
+        pb.line_to(Point::new(90.0, 0.0));
+        pb.svg_arc_to(
+            Size::new(10.0, 10.0),
+            0.0,
+            false,
+            true,
+            Point::new(100.0, 10.0),
+        );
+        assert_point_near(pb.current_point(), Point::new(100.0, 10.0));
+        pb.line_to(Point::new(100.0, 40.0));
+        pb.svg_arc_to(
+            Size::new(10.0, 10.0),
+            0.0,
+            false,
+            true,
+            Point::new(90.0, 50.0),
+        );
+        pb.line_to(Point::new(10.0, 50.0));
+        pb.svg_arc_to(
+            Size::new(10.0, 10.0),
+            0.0,
+            false,
+            true,
+            Point::new(0.0, 40.0),
+        );
+        pb.line_to(Point::new(0.0, 10.0));
+        pb.svg_arc_to(
+            Size::new(10.0, 10.0),
+            0.0,
+            false,
+            true,
+            Point::new(10.0, 0.0),
+        );
+        pb.close();
+
+        let path = pb.build(FillType::NonZero);
+        assert!(path.is_single_contour());
+        let polyline = path.create_polyline(1.0);
+        assert_eq!(polyline.contours.len(), 1);
+        assert!(polyline.contours[0].is_closed);
+
+        let bounds = path.get_bounding_box().expect("bounds");
+        assert_rect_near(bounds, Rect::from_xywh(0.0, 0.0, 100.0, 50.0));
+    }
+
+    /// C++ source: path_unittests.cc:AddPathPreservesConvexityWhenBuilderEmpty
+    #[test]
+    fn test_add_path_preserves_convexity_when_builder_empty() {
+        let mut src_pb = PathBuilder::new();
+        src_pb.add_rounded_rect(
+            Rect::from_xywh(10.0, 20.0, 100.0, 40.0),
+            RoundingRadii::from_single_radius(8.0),
+        );
+        let convex_src = src_pb.build(FillType::NonZero);
+        assert_eq!(convex_src.convexity, Convexity::Convex);
+
+        // Adding a convex path to an empty PathBuilder preserves Convexity::Convex.
+        let mut dst_pb = PathBuilder::new();
+        dst_pb.add_path(&convex_src);
+        assert_eq!(dst_pb.get_convexity(), Convexity::Convex);
+        let built = dst_pb.build(FillType::NonZero);
+        assert_eq!(built.convexity, Convexity::Convex);
+
+        // Adding a second path to a non-empty PathBuilder resets convexity to Unknown.
+        dst_pb.add_path(&convex_src);
+        assert_eq!(dst_pb.get_convexity(), Convexity::Unknown);
     }
 }

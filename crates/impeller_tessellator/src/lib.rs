@@ -11,8 +11,8 @@ use impeller_geometry::{Point, Rect, Scalar, Size};
 use impeller_path::{Convexity, Path};
 
 pub use primitives::{
-    CircleGeometry, EllipseGeometry, FillPathGeometry, LineGeometry, RectGeometry,
-    RoundRectGeometry, StrokePathGeometry,
+    ArcGeometry, CircleGeometry, DiffRoundRectGeometry, EllipseGeometry, FillPathGeometry,
+    LineGeometry, RectGeometry, RoundRectGeometry, StrokePathGeometry,
 };
 pub use stroke::{compute_stroke_alpha_coverage, K_MIN_STROKE_SIZE};
 pub use trigs::{compute_quadrant_divisions, Trig, Trigs, K_CIRCLE_TOLERANCE};
@@ -51,6 +51,15 @@ pub enum TessellationResult {
     Success,
     InputError,
     TessellationError,
+}
+
+/// Classification of the fill tessellation algorithm tier used for a path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FillTessellationKind {
+    ConvexFast,
+    PslgSimpleConvex,
+    PslgDisjointConvex,
+    PslgGeneral,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -111,15 +120,31 @@ impl Tessellator {
         }
     }
 
+    /// Tessellates a filled path into a `(TessellatedMesh, FillTessellationKind)`.
+    /// Uses the convex strip fast-path when `path.convexity == Convexity::Convex`, and the
+    /// classified PSLG winding-rule tessellator otherwise.
+    pub fn tessellate_fill_classified(
+        path: &Path,
+        tolerance_scale: Scalar,
+    ) -> (TessellatedMesh, FillTessellationKind) {
+        let scale = tolerance_scale.max(1.0);
+        if path.convexity == Convexity::Convex {
+            return (
+                Self::tessellate_convex(path, scale),
+                FillTessellationKind::ConvexFast,
+            );
+        }
+        pslg::tessellate_pslg_classified(path, scale).unwrap_or((
+            TessellatedMesh::default(),
+            FillTessellationKind::PslgGeneral,
+        ))
+    }
+
     /// Tessellates a filled path into a `TessellatedMesh`.
     /// Uses the convex strip fast-path when `path.convexity == Convexity::Convex`, and the
     /// general PSLG winding-rule tessellator otherwise.
     pub fn tessellate_fill(path: &Path, tolerance_scale: Scalar) -> TessellatedMesh {
-        let scale = tolerance_scale.max(1.0);
-        if path.convexity == Convexity::Convex {
-            return Self::tessellate_convex(path, scale);
-        }
-        pslg::tessellate_pslg(path, scale).unwrap_or_default()
+        Self::tessellate_fill_classified(path, tolerance_scale).0
     }
 
     /// Ported from `Tessellator::TessellateConvex` in `tessellator.cc`.
@@ -1870,6 +1895,385 @@ mod tests {
             mesh_total_area(&subpixel_mesh),
             min_clamped_outer - min_clamped_inner,
             epsilon = 1.0
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:TrigsStaticCacheReuse
+    #[test]
+    fn test_trigs_static_cache_reuse() {
+        for d in 1..=64 {
+            let t1 = Trigs::from_divisions(d);
+            let t2 = Trigs::from_divisions(d);
+            assert_eq!(t1.len(), d + 1);
+            assert!(
+                std::ptr::eq(t1.as_slice().as_ptr(), t2.as_slice().as_ptr()),
+                "expected static slice reuse for divisions = {d}"
+            );
+        }
+        let uncached = Trigs::from_divisions(80);
+        assert_eq!(uncached.len(), 81);
+    }
+
+    /// C++ source: geometry_unittests.cc:RoundRectGeometryUniformStripFastPath
+    #[test]
+    fn test_uniform_round_rect_strip_fast_path() {
+        let rect = Rect::from_xywh(10.0, 20.0, 120.0, 80.0);
+        let radii = RoundingRadii::from_single_radius(16.0);
+        let geom = RoundRectGeometry::new(rect, radii);
+        let mesh = geom.get_mesh(1.0);
+        assert!(!mesh.vertices.is_empty());
+        assert!(!mesh.indices.is_empty());
+
+        let expected_continuous = 120.0 * 80.0 - (4.0 - std::f32::consts::PI) * 16.0 * 16.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_continuous, epsilon = 1.5);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 60.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(75.0, 60.0)),
+            1
+        );
+    }
+
+    /// C++ source: geometry_unittests.cc:ArcGeometryFillAndStroke
+    #[test]
+    fn test_arc_geometry_fill_and_stroke() {
+        let oval = Rect::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let divs = compute_quadrant_divisions(50.0) as f32;
+
+        // 90-degree pie wedge (use_center = true), radius = 50
+        let wedge = ArcGeometry::new(
+            oval,
+            Radians(0.0),
+            Radians(std::f32::consts::FRAC_PI_2),
+            true,
+        );
+        let wedge_mesh = wedge.get_mesh(1.0);
+        let expected_wedge_inscribed =
+            0.5 * divs * 50.0 * 50.0 * (std::f32::consts::FRAC_PI_2 / divs).sin();
+        assert_relative_eq!(
+            mesh_total_area(&wedge_mesh),
+            expected_wedge_inscribed,
+            epsilon = 0.1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&wedge_mesh, Point::new(65.0, 65.0)),
+            1
+        );
+
+        // 180-degree semicircle chord (use_center = false)
+        let chord = ArcGeometry::new(oval, Radians(0.0), Radians(std::f32::consts::PI), false);
+        let chord_mesh = chord.get_mesh(1.0);
+        let semi_divs = 2.0 * divs;
+        let expected_chord_inscribed =
+            0.5 * semi_divs * 50.0 * 50.0 * (std::f32::consts::PI / semi_divs).sin();
+        assert_relative_eq!(
+            mesh_total_area(&chord_mesh),
+            expected_chord_inscribed,
+            epsilon = 0.2
+        );
+
+        // 90-degree stroked arc (r_in = 45, r_out = 55, width = 10)
+        let arc_open = ArcGeometry::new(
+            oval,
+            Radians(0.0),
+            Radians(std::f32::consts::FRAC_PI_2),
+            false,
+        );
+        let stroke_divs = compute_quadrant_divisions(55.0) as f32;
+        let butt_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        let expected_butt = 0.5
+            * stroke_divs
+            * (55.0 * 55.0 - 45.0 * 45.0)
+            * (std::f32::consts::FRAC_PI_2 / stroke_divs).sin();
+        assert_relative_eq!(mesh_total_area(&butt_mesh), expected_butt, epsilon = 0.2);
+
+        let square_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Square,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_relative_eq!(
+            mesh_total_area(&square_mesh),
+            expected_butt + 100.0,
+            epsilon = 0.2
+        );
+
+        let round_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Round,
+                join: Join::Round,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        let cap_divs = compute_quadrant_divisions(5.0) as f32;
+        let expected_cap_area = 2.0
+            * (0.5 * 2.0 * cap_divs * 5.0 * 5.0 * (std::f32::consts::FRAC_PI_2 / cap_divs).sin());
+        assert_relative_eq!(
+            mesh_total_area(&round_mesh),
+            expected_butt + expected_cap_area,
+            epsilon = 0.2
+        );
+    }
+
+    /// C++ source: geometry_unittests.cc:DiffRoundRectGeometryCoversNestedBorderAndRejectsInvalidInner
+    #[test]
+    fn test_diff_round_rect_geometry_ring_and_containment() {
+        let outer = Rect::from_xywh(10.0, 20.0, 120.0, 80.0);
+        let outer_radii = RoundingRadii::from_single_radius(16.0);
+        let inner = Rect::from_xywh(16.0, 26.0, 108.0, 68.0);
+        let inner_radii = RoundingRadii::from_single_radius(10.0);
+
+        let geom = DiffRoundRectGeometry::new(outer, outer_radii, inner, inner_radii);
+        let mesh = geom
+            .get_mesh(1.0)
+            .expect("valid nested DiffRoundRectGeometry");
+
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(70.0, 60.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 23.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(13.0, 55.0)),
+            1
+        );
+
+        let rrect_area =
+            |w: f32, h: f32, r: f32| -> f32 { w * h - (4.0 - std::f32::consts::PI) * r * r };
+        let expected_ring = rrect_area(120.0, 80.0, 16.0) - rrect_area(108.0, 68.0, 10.0);
+        assert_relative_eq!(mesh_total_area(&mesh), expected_ring, epsilon = 1.5);
+
+        // Square inner hole poking out of a rounded outer corner must return None.
+        let poking_inner = Rect::from_xywh(11.0, 21.0, 118.0, 78.0);
+        let poking = DiffRoundRectGeometry::new(
+            outer,
+            RoundingRadii::from_single_radius(24.0),
+            poking_inner,
+            RoundingRadii::ZERO,
+        );
+        assert!(poking.get_mesh(1.0).is_none());
+
+        // Inner rect extending outside outer rect must return None.
+        let outside_inner = Rect::from_xywh(0.0, 20.0, 120.0, 80.0);
+        let outside = DiffRoundRectGeometry::new(outer, outer_radii, outside_inner, inner_radii);
+        assert!(outside.get_mesh(1.0).is_none());
+    }
+
+    /// C++ source: tessellator_unittests.cc:PslgSingleConvexFastPathAndAntiStarGuard
+    #[test]
+    fn test_pslg_single_convex_fast_path_and_anti_star_guard() {
+        // 1. Stadium / rounded rect path with Convexity::Unknown hits the single-contour convex fast path.
+        let mut pb = PathBuilder::new();
+        pb.add_rounded_rect(
+            Rect::from_xywh(0.0, 0.0, 140.0, 60.0),
+            RoundingRadii::from_single_radius(30.0),
+        );
+        let mut stadium = pb.build(FillType::NonZero);
+        stadium.set_convexity(Convexity::Unknown);
+
+        let mesh = Tessellator::tessellate(&stadium, 1.0).expect("stadium tessellates");
+        let convex_ref = Tessellator::tessellate_convex(&stadium, 1.0);
+        assert_relative_eq!(
+            mesh_total_area(&mesh),
+            mesh_total_area(&convex_ref),
+            epsilon = 1e-2
+        );
+        let expected_area = 80.0 * 60.0 + std::f32::consts::PI * 30.0 * 30.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_area, epsilon = 8.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 20.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 40.0)),
+            1
+        );
+
+        // 2. 5-pointed star pentagram {5/2} has uniform turn sign but winding number 2 (4 sign flips):
+        // must be rejected by `is_simple_convex_contour` so `FillType::Odd` leaves the center hollow!
+        let mut star_pb = PathBuilder::new();
+        for k in 0..5 {
+            let angle =
+                -std::f32::consts::FRAC_PI_2 + (k as f32) * (4.0 * std::f32::consts::PI / 5.0);
+            let p = Point::new(50.0 + 40.0 * angle.cos(), 50.0 + 40.0 * angle.sin());
+            if k == 0 {
+                star_pb.move_to(p);
+            } else {
+                star_pb.line_to(p);
+            }
+        }
+        star_pb.close();
+        let star_odd = star_pb.build(FillType::Odd);
+        let star_mesh = Tessellator::tessellate(&star_odd, 1.0).expect("star tessellates");
+        assert_eq!(
+            mesh_containing_triangle_count(&star_mesh, Point::new(50.0, 50.0)),
+            0,
+            "pentagram center must remain hollow under FillType::Odd"
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:RetinaArcToOvalPillClassifiesAsSimpleConvex
+    #[test]
+    fn test_retina_arc_to_oval_pill_classifies_as_simple_convex() {
+        let mut pb = PathBuilder::new();
+        let ox = 1800.0;
+        let oy = 1200.0;
+        let pi = std::f32::consts::PI;
+        let half_pi = std::f32::consts::FRAC_PI_2;
+
+        // Build a 120x30 pill / slider track at large Retina coordinates via arc_to_oval(..., false).
+        pb.arc_to_oval(
+            Rect::from_xywh(ox, oy, 30.0, 30.0),
+            Radians(pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox + 90.0, oy, 30.0, 30.0),
+            Radians(-half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox + 90.0, oy, 30.0, 30.0),
+            Radians(0.0),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox, oy, 30.0, 30.0),
+            Radians(half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.close();
+
+        let pill = pb.build(FillType::NonZero);
+        assert_eq!(pill.convexity, Convexity::Unknown);
+
+        let (mesh, kind) = Tessellator::tessellate_fill_classified(&pill, 2.0);
+        assert_eq!(kind, FillTessellationKind::PslgSimpleConvex);
+
+        let expected_area = 90.0 * 30.0 + std::f32::consts::PI * 15.0 * 15.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_area, epsilon = 2.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(ox + 55.0, oy + 11.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(ox + 55.0, oy + 19.0)),
+            1
+        );
+
+        // Verify PathBuilder::add_path preserves Convexity::Convex -> ConvexFast.
+        let mut rrect_pb = PathBuilder::new();
+        rrect_pb.add_rounded_rect(
+            Rect::from_xywh(ox, oy, 120.0, 30.0),
+            RoundingRadii::from_single_radius(15.0),
+        );
+        let rrect_path = rrect_pb.build(FillType::NonZero);
+        let mut copied_pb = PathBuilder::new();
+        copied_pb.add_path(&rrect_path);
+        let copied_path = copied_pb.build(FillType::NonZero);
+        assert_eq!(copied_path.convexity, Convexity::Convex);
+        let (_, copied_kind) = Tessellator::tessellate_fill_classified(&copied_path, 2.0);
+        assert_eq!(copied_kind, FillTessellationKind::ConvexFast);
+    }
+
+    /// C++ source: tessellator_unittests.cc:DisjointMultiContourConvexVsNestedHoleClassification
+    #[test]
+    fn test_disjoint_multi_contour_convex_vs_nested_hole_classification() {
+        // 1. Three pairwise-disjoint rounded rects -> PslgDisjointConvex.
+        let mut disjoint_pb = PathBuilder::new();
+        for k in 0..3 {
+            let x = (k as f32) * 150.0;
+            disjoint_pb.add_rounded_rect(
+                Rect::from_xywh(x, 20.0, 100.0, 50.0),
+                RoundingRadii::from_single_radius(10.0),
+            );
+        }
+        let disjoint_path = disjoint_pb.build(FillType::NonZero);
+        assert_eq!(disjoint_path.convexity, Convexity::Unknown);
+
+        let (disjoint_mesh, disjoint_kind) =
+            Tessellator::tessellate_fill_classified(&disjoint_path, 2.0);
+        assert_eq!(disjoint_kind, FillTessellationKind::PslgDisjointConvex);
+
+        let single_rrect_area = 100.0 * 50.0 - (4.0 - std::f32::consts::PI) * 100.0;
+        assert_relative_eq!(
+            mesh_total_area(&disjoint_mesh),
+            3.0 * single_rrect_area,
+            epsilon = 4.0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(45.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(195.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(345.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(125.0, 38.0)),
+            0
+        );
+
+        // 2. Concentric nested squares (outer + inner hole) -> PslgGeneral with exact Odd/NonZero hole.
+        let mut ring_odd_pb = PathBuilder::new();
+        ring_odd_pb.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        ring_odd_pb.add_rect(Rect::from_xywh(25.0, 25.0, 50.0, 50.0));
+        let ring_odd = ring_odd_pb.build(FillType::Odd);
+        let (ring_odd_mesh, ring_odd_kind) =
+            Tessellator::tessellate_fill_classified(&ring_odd, 2.0);
+        assert_eq!(ring_odd_kind, FillTessellationKind::PslgGeneral);
+        assert_relative_eq!(mesh_total_area(&ring_odd_mesh), 7500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_odd_mesh, Point::new(50.0, 50.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_odd_mesh, Point::new(12.0, 50.0)),
+            1
+        );
+
+        // Opposite-winding nested hole under FillType::NonZero -> PslgGeneral with hollow interior.
+        let mut ring_nz_pb = PathBuilder::new();
+        ring_nz_pb.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        ring_nz_pb.move_to(Point::new(25.0, 25.0));
+        ring_nz_pb.line_to(Point::new(25.0, 75.0));
+        ring_nz_pb.line_to(Point::new(75.0, 75.0));
+        ring_nz_pb.line_to(Point::new(75.0, 25.0));
+        ring_nz_pb.close();
+        let ring_nz = ring_nz_pb.build(FillType::NonZero);
+        let (ring_nz_mesh, ring_nz_kind) = Tessellator::tessellate_fill_classified(&ring_nz, 2.0);
+        assert_eq!(ring_nz_kind, FillTessellationKind::PslgGeneral);
+        assert_relative_eq!(mesh_total_area(&ring_nz_mesh), 7500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_nz_mesh, Point::new(50.0, 50.0)),
+            0
         );
     }
 }

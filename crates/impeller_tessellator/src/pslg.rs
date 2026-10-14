@@ -1,9 +1,7 @@
-use crate::convex::{
-    solve_cubic, solve_quad, wangs_cubic_subdivisions, wangs_quadratic_subdivisions,
-};
-use crate::{TessellatedMesh, TessellationResult, Vertex2D};
+use crate::convex::{wangs_cubic_subdivisions, wangs_quadratic_subdivisions};
+use crate::{FillTessellationKind, TessellatedMesh, TessellationResult, Vertex2D};
 use impeller_geometry::{Point, Scalar};
-use impeller_path::{FillType, Path, PathComponent};
+use impeller_path::{CubicPathComponent, FillType, Path, PathComponent, QuadPathComponent};
 use std::collections::BTreeMap;
 
 const SNAP_EPS: f64 = 1e-5;
@@ -72,6 +70,39 @@ impl Pt2 {
     #[inline]
     fn dist_sq(self, other: Self) -> f64 {
         self.sub(other).len_sq()
+    }
+}
+
+#[inline]
+fn solve_quad_f64(q: &QuadPathComponent, t: f64) -> Pt2 {
+    let u = 1.0 - t;
+    let w0 = u * u;
+    let w1 = 2.0 * u * t;
+    let w2 = t * t;
+    Pt2 {
+        x: (q.p1.x as f64) * w0 + (q.cp.x as f64) * w1 + (q.p2.x as f64) * w2,
+        y: (q.p1.y as f64) * w0 + (q.cp.y as f64) * w1 + (q.p2.y as f64) * w2,
+    }
+}
+
+#[inline]
+fn solve_cubic_f64(c: &CubicPathComponent, t: f64) -> Pt2 {
+    let u = 1.0 - t;
+    let u2 = u * u;
+    let t2 = t * t;
+    let w0 = u2 * u;
+    let w1 = 3.0 * u2 * t;
+    let w2 = 3.0 * u * t2;
+    let w3 = t2 * t;
+    Pt2 {
+        x: (c.p1.x as f64) * w0
+            + (c.cp1.x as f64) * w1
+            + (c.cp2.x as f64) * w2
+            + (c.p2.x as f64) * w3,
+        y: (c.p1.y as f64) * w0
+            + (c.cp1.y as f64) * w1
+            + (c.cp2.y as f64) * w2
+            + (c.p2.y as f64) * w3,
     }
 }
 
@@ -145,9 +176,10 @@ fn extract_fill_contours(path: &Path, tolerance_scale: Scalar) -> (Vec<Vec<Pt2>>
                     let count =
                         wangs_quadratic_subdivisions(scale, q.p1, q.cp, q.p2).ceil() as usize;
                     let count = count.max(1);
+                    let inv_count = 1.0 / (count as f64);
                     for i in 1..count {
-                        let t = (i as Scalar) / (count as Scalar);
-                        current_contour.push(Pt2::from_point(solve_quad(&q, t)));
+                        let t = (i as f64) * inv_count;
+                        current_contour.push(solve_quad_f64(&q, t));
                     }
                     current_contour.push(Pt2::from_point(q.p2));
                     current_point = q.p2;
@@ -163,9 +195,10 @@ fn extract_fill_contours(path: &Path, tolerance_scale: Scalar) -> (Vec<Vec<Pt2>>
                     let count =
                         wangs_cubic_subdivisions(scale, c.p1, c.cp1, c.cp2, c.p2).ceil() as usize;
                     let count = count.max(1);
+                    let inv_count = 1.0 / (count as f64);
                     for i in 1..count {
-                        let t = (i as Scalar) / (count as Scalar);
-                        current_contour.push(Pt2::from_point(solve_cubic(&c, t)));
+                        let t = (i as f64) * inv_count;
+                        current_contour.push(solve_cubic_f64(&c, t));
                     }
                     current_contour.push(Pt2::from_point(c.p2));
                     current_point = c.p2;
@@ -193,25 +226,270 @@ fn intern_vertex(verts: &mut Vec<Pt2>, p: Pt2) -> usize {
     idx
 }
 
+/// Checks in $O(V)$ whether a single flattened contour is a strictly simple convex polygon
+/// (winding number $\pm 1$, uniform turn sign, no self-intersections or star-polygon wraps).
+fn is_simple_convex_contour(pts: &[Pt2]) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+
+    let eps_sq = SNAP_EPS * SNAP_EPS;
+    let mut signed_area2 = 0.0f64;
+    let mut non_zero_edge_count = 0usize;
+    let mut first_edge: Option<Pt2> = None;
+    let mut prev_edge: Option<Pt2> = None;
+    let mut has_pos_turn = false;
+    let mut has_neg_turn = false;
+
+    let mut first_x_sign: i8 = 0;
+    let mut prev_x_sign: i8 = 0;
+    let mut x_sign_flips = 0usize;
+
+    let mut first_y_sign: i8 = 0;
+    let mut prev_y_sign: i8 = 0;
+    let mut y_sign_flips = 0usize;
+
+    for i in 0..n {
+        let p0 = pts[i];
+        let p1 = pts[(i + 1) % n];
+        signed_area2 += p0.cross(p1);
+        let e = p1.sub(p0);
+        if e.len_sq() <= eps_sq {
+            continue;
+        }
+        non_zero_edge_count += 1;
+
+        if let Some(pe) = prev_edge {
+            let cross = pe.cross(e);
+            let turn_eps = (2e-4 * (pe.len_sq() * e.len_sq()).sqrt()).max(AREA_EPS);
+            if cross > turn_eps {
+                has_pos_turn = true;
+            } else if cross < -turn_eps {
+                has_neg_turn = true;
+            } else if pe.dot(e) < 0.0 {
+                return false;
+            }
+            if has_pos_turn && has_neg_turn {
+                return false;
+            }
+        } else {
+            first_edge = Some(e);
+        }
+        prev_edge = Some(e);
+
+        let sx: i8 = if e.x > SNAP_EPS {
+            1
+        } else if e.x < -SNAP_EPS {
+            -1
+        } else {
+            0
+        };
+        if sx != 0 {
+            if first_x_sign == 0 {
+                first_x_sign = sx;
+            } else if sx != prev_x_sign {
+                x_sign_flips += 1;
+            }
+            prev_x_sign = sx;
+        }
+
+        let sy: i8 = if e.y > SNAP_EPS {
+            1
+        } else if e.y < -SNAP_EPS {
+            -1
+        } else {
+            0
+        };
+        if sy != 0 {
+            if first_y_sign == 0 {
+                first_y_sign = sy;
+            } else if sy != prev_y_sign {
+                y_sign_flips += 1;
+            }
+            prev_y_sign = sy;
+        }
+    }
+
+    if non_zero_edge_count < 3 || signed_area2.abs() <= AREA_EPS * 2.0 {
+        return false;
+    }
+
+    if let (Some(pe), Some(fe)) = (prev_edge, first_edge) {
+        let cross = pe.cross(fe);
+        let turn_eps = (2e-4 * (pe.len_sq() * fe.len_sq()).sqrt()).max(AREA_EPS);
+        if cross > turn_eps {
+            has_pos_turn = true;
+        } else if cross < -turn_eps {
+            has_neg_turn = true;
+        } else if pe.dot(fe) < 0.0 {
+            return false;
+        }
+        if has_pos_turn && has_neg_turn {
+            return false;
+        }
+    }
+
+    if !(has_pos_turn || has_neg_turn) {
+        return false;
+    }
+
+    if first_x_sign == 0 || first_y_sign == 0 {
+        return false;
+    }
+    if prev_x_sign != first_x_sign {
+        x_sign_flips += 1;
+    }
+    if prev_y_sign != first_y_sign {
+        y_sign_flips += 1;
+    }
+
+    x_sign_flips <= 2 && y_sign_flips <= 2
+}
+
+/// Triangulates a single convex contour in $O(V)$ using an alternating zig-zag strip
+/// (`0, 1, n-1, 2, n-2, ...`).
+fn triangulate_convex_contour(pts: &[Pt2]) -> TessellatedMesh {
+    let n = pts.len();
+    if n < 3 {
+        return TessellatedMesh::default();
+    }
+    let vertices: Vec<Vertex2D> = pts
+        .iter()
+        .map(|p| Vertex2D::from_point(p.to_point()))
+        .collect();
+    let mut indices = Vec::with_capacity((n - 2) * 3);
+    let zig_zag = |k: usize| -> usize {
+        if k == 0 {
+            0
+        } else if k % 2 == 1 {
+            k.div_ceil(2)
+        } else {
+            n - (k / 2)
+        }
+    };
+
+    for i in 0..(n - 2) {
+        let (i0, i1, i2) = if i % 2 == 0 {
+            (zig_zag(i), zig_zag(i + 1), zig_zag(i + 2))
+        } else {
+            (zig_zag(i + 1), zig_zag(i), zig_zag(i + 2))
+        };
+        let p0 = pts[i0];
+        let p1 = pts[i1];
+        let p2 = pts[i2];
+        if p1.sub(p0).cross(p2.sub(p0)).abs() > AREA_EPS {
+            indices.push(i0 as u32);
+            indices.push(i1 as u32);
+            indices.push(i2 as u32);
+        }
+    }
+
+    TessellatedMesh { vertices, indices }
+}
+
+fn contour_aabb(pts: &[Pt2]) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for p in pts {
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    (
+        min_x - SNAP_EPS,
+        max_x + SNAP_EPS,
+        min_y - SNAP_EPS,
+        max_y + SNAP_EPS,
+    )
+}
+
+fn try_tessellate_disjoint_convex(contours: &[Vec<Pt2>]) -> Option<TessellatedMesh> {
+    if contours.len() <= 1 || contours.len() > 8 {
+        return None;
+    }
+    let mut aabbs: [(f64, f64, f64, f64); 8] = [(0.0, 0.0, 0.0, 0.0); 8];
+    for (i, c) in contours.iter().enumerate() {
+        aabbs[i] = contour_aabb(c);
+    }
+    for i in 0..contours.len() {
+        let (min_x1, max_x1, min_y1, max_y1) = aabbs[i];
+        for &(min_x2, max_x2, min_y2, max_y2) in &aabbs[(i + 1)..contours.len()] {
+            let disjoint = max_x1 < min_x2 || max_x2 < min_x1 || max_y1 < min_y2 || max_y2 < min_y1;
+            if !disjoint {
+                return None;
+            }
+        }
+    }
+    if !contours.iter().all(|c| is_simple_convex_contour(c)) {
+        return None;
+    }
+
+    let total_verts: usize = contours.iter().map(|c| c.len()).sum();
+    let total_indices: usize = contours.iter().map(|c| c.len().saturating_sub(2) * 3).sum();
+    let mut vertices = Vec::with_capacity(total_verts);
+    let mut indices = Vec::with_capacity(total_indices);
+
+    for c in contours {
+        let base = vertices.len() as u32;
+        let mesh = triangulate_convex_contour(c);
+        vertices.extend_from_slice(&mesh.vertices);
+        indices.extend(mesh.indices.into_iter().map(|idx| base + idx));
+    }
+
+    Some(TessellatedMesh { vertices, indices })
+}
+
 /// Tessellates an arbitrary path (convex, concave, multi-contour with holes, or self-intersecting)
 /// using a Planar Straight-Line Graph (PSLG) decomposition and winding-rule face filtering.
 pub fn tessellate_pslg(
     path: &Path,
     tolerance_scale: Scalar,
 ) -> Result<TessellatedMesh, TessellationResult> {
+    tessellate_pslg_classified(path, tolerance_scale).map(|(mesh, _)| mesh)
+}
+
+/// Tessellates an arbitrary path and returns the classification tier taken (`PslgSimpleConvex`,
+/// `PslgDisjointConvex`, or `PslgGeneral`).
+pub fn tessellate_pslg_classified(
+    path: &Path,
+    tolerance_scale: Scalar,
+) -> Result<(TessellatedMesh, FillTessellationKind), TessellationResult> {
     let (contours, has_any_segment) = extract_fill_contours(path, tolerance_scale);
     if !has_any_segment {
         return Err(TessellationResult::InputError);
     }
     if contours.is_empty() {
-        return Ok(TessellatedMesh::default());
+        return Ok((
+            TessellatedMesh::default(),
+            FillTessellationKind::PslgSimpleConvex,
+        ));
+    }
+    if contours.len() == 1 && is_simple_convex_contour(&contours[0]) {
+        return Ok((
+            triangulate_convex_contour(&contours[0]),
+            FillTessellationKind::PslgSimpleConvex,
+        ));
+    }
+    if let Some(mesh) = try_tessellate_disjoint_convex(&contours) {
+        return Ok((mesh, FillTessellationKind::PslgDisjointConvex));
     }
 
+    Ok((
+        tessellate_pslg_general(&contours, path.fill_type),
+        FillTessellationKind::PslgGeneral,
+    ))
+}
+
+fn tessellate_pslg_general(contours: &[Vec<Pt2>], fill_type: FillType) -> TessellatedMesh {
     // 1. Intern initial vertices and build directed segments.
     let mut verts: Vec<Pt2> = Vec::new();
     let mut raw_segments: Vec<(usize, usize)> = Vec::new();
 
-    for contour in &contours {
+    for contour in contours {
         let n = contour.len();
         if n < 3 {
             continue;
@@ -239,7 +517,7 @@ pub fn tessellate_pslg(
     }
 
     if raw_segments.is_empty() {
-        return Ok(TessellatedMesh::default());
+        return TessellatedMesh::default();
     }
 
     // 2. Find all pairwise proper segment intersections and intern intersection points.
@@ -358,7 +636,7 @@ pub fn tessellate_pslg(
     }
 
     if edges.is_empty() {
-        return Ok(TessellatedMesh::default());
+        return TessellatedMesh::default();
     }
 
     // 4. Connected components via Union-Find.
@@ -497,7 +775,7 @@ pub fn tessellate_pslg(
         };
 
         let winding = compute_winding_number(centroid, &edges, &verts);
-        let is_filled = match path.fill_type {
+        let is_filled = match fill_type {
             FillType::NonZero => winding != 0,
             FillType::Odd => winding.rem_euclid(2) != 0,
         };
@@ -522,10 +800,10 @@ pub fn tessellate_pslg(
         }
     }
 
-    Ok(TessellatedMesh {
+    TessellatedMesh {
         vertices: out_vertices,
         indices: out_indices,
-    })
+    }
 }
 
 struct BoundedFace {
@@ -793,6 +1071,114 @@ fn clean_polygon_spikes(poly: &mut Vec<usize>, verts: &[Pt2]) {
     }
 }
 
+#[inline]
+fn is_reflex_at(poly: &[usize], k: usize, verts: &[Pt2]) -> bool {
+    let n = poly.len();
+    let prev = poly[(k + n - 1) % n];
+    let curr = poly[k];
+    let next = poly[(k + 1) % n];
+    if prev == curr || curr == next || prev == next {
+        return true;
+    }
+    let a = verts[prev];
+    let b = verts[curr];
+    let c = verts[next];
+    b.sub(a).cross(c.sub(a)) <= 1e-10
+}
+
+#[inline]
+fn remove_poly_vertex(
+    poly: &mut Vec<usize>,
+    is_reflex: &mut Vec<bool>,
+    reflex_verts: &mut Vec<usize>,
+    idx: usize,
+) {
+    let vid = poly.remove(idx);
+    let was_reflex = is_reflex.remove(idx);
+    if was_reflex {
+        if let Some(pos) = reflex_verts.iter().position(|&v| v == vid) {
+            reflex_verts.swap_remove(pos);
+        }
+    }
+}
+
+#[inline]
+fn refresh_reflex_at(
+    poly: &[usize],
+    is_reflex: &mut [bool],
+    reflex_verts: &mut Vec<usize>,
+    k: usize,
+    verts: &[Pt2],
+) {
+    let new_r = is_reflex_at(poly, k, verts);
+    let old_r = is_reflex[k];
+    if old_r != new_r {
+        is_reflex[k] = new_r;
+        let vid = poly[k];
+        if new_r {
+            reflex_verts.push(vid);
+        } else if let Some(pos) = reflex_verts.iter().position(|&v| v == vid) {
+            reflex_verts.swap_remove(pos);
+        }
+    }
+}
+
+fn clean_local_around(
+    poly: &mut Vec<usize>,
+    is_reflex: &mut Vec<bool>,
+    reflex_verts: &mut Vec<usize>,
+    mut pivot: usize,
+    verts: &[Pt2],
+) -> usize {
+    while poly.len() >= 3 {
+        let m = poly.len();
+        pivot %= m;
+        let candidates = [(pivot + m - 1) % m, pivot, (pivot + 1) % m];
+        let mut removed = None;
+        for &idx in &candidates {
+            let prev = poly[(idx + m - 1) % m];
+            let curr = poly[idx];
+            let next = poly[(idx + 1) % m];
+            if curr == next || prev == curr || prev == next {
+                removed = Some(idx);
+                break;
+            }
+            let a = verts[prev];
+            let b = verts[curr];
+            let c = verts[next];
+            let ab = b.sub(a);
+            let bc = c.sub(b);
+            if ab.cross(bc).abs() <= 1e-11 && ab.dot(bc) > 0.0 {
+                removed = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = removed {
+            remove_poly_vertex(poly, is_reflex, reflex_verts, idx);
+            if !poly.is_empty() {
+                pivot = idx % poly.len();
+            }
+        } else {
+            break;
+        }
+    }
+    if poly.len() >= 3 {
+        let m = poly.len();
+        pivot %= m;
+        let p0 = (pivot + m - 1) % m;
+        let p1 = pivot;
+        let p2 = (pivot + 1) % m;
+        refresh_reflex_at(poly, is_reflex, reflex_verts, p0, verts);
+        if p1 != p0 {
+            refresh_reflex_at(poly, is_reflex, reflex_verts, p1, verts);
+        }
+        if p2 != p0 && p2 != p1 {
+            refresh_reflex_at(poly, is_reflex, reflex_verts, p2, verts);
+        }
+    }
+    pivot
+}
+
 fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
     let mut poly = initial_poly.to_vec();
     clean_polygon_spikes(&mut poly, verts);
@@ -800,21 +1186,31 @@ fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
         return Vec::new();
     }
 
-    let mut tris = Vec::with_capacity(poly.len() - 2);
-    let mut guard = poly.len() * 4 + 16;
+    let n_init = poly.len();
+    let mut is_reflex: Vec<bool> = (0..n_init).map(|k| is_reflex_at(&poly, k, verts)).collect();
+    let mut reflex_verts: Vec<usize> = poly
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &vid)| if is_reflex[k] { Some(vid) } else { None })
+        .collect();
+
+    let mut tris = Vec::with_capacity(n_init - 2);
+    let mut guard = n_init * 4 + 16;
+    let mut cursor = 0usize;
 
     while poly.len() > 3 && guard > 0 {
         guard -= 1;
-        clean_polygon_spikes(&mut poly, verts);
-        if poly.len() <= 3 {
-            break;
-        }
 
         let n = poly.len();
+        cursor %= n;
         let mut best_ear: Option<usize> = None;
         let mut best_score = -1.0f64;
 
-        for i in 0..n {
+        for offset in 0..n {
+            let i = (cursor + offset) % n;
+            if is_reflex[i] {
+                continue;
+            }
             let prev = poly[(i + n - 1) % n];
             let curr = poly[i];
             let next = poly[(i + 1) % n];
@@ -828,24 +1224,29 @@ fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
             if cross <= 1e-11 {
                 continue;
             }
+            let perim_sq = a.dist_sq(b) + b.dist_sq(c) + c.dist_sq(a);
+            let score = if perim_sq > 0.0 {
+                cross / perim_sq
+            } else {
+                cross
+            };
+            if score <= best_score {
+                continue;
+            }
 
-            if is_valid_ear(i, &poly, verts, a, b, c, 1e-10) {
-                let perim_sq = a.dist_sq(b) + b.dist_sq(c) + c.dist_sq(a);
-                let score = if perim_sq > 0.0 {
-                    cross / perim_sq
-                } else {
-                    cross
-                };
-                if score > best_score {
-                    best_score = score;
-                    best_ear = Some(i);
+            if is_valid_ear(i, &poly, &reflex_verts, verts, [a, b, c], 1e-10) {
+                best_score = score;
+                best_ear = Some(i);
+                if score >= 1e-3 {
+                    break;
                 }
             }
         }
 
         // Relaxed fallback if strict tolerance rejected all ears due to near-collinear bridge edges.
         if best_ear.is_none() {
-            for i in 0..n {
+            for offset in 0..n {
+                let i = (cursor + offset) % n;
                 let prev = poly[(i + n - 1) % n];
                 let curr = poly[i];
                 let next = poly[(i + 1) % n];
@@ -856,7 +1257,7 @@ fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
                 let b = verts[curr];
                 let c = verts[next];
                 let cross = b.sub(a).cross(c.sub(a));
-                if cross > 0.0 && is_valid_ear(i, &poly, verts, a, b, c, -1e-9) {
+                if cross > 0.0 && is_valid_ear(i, &poly, &reflex_verts, verts, [a, b, c], -1e-9) {
                     best_ear = Some(i);
                     break;
                 }
@@ -869,7 +1270,12 @@ fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
             let curr = poly[ear_idx];
             let next = poly[(ear_idx + 1) % n];
             tris.push([prev, curr, next]);
-            poly.remove(ear_idx);
+            remove_poly_vertex(&mut poly, &mut is_reflex, &mut reflex_verts, ear_idx);
+            if !poly.is_empty() {
+                let pivot = ear_idx % poly.len();
+                cursor =
+                    clean_local_around(&mut poly, &mut is_reflex, &mut reflex_verts, pivot, verts);
+            }
         } else {
             break;
         }
@@ -891,32 +1297,64 @@ fn ear_clip_polygon(initial_poly: &[usize], verts: &[Pt2]) -> Vec<[usize; 3]> {
     tris
 }
 
-fn is_valid_ear(i: usize, poly: &[usize], verts: &[Pt2], a: Pt2, b: Pt2, c: Pt2, eps: f64) -> bool {
+fn is_valid_ear(
+    i: usize,
+    poly: &[usize],
+    reflex_verts: &[usize],
+    verts: &[Pt2],
+    [a, b, c]: [Pt2; 3],
+    eps: f64,
+) -> bool {
     let n = poly.len();
     let prev = poly[(i + n - 1) % n];
     let curr = poly[i];
     let next = poly[(i + 1) % n];
 
-    // 1. Check no distinct vertex lies inside or on triangle (a, b, c).
-    for &vk in poly {
+    let pad = eps.abs().max(1e-8);
+    let tri_min_x = a.x.min(b.x).min(c.x) - pad;
+    let tri_max_x = a.x.max(b.x).max(c.x) + pad;
+    let tri_min_y = a.y.min(b.y).min(c.y) - pad;
+    let tri_max_y = a.y.max(b.y).max(c.y) + pad;
+
+    // 1. Check no distinct reflex vertex lies inside or on triangle (a, b, c).
+    for &vk in reflex_verts {
         if vk == prev || vk == curr || vk == next {
             continue;
         }
         let p = verts[vk];
+        if p.x < tri_min_x || p.x > tri_max_x || p.y < tri_min_y || p.y > tri_max_y {
+            continue;
+        }
         if point_in_triangle_inclusive(p, a, b, c, eps) {
             return false;
         }
     }
 
     // 2. Check that diagonal (prev, next) does not properly intersect any polygon edge.
-    for e in 0..n {
-        let u = poly[e];
-        let v = poly[(e + 1) % n];
-        if u == prev || u == next || v == prev || v == next {
-            continue;
-        }
-        if segments_properly_intersect(a, c, verts[u], verts[v]) {
-            return false;
+    if !reflex_verts.is_empty() {
+        let diag_min_x = a.x.min(c.x) - 1e-8;
+        let diag_max_x = a.x.max(c.x) + 1e-8;
+        let diag_min_y = a.y.min(c.y) - 1e-8;
+        let diag_max_y = a.y.max(c.y) + 1e-8;
+
+        for e in 0..n {
+            let u = poly[e];
+            let v = poly[(e + 1) % n];
+            if u == prev || u == next || v == prev || v == next {
+                continue;
+            }
+            let pu = verts[u];
+            let pv = verts[v];
+            if pu.x.max(pv.x) < diag_min_x
+                || pu.x.min(pv.x) > diag_max_x
+                || pu.y.max(pv.y) < diag_min_y
+                || pu.y.min(pv.y) > diag_max_y
+            {
+                continue;
+            }
+            if segments_properly_intersect(a, c, pu, pv) {
+                return false;
+            }
         }
     }
 
