@@ -2838,7 +2838,7 @@ pub unsafe extern "C" fn pictureRecorder_endRecording(handle: u32) -> u32 {
             .and_then(|rec| {
                 let cid = rec.active_canvas_handle.take()?;
                 let entry = st.canvases.remove(&cid)?;
-                let dl = entry.dl_builder.build();
+                let dl = entry.dl_builder.into_display_list();
                 let bytes = dl.len() * 64;
                 Some((Arc::new(dl), entry.cull_rect, bytes))
             })
@@ -3044,7 +3044,7 @@ pub unsafe extern "C" fn canvas_clipRRect(
     };
     with_state(|st| {
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.canvas.clip_rrect(rect, radii, ClipOperation::Intersect);
+            c.canvas.clip_rect_with_op(rect, ClipOperation::Intersect);
             c.dl_builder
                 .clip_rrect(rect, radii, ClipOperation::Intersect);
         }
@@ -3059,7 +3059,8 @@ pub unsafe extern "C" fn canvas_clipPath(canvas_handle: u32, path_handle: u32, _
         };
         let path = p.build_path();
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.canvas.clip_path(&path, ClipOperation::Intersect);
+            c.canvas
+                .clip_path_bounds_only(&path, ClipOperation::Intersect);
             c.dl_builder.clip_path(path, ClipOperation::Intersect);
         }
     });
@@ -3777,16 +3778,29 @@ pub unsafe extern "C" fn textStyle_addFontFamilies(
     }
     let str_handles = std::slice::from_raw_parts(families_ptr, count as usize);
     with_state(|st| {
-        let mut names = Vec::with_capacity(str_handles.len());
+        let SkwasmState {
+            sk_strings,
+            sk_strings_16,
+            text_styles,
+            ..
+        } = st;
+        let Some(ts) = text_styles.get_mut(&handle) else {
+            return;
+        };
+        ts.font_families.reserve(str_handles.len());
         for &sh in str_handles {
-            if let Some(s) = st.read_sk_string(sh) {
+            let s = if let Some(entry) = sk_strings.get(&sh) {
+                Some(String::from_utf8_lossy(&entry.buf[..entry.len]).into_owned())
+            } else {
+                sk_strings_16
+                    .get(&sh)
+                    .map(|entry16| String::from_utf16_lossy(&entry16.buf[..entry16.len]))
+            };
+            if let Some(s) = s {
                 if !s.is_empty() {
-                    names.push(s);
+                    ts.font_families.push(s);
                 }
             }
-        }
-        if let Some(ts) = st.text_styles.get_mut(&handle) {
-            ts.font_families.extend(names);
         }
     });
 }
@@ -4070,16 +4084,30 @@ pub unsafe extern "C" fn strutStyle_setFontFamilies(
     }
     let str_handles = std::slice::from_raw_parts(families_ptr, count as usize);
     with_state(|st| {
-        let mut names = Vec::with_capacity(str_handles.len());
+        let SkwasmState {
+            sk_strings,
+            sk_strings_16,
+            strut_styles,
+            ..
+        } = st;
+        let Some(ss) = strut_styles.get_mut(&handle) else {
+            return;
+        };
+        ss.font_families.clear();
+        ss.font_families.reserve(str_handles.len());
         for &sh in str_handles {
-            if let Some(s) = st.read_sk_string(sh) {
+            let s = if let Some(entry) = sk_strings.get(&sh) {
+                Some(String::from_utf8_lossy(&entry.buf[..entry.len]).into_owned())
+            } else {
+                sk_strings_16
+                    .get(&sh)
+                    .map(|entry16| String::from_utf16_lossy(&entry16.buf[..entry16.len]))
+            };
+            if let Some(s) = s {
                 if !s.is_empty() {
-                    names.push(s);
+                    ss.font_families.push(s);
                 }
             }
-        }
-        if let Some(ss) = st.strut_styles.get_mut(&handle) {
-            ss.font_families = names;
         }
     });
 }
@@ -4191,13 +4219,18 @@ pub unsafe extern "C" fn paragraphBuilder_pop(handle: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn paragraphBuilder_addText(handle: u32, sk_string16_handle: u32) {
     with_state(|st| {
-        let Some(entry16) = st.sk_strings_16.get(&sk_string16_handle) else {
+        let SkwasmState {
+            sk_strings_16,
+            paragraph_builders,
+            ..
+        } = st;
+        let Some(entry16) = sk_strings_16.get(&sk_string16_handle) else {
             return;
         };
-        let units = entry16.buf[..entry16.len].to_vec();
-        if let Some((pb, utf8_cache)) = st.paragraph_builders.get_mut(&handle) {
-            pb.add_text_utf16(&units);
-            *utf8_cache = pb.utf8_text().as_bytes().to_vec();
+        let units = &entry16.buf[..entry16.len];
+        if let Some((pb, utf8_cache)) = paragraph_builders.get_mut(&handle) {
+            pb.add_text_utf16(units);
+            utf8_cache.clear();
         }
     });
 }
@@ -4220,7 +4253,7 @@ pub unsafe extern "C" fn paragraphBuilder_addPlaceholder(
                 baseline_offset,
                 baseline,
             });
-            *utf8_cache = pb.utf8_text().as_bytes().to_vec();
+            utf8_cache.clear();
         }
     });
 }
@@ -4231,12 +4264,15 @@ pub unsafe extern "C" fn paragraphBuilder_getUtf8Text(
     out_size: *mut u32,
 ) -> *const u8 {
     with_state(|st| {
-        let Some((_, utf8_cache)) = st.paragraph_builders.get(&handle) else {
+        let Some((pb, utf8_cache)) = st.paragraph_builders.get_mut(&handle) else {
             if !out_size.is_null() {
                 *out_size = 0;
             }
             return std::ptr::null();
         };
+        if utf8_cache.is_empty() && !pb.utf8_text().is_empty() {
+            utf8_cache.extend_from_slice(pb.utf8_text().as_bytes());
+        }
         if !out_size.is_null() {
             *out_size = utf8_cache.len() as u32;
         }
@@ -4251,30 +4287,20 @@ pub unsafe extern "C" fn paragraphBuilder_getUtf8Text(
 #[no_mangle]
 pub unsafe extern "C" fn paragraphBuilder_setGraphemeBreaksUtf16(
     handle: u32,
-    pos_buffer_handle: u32,
+    _pos_buffer_handle: u32,
 ) {
     with_state(|st| {
-        let breaks = st
-            .unicode_pos_buffers
-            .get(&pos_buffer_handle)
-            .cloned()
-            .unwrap_or_default();
         if let Some((pb, _)) = st.paragraph_builders.get_mut(&handle) {
-            pb.set_grapheme_breaks_utf16(breaks);
+            pb.set_grapheme_breaks_utf16(Vec::new());
         }
     });
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn paragraphBuilder_setWordBreaksUtf16(handle: u32, pos_buffer_handle: u32) {
+pub unsafe extern "C" fn paragraphBuilder_setWordBreaksUtf16(handle: u32, _pos_buffer_handle: u32) {
     with_state(|st| {
-        let breaks = st
-            .unicode_pos_buffers
-            .get(&pos_buffer_handle)
-            .cloned()
-            .unwrap_or_default();
         if let Some((pb, _)) = st.paragraph_builders.get_mut(&handle) {
-            pb.set_word_breaks_utf16(breaks);
+            pb.set_word_breaks_utf16(Vec::new());
         }
     });
 }
@@ -4282,16 +4308,11 @@ pub unsafe extern "C" fn paragraphBuilder_setWordBreaksUtf16(handle: u32, pos_bu
 #[no_mangle]
 pub unsafe extern "C" fn paragraphBuilder_setLineBreaksUtf16(
     handle: u32,
-    line_break_buffer_handle: u32,
+    _line_break_buffer_handle: u32,
 ) {
     with_state(|st| {
-        let breaks = st
-            .line_break_buffers
-            .get(&line_break_buffer_handle)
-            .cloned()
-            .unwrap_or_default();
         if let Some((pb, _)) = st.paragraph_builders.get_mut(&handle) {
-            pb.set_line_breaks_utf16(breaks);
+            pb.set_line_breaks_utf16(Vec::new());
         }
     });
 }
@@ -4319,11 +4340,19 @@ pub unsafe extern "C" fn paragraph_dispose(handle: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn paragraph_layout(handle: u32, width: f32) {
     with_state(|st| {
-        let Some(mut para) = st.paragraphs.remove(&handle) else {
+        let SkwasmState {
+            paragraphs,
+            typographer,
+            ..
+        } = st;
+        let Some(para) = paragraphs.get_mut(&handle) else {
             return;
         };
-        Arc::make_mut(&mut para).layout(&mut st.typographer, width);
-        st.paragraphs.insert(handle, para);
+        if let Some(p) = Arc::get_mut(para) {
+            p.layout(typographer, width);
+        } else {
+            Arc::make_mut(para).layout(typographer, width);
+        }
     });
 }
 

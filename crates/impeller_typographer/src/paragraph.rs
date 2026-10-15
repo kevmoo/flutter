@@ -2,9 +2,11 @@
 //! supporting multi-span `RichTextStyle`, horizontal alignment, line metrics, UTF-16 code unit
 //! queries, inline `PlaceholderSpan`s, background/decoration rects, and `cosmic-text` shaping.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::ops::Range;
-use std::sync::Arc;
+use std::ops::{Deref, Range};
+use std::sync::{Arc, OnceLock};
 
 use cosmic_text::{
     Attrs, BidiParagraphs, Buffer, CacheKeyFlags, Family, Metrics, Shaping, Stretch, Style, Weight,
@@ -194,50 +196,55 @@ impl RichTextStyle {
         self.has_font_slant = true;
     }
 
-    /// Merges unset properties from `parent` so nested Flutter `TextSpan`s inherit parent properties.
-    pub fn merged_with_parent(&self, parent: &Self) -> Self {
-        let mut out = self.clone();
-        if !out.has_color
-            && out.foreground_paint_color.is_none()
-            && out.color == Color::WHITE
+    /// Merges unset properties from `parent` in place so nested Flutter `TextSpan`s inherit parent properties.
+    pub fn merge_from_parent(&mut self, parent: &Self) {
+        if !self.has_color
+            && self.foreground_paint_color.is_none()
+            && self.color == Color::WHITE
             && (parent.has_color
                 || parent.foreground_paint_color.is_some()
                 || parent.color != Color::WHITE)
         {
-            out.color = parent.color;
-            out.has_color = parent.has_color;
-            out.foreground_paint_color = parent.foreground_paint_color;
+            self.color = parent.color;
+            self.has_color = parent.has_color;
+            self.foreground_paint_color = parent.foreground_paint_color;
         }
-        if !out.has_font_size && (out.font_size - 14.0).abs() < 1e-4 {
-            out.font_size = parent.font_size;
-            out.has_font_size = parent.has_font_size;
+        if !self.has_font_size && (self.font_size - 14.0).abs() < 1e-4 {
+            self.font_size = parent.font_size;
+            self.has_font_size = parent.has_font_size;
         }
-        if !out.has_font_weight && out.font_weight == 400 {
-            out.font_weight = parent.font_weight;
-            out.has_font_weight = parent.has_font_weight;
+        if !self.has_font_weight && self.font_weight == 400 {
+            self.font_weight = parent.font_weight;
+            self.has_font_weight = parent.has_font_weight;
         }
-        if !out.has_font_slant && out.font_slant == 0 {
-            out.font_slant = parent.font_slant;
-            out.has_font_slant = parent.has_font_slant;
+        if !self.has_font_slant && self.font_slant == 0 {
+            self.font_slant = parent.font_slant;
+            self.has_font_slant = parent.has_font_slant;
         }
-        if out.font_families.is_empty() {
-            out.font_families.clone_from(&parent.font_families);
+        if self.font_families.is_empty() && !parent.font_families.is_empty() {
+            self.font_families.clone_from(&parent.font_families);
         }
-        if out.height_multiplier.is_none() {
-            out.height_multiplier = parent.height_multiplier;
+        if self.height_multiplier.is_none() {
+            self.height_multiplier = parent.height_multiplier;
         }
-        if out.background_paint_color.is_none() {
-            out.background_paint_color = parent.background_paint_color;
+        if self.background_paint_color.is_none() {
+            self.background_paint_color = parent.background_paint_color;
         }
-        if out.decoration == 0 && parent.decoration != 0 {
-            out.decoration = parent.decoration;
-            out.decoration_color = parent.decoration_color;
-            out.decoration_style = parent.decoration_style;
-            out.decoration_thickness = parent.decoration_thickness;
+        if self.decoration == 0 && parent.decoration != 0 {
+            self.decoration = parent.decoration;
+            self.decoration_color = parent.decoration_color;
+            self.decoration_style = parent.decoration_style;
+            self.decoration_thickness = parent.decoration_thickness;
         }
-        if out.shadows.is_empty() && !parent.shadows.is_empty() {
-            out.shadows.clone_from(&parent.shadows);
+        if self.shadows.is_empty() && !parent.shadows.is_empty() {
+            self.shadows.clone_from(&parent.shadows);
         }
+    }
+
+    /// Merges unset properties from `parent` so nested Flutter `TextSpan`s inherit parent properties.
+    pub fn merged_with_parent(&self, parent: &Self) -> Self {
+        let mut out = self.clone();
+        out.merge_from_parent(parent);
         out
     }
 }
@@ -418,9 +425,13 @@ impl ParagraphBuilder {
             .unwrap_or(&self.paragraph_style.default_text_style)
     }
 
-    pub fn push_style(&mut self, style: RichTextStyle) {
-        let merged = style.merged_with_parent(self.current_style());
-        self.style_stack.push(merged);
+    pub fn push_style(&mut self, mut style: RichTextStyle) {
+        if let Some(parent) = self.style_stack.last() {
+            style.merge_from_parent(parent);
+        } else {
+            style.merge_from_parent(&self.paragraph_style.default_text_style);
+        }
+        self.style_stack.push(style);
     }
 
     pub fn pop(&mut self) {
@@ -452,8 +463,34 @@ impl ParagraphBuilder {
         if utf16_units.is_empty() {
             return;
         }
-        let decoded = String::from_utf16_lossy(utf16_units);
-        self.add_text(&decoded);
+        let utf8_start = self.text_utf8.len();
+        let utf16_start = self.text_utf16.len();
+        self.text_utf8.reserve(utf16_units.len());
+        let mut had_replacement = false;
+        for res in char::decode_utf16(utf16_units.iter().copied()) {
+            match res {
+                Ok(ch) => self.text_utf8.push(ch),
+                Err(_) => {
+                    self.text_utf8.push(char::REPLACEMENT_CHARACTER);
+                    had_replacement = true;
+                }
+            }
+        }
+        if had_replacement {
+            self.text_utf16
+                .extend(self.text_utf8[utf8_start..].encode_utf16());
+        } else {
+            self.text_utf16.extend_from_slice(utf16_units);
+        }
+        let utf8_end = self.text_utf8.len();
+        let utf16_end = self.text_utf16.len();
+
+        let style = self.current_style().clone();
+        self.spans.push(RichTextSpan {
+            utf8_range: utf8_start..utf8_end,
+            utf16_range: utf16_start..utf16_end,
+            style,
+        });
     }
 
     pub fn add_placeholder(&mut self, placeholder: PlaceholderSpan) {
@@ -499,34 +536,16 @@ impl ParagraphBuilder {
     }
 
     pub fn build(self) -> Paragraph {
-        let utf8_to_utf16 = build_utf8_to_utf16_map(&self.text_utf8);
         Paragraph {
             paragraph_style: self.paragraph_style,
             text_utf8: self.text_utf8,
             text_utf16: self.text_utf16,
-            utf8_to_utf16,
             spans: self.spans,
             placeholders: self.placeholders,
-            quads: Vec::new(),
-            background_rects: Vec::new(),
-            decoration_rects: Vec::new(),
-            lines: Vec::new(),
-            placeholder_boxes: Vec::new(),
-            width: 0.0,
-            height: 0.0,
-            longest_line: 0.0,
-            min_intrinsic_width: 0.0,
-            max_intrinsic_width: 0.0,
-            alphabetic_baseline: 0.0,
-            ideographic_baseline: 0.0,
-            did_exceed_max_lines: false,
-            quad_bounds: None,
-            uses_alpha: false,
-            uses_color: false,
+            layout_data: CachedParagraphLayout::empty_shared(),
             has_laid_out: false,
             laid_out_epoch: 0,
             last_layout_finite: false,
-            glyph_clusters: Vec::new(),
         }
     }
 }
@@ -546,8 +565,11 @@ const MAX_RESOLVED_FONT_CACHE_ENTRIES: usize = 512;
 /// Cached layout result for a shaped [`Paragraph`] stored inside [`TypographerContext`].
 #[derive(Debug, Clone)]
 pub struct CachedParagraphLayout {
+    /// Positioned, tinted glyph quads ready for `GlyphAtlasBatch` rendering.
     pub quads: Vec<AtlasGlyphQuad>,
+    /// Background and text decoration rectangles `(rect, color)` in paragraph local space.
     pub background_rects: Vec<(Rect, Color)>,
+    /// Subset of `background_rects` specifically representing underline/overline/line-through decorations.
     pub decoration_rects: Vec<(Rect, Color)>,
     pub lines: Vec<ParagraphLineMetrics>,
     pub placeholder_boxes: Vec<(Rect, TextDirection)>,
@@ -563,6 +585,35 @@ pub struct CachedParagraphLayout {
     pub quad_bounds: Option<Rect>,
     pub uses_alpha: bool,
     pub uses_color: bool,
+}
+
+impl CachedParagraphLayout {
+    pub fn empty() -> Self {
+        Self {
+            quads: Vec::new(),
+            background_rects: Vec::new(),
+            decoration_rects: Vec::new(),
+            lines: Vec::new(),
+            placeholder_boxes: Vec::new(),
+            glyph_clusters: Vec::new(),
+            width: 0.0,
+            height: 0.0,
+            longest_line: 0.0,
+            min_intrinsic_width: 0.0,
+            max_intrinsic_width: 0.0,
+            alphabetic_baseline: 0.0,
+            ideographic_baseline: 0.0,
+            did_exceed_max_lines: false,
+            quad_bounds: None,
+            uses_alpha: false,
+            uses_color: false,
+        }
+    }
+
+    pub fn empty_shared() -> Arc<Self> {
+        static EMPTY: OnceLock<Arc<CachedParagraphLayout>> = OnceLock::new();
+        Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::empty())))
+    }
 }
 
 struct DeterministicHasher(u64);
@@ -681,6 +732,42 @@ fn hash_rich_text_style(h: &mut DeterministicHasher, s: &RichTextStyle) {
     }
 }
 
+enum Utf8ToUtf16Map {
+    Ascii(usize),
+    NonAscii(Vec<usize>),
+}
+
+impl Utf8ToUtf16Map {
+    fn from_str(s: &str) -> Self {
+        if s.is_ascii() {
+            Self::Ascii(s.len())
+        } else {
+            Self::NonAscii(build_utf8_to_utf16_map(s))
+        }
+    }
+
+    #[inline]
+    fn get(&self, utf8_idx: usize) -> usize {
+        match self {
+            Self::Ascii(len) => utf8_idx.min(*len),
+            Self::NonAscii(map) => map[utf8_idx.min(map.len() - 1)],
+        }
+    }
+}
+
+const MAX_SHAPED_BUFFER_CACHE_ENTRIES: usize = 512;
+
+struct CachedShapedParagraph {
+    buffer: Buffer,
+    para_ranges: Vec<Range<usize>>,
+    utf8_to_utf16: Utf8ToUtf16Map,
+}
+
+thread_local! {
+    static SHAPED_BUFFER_CACHE: RefCell<HashMap<u64, CachedShapedParagraph>> =
+        RefCell::new(HashMap::new());
+}
+
 fn build_utf8_to_utf16_map(s: &str) -> Vec<usize> {
     let mut map = vec![0usize; s.len() + 1];
     let mut utf16_pos = 0usize;
@@ -720,9 +807,9 @@ fn resolve_family_name(ctx: &TypographerContext, families: &[String], weight: u1
 
         if lower.contains("icons") || short_lower.contains("icons") {
             if let Some(found) = ctx.font_system.db().faces().find(|f| {
-                f.families.iter().any(|(n, _)| {
-                    n.eq_ignore_ascii_case(fam) || n.eq_ignore_ascii_case(short)
-                })
+                f.families
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(fam) || n.eq_ignore_ascii_case(short))
             }) {
                 if let Some((name, _)) = found.families.first() {
                     return name.clone();
@@ -791,6 +878,14 @@ fn resolve_family_and_slant_cached(
     weight: u16,
     font_slant: i32,
 ) -> (String, Style, CacheKeyFlags) {
+    if families.is_empty() && !matches!(font_slant, 1 | 2) {
+        let fam = if weight >= 600 {
+            ctx.fonts[1].family.clone()
+        } else {
+            ctx.fonts[0].family.clone()
+        };
+        return (fam, Style::Normal, CacheKeyFlags::empty());
+    }
     let key = (families.to_vec(), weight, font_slant);
     if let Some(cached) = ctx.resolved_font_cache.get(&key) {
         return cached.clone();
@@ -811,40 +906,33 @@ pub struct Paragraph {
     pub paragraph_style: ParagraphStyle,
     pub text_utf8: String,
     pub text_utf16: Vec<u16>,
-    utf8_to_utf16: Vec<usize>,
     pub spans: Vec<RichTextSpan>,
     pub placeholders: Vec<PlaceholderEntry>,
-    /// Positioned, tinted glyph quads ready for `GlyphAtlasBatch` rendering.
-    pub quads: Vec<AtlasGlyphQuad>,
-    /// Background and text decoration rectangles `(rect, color)` in paragraph local space.
-    pub background_rects: Vec<(Rect, Color)>,
-    /// Subset of `background_rects` specifically representing underline/overline/line-through decorations.
-    pub decoration_rects: Vec<(Rect, Color)>,
-    pub lines: Vec<ParagraphLineMetrics>,
-    pub placeholder_boxes: Vec<(Rect, TextDirection)>,
-    pub width: Scalar,
-    pub height: Scalar,
-    pub longest_line: Scalar,
-    pub min_intrinsic_width: Scalar,
-    pub max_intrinsic_width: Scalar,
-    pub alphabetic_baseline: Scalar,
-    pub ideographic_baseline: Scalar,
-    pub did_exceed_max_lines: bool,
-    pub quad_bounds: Option<Rect>,
-    pub uses_alpha: bool,
-    pub uses_color: bool,
+    /// Shared, cached layout metrics and glyph quads (`Deref<Target = CachedParagraphLayout>`).
+    pub layout_data: Arc<CachedParagraphLayout>,
     pub has_laid_out: bool,
     laid_out_epoch: u64,
     last_layout_finite: bool,
-    glyph_clusters: Vec<PositionedGlyphCluster>,
+}
+
+impl Deref for Paragraph {
+    type Target = CachedParagraphLayout;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.layout_data
+    }
 }
 
 impl Paragraph {
-    fn compute_paragraph_layout_hash(&self, effective_width: Scalar, finite_width: bool) -> u64 {
+    fn compute_shaping_hash(&self, ctx: &TypographerContext) -> u64 {
         let mut h = DeterministicHasher::new();
+        ctx.cache_epoch.hash(&mut h);
+        ctx.font_system.db().len().hash(&mut h);
+        for f in &ctx.fonts {
+            f.id.hash(&mut h);
+        }
         self.text_utf8.hash(&mut h);
-        finite_width.hash(&mut h);
-        ((effective_width * 16.0).round() as i64).hash(&mut h);
 
         self.spans.len().hash(&mut h);
         for sp in &self.spans {
@@ -896,24 +984,17 @@ impl Paragraph {
         h.finish()
     }
 
-    fn apply_cached_layout(&mut self, cached: &CachedParagraphLayout) {
-        self.quads.clone_from(&cached.quads);
-        self.background_rects.clone_from(&cached.background_rects);
-        self.decoration_rects.clone_from(&cached.decoration_rects);
-        self.lines.clone_from(&cached.lines);
-        self.placeholder_boxes.clone_from(&cached.placeholder_boxes);
-        self.glyph_clusters.clone_from(&cached.glyph_clusters);
-        self.width = cached.width;
-        self.height = cached.height;
-        self.longest_line = cached.longest_line;
-        self.min_intrinsic_width = cached.min_intrinsic_width;
-        self.max_intrinsic_width = cached.max_intrinsic_width;
-        self.alphabetic_baseline = cached.alphabetic_baseline;
-        self.ideographic_baseline = cached.ideographic_baseline;
-        self.did_exceed_max_lines = cached.did_exceed_max_lines;
-        self.quad_bounds = cached.quad_bounds;
-        self.uses_alpha = cached.uses_alpha;
-        self.uses_color = cached.uses_color;
+    #[inline]
+    fn compute_paragraph_layout_hash(
+        shaping_hash: u64,
+        effective_width: Scalar,
+        finite_width: bool,
+    ) -> u64 {
+        let mut h = DeterministicHasher::new();
+        shaping_hash.hash(&mut h);
+        finite_width.hash(&mut h);
+        ((effective_width * 16.0).round() as i64).hash(&mut h);
+        h.finish()
     }
 
     /// Shapes and lays out the paragraph at `max_width` using `ctx`, rasterizing all visible
@@ -925,34 +1006,21 @@ impl Paragraph {
         if self.has_laid_out
             && self.laid_out_epoch == ctx.cache_epoch
             && self.last_layout_finite == finite_width
-            && (!finite_width || (self.width - effective_width).abs() < 1e-3)
+            && (!finite_width || (self.layout_data.width - effective_width).abs() < 1e-3)
         {
             return;
         }
 
-        let layout_hash = self.compute_paragraph_layout_hash(effective_width, finite_width);
-        if let Some(cached) = ctx.paragraph_layout_cache.get(&layout_hash).cloned() {
-            self.apply_cached_layout(&cached);
+        let shaping_hash = self.compute_shaping_hash(ctx);
+        let layout_hash =
+            Self::compute_paragraph_layout_hash(shaping_hash, effective_width, finite_width);
+        if let Some(cached) = ctx.paragraph_layout_cache.get(&layout_hash) {
+            self.layout_data = Arc::clone(cached);
             self.has_laid_out = true;
             self.laid_out_epoch = ctx.cache_epoch;
             self.last_layout_finite = finite_width;
             return;
         }
-
-        self.quads.clear();
-        self.background_rects.clear();
-        self.decoration_rects.clear();
-        self.lines.clear();
-        self.placeholder_boxes.clear();
-        self.glyph_clusters.clear();
-        self.longest_line = 0.0;
-        self.min_intrinsic_width = 0.0;
-        self.max_intrinsic_width = 0.0;
-        self.did_exceed_max_lines = false;
-        self.quad_bounds = None;
-        self.uses_alpha = false;
-        self.uses_color = false;
-        self.width = effective_width;
 
         let default_style = &self.paragraph_style.default_text_style;
         let default_font_size = default_style.font_size.max(1.0);
@@ -960,83 +1028,130 @@ impl Paragraph {
         let default_ascent = (default_font_size * 0.93).min(default_line_h);
 
         if self.text_utf8.is_empty() || self.spans.is_empty() {
-            self.height = default_line_h.round();
-            self.alphabetic_baseline = default_ascent.round();
-            self.ideographic_baseline = self.height;
+            let height = default_line_h.round();
+            let mut empty_layout = CachedParagraphLayout::empty();
+            empty_layout.width = effective_width;
+            empty_layout.height = height;
+            empty_layout.alphabetic_baseline = default_ascent.round();
+            empty_layout.ideographic_baseline = height;
+            self.layout_data = Arc::new(empty_layout);
             self.has_laid_out = true;
             self.laid_out_epoch = ctx.cache_epoch;
             self.last_layout_finite = finite_width;
             return;
         }
 
-        let mut buffer = Buffer::new(
-            &mut ctx.font_system,
-            Metrics::new(default_font_size, default_line_h),
-        );
-        if finite_width && max_width > 0.0 {
-            buffer.set_wrap(&mut ctx.font_system, Wrap::WordOrGlyph);
-            buffer.set_size(&mut ctx.font_system, Some(max_width.max(1.0)), None);
+        let (target_wrap, target_width_opt) = if finite_width && max_width > 0.0 {
+            (Wrap::WordOrGlyph, Some(max_width.max(1.0)))
         } else {
-            buffer.set_wrap(&mut ctx.font_system, Wrap::None);
-            buffer.set_size(&mut ctx.font_system, None, None);
-        }
+            (Wrap::None, None)
+        };
 
-        let mut resolved_families_and_slants = Vec::with_capacity(self.spans.len());
-        for span in &self.spans {
-            resolved_families_and_slants.push(resolve_family_and_slant_cached(
-                ctx,
-                &span.style.font_families,
-                span.style.font_weight,
-                span.style.font_slant,
-            ));
-        }
+        let cached_shaped =
+            SHAPED_BUFFER_CACHE.with(|cache| cache.borrow_mut().remove(&shaping_hash));
+        let shaped = if let Some(mut existing) = cached_shaped {
+            existing.buffer.set_wrap(&mut ctx.font_system, target_wrap);
+            existing
+                .buffer
+                .set_size(&mut ctx.font_system, target_width_opt, None);
+            existing
+        } else {
+            let mut buffer = Buffer::new_empty(Metrics::new(default_font_size, default_line_h));
+            buffer.set_wrap(&mut ctx.font_system, target_wrap);
+            buffer.set_size(&mut ctx.font_system, target_width_opt, None);
 
-        let (default_family, default_font_style, default_flags) = resolve_family_and_slant_cached(
-            ctx,
-            &default_style.font_families,
-            default_style.font_weight,
-            default_style.font_slant,
-        );
-        let default_attrs = Attrs::new()
-            .family(Family::Name(&default_family))
-            .weight(Weight(default_style.font_weight.clamp(100, 900)))
-            .style(default_font_style)
-            .cache_key_flags(default_flags)
-            .stretch(Stretch::Normal);
+            let mut resolved_families_and_slants = Vec::with_capacity(self.spans.len());
+            for span in &self.spans {
+                resolved_families_and_slants.push(resolve_family_and_slant_cached(
+                    ctx,
+                    &span.style.font_families,
+                    span.style.font_weight,
+                    span.style.font_slant,
+                ));
+            }
 
-        {
-            let rich_iter = self.spans.iter().enumerate().map(|(idx, span)| {
-                let slice = &self.text_utf8[span.utf8_range.clone()];
-                let font_size = span.style.font_size.max(1.0);
-                let line_h = resolve_span_line_height(&span.style, &self.paragraph_style);
-                let (ref fam, font_style, flags) = resolved_families_and_slants[idx];
-                let attrs = Attrs::new()
-                    .family(Family::Name(fam))
-                    .weight(Weight(span.style.font_weight.clamp(100, 900)))
-                    .style(font_style)
-                    .cache_key_flags(flags)
-                    .stretch(Stretch::Normal)
-                    .metrics(Metrics::new(font_size, line_h))
-                    .metadata(idx);
-                (slice, attrs)
-            });
-            buffer.set_rich_text(&mut ctx.font_system, rich_iter, default_attrs, Shaping::Advanced);
-        }
-        buffer.shape_until_scroll(&mut ctx.font_system, false);
+            let (default_family, default_font_style, default_flags) =
+                resolve_family_and_slant_cached(
+                    ctx,
+                    &default_style.font_families,
+                    default_style.font_weight,
+                    default_style.font_slant,
+                );
+            let default_attrs = Attrs::new()
+                .family(Family::Name(&default_family))
+                .weight(Weight(default_style.font_weight.clamp(100, 900)))
+                .style(default_font_style)
+                .cache_key_flags(default_flags)
+                .stretch(Stretch::Normal);
 
-        // Precompute UTF-8 byte range of each BidiParagraph line inside self.text_utf8.
-        let base_ptr = self.text_utf8.as_ptr() as usize;
-        let para_ranges: Vec<Range<usize>> = BidiParagraphs::new(&self.text_utf8)
-            .map(|line| {
-                let start = (line.as_ptr() as usize) - base_ptr;
-                start..(start + line.len())
-            })
-            .collect();
+            {
+                let rich_iter = self.spans.iter().enumerate().map(|(idx, span)| {
+                    let slice = &self.text_utf8[span.utf8_range.clone()];
+                    let font_size = span.style.font_size.max(1.0);
+                    let line_h = resolve_span_line_height(&span.style, &self.paragraph_style);
+                    let (ref fam, font_style, flags) = resolved_families_and_slants[idx];
+                    let attrs = Attrs::new()
+                        .family(Family::Name(fam))
+                        .weight(Weight(span.style.font_weight.clamp(100, 900)))
+                        .style(font_style)
+                        .cache_key_flags(flags)
+                        .stretch(Stretch::Normal)
+                        .metrics(Metrics::new(font_size, line_h))
+                        .metadata(idx);
+                    (slice, attrs)
+                });
+                buffer.set_rich_text(
+                    &mut ctx.font_system,
+                    rich_iter,
+                    default_attrs,
+                    Shaping::Advanced,
+                );
+            }
+
+            // Precompute UTF-8 byte range of each BidiParagraph line inside self.text_utf8.
+            let base_ptr = self.text_utf8.as_ptr() as usize;
+            let para_ranges: Vec<Range<usize>> = BidiParagraphs::new(&self.text_utf8)
+                .map(|line| {
+                    let start = (line.as_ptr() as usize) - base_ptr;
+                    start..(start + line.len())
+                })
+                .collect();
+            let utf8_to_utf16 = Utf8ToUtf16Map::from_str(&self.text_utf8);
+
+            CachedShapedParagraph {
+                buffer,
+                para_ranges,
+                utf8_to_utf16,
+            }
+        };
+
+        let utf8_to_utf16 = &shaped.utf8_to_utf16;
+        let para_ranges = &shaped.para_ranges;
+        let approx_glyphs = self.text_utf8.len();
+        let mut quads = Vec::with_capacity(approx_glyphs);
+        let mut background_rects = Vec::new();
+        let mut decoration_rects = Vec::new();
+        let mut lines = Vec::new();
+        let mut placeholder_boxes = Vec::new();
+        let mut glyph_clusters = Vec::with_capacity(approx_glyphs);
+        let mut longest_line: Scalar = 0.0;
+        let mut min_intrinsic_width: Scalar = 0.0;
+        let mut max_intrinsic_width: Scalar = 0.0;
+        let mut did_exceed_max_lines = false;
+        let mut quad_bounds: Option<Rect> = None;
+        let mut uses_alpha = false;
+        let mut uses_color = false;
+        let mut width = effective_width;
 
         let effective_align = self
             .paragraph_style
             .text_align
             .resolve(self.paragraph_style.text_direction);
+        let has_placeholders = !self.placeholders.is_empty();
+        let has_bg_or_decoration = self
+            .spans
+            .iter()
+            .any(|s| s.style.background_paint_color.is_some() || s.style.decoration != 0);
 
         let max_font_ceil = self
             .spans
@@ -1049,10 +1164,10 @@ impl Paragraph {
         let mut current_word_w: Scalar = 0.0;
         let mut last_line_bottom: Scalar = 0.0;
 
-        for (line_idx, run) in buffer.layout_runs().enumerate() {
+        for (line_idx, run) in shaped.buffer.layout_runs().enumerate() {
             if let Some(max_l) = self.paragraph_style.max_lines {
                 if line_idx >= max_l {
-                    self.did_exceed_max_lines = true;
+                    did_exceed_max_lines = true;
                     break;
                 }
             }
@@ -1069,25 +1184,27 @@ impl Paragraph {
                 current_para_line_i = Some(run.line_i);
                 current_para_unwrapped_w = run.line_w;
             }
-            self.max_intrinsic_width = self.max_intrinsic_width.max(current_para_unwrapped_w);
+            max_intrinsic_width = max_intrinsic_width.max(current_para_unwrapped_w);
 
             let mut line_w = run.line_w;
             // Account for inline placeholder width overrides if any placeholder sits on this line.
-            for glyph in run.glyphs {
-                let g_utf8_start = (para_range.start + glyph.start).min(self.text_utf8.len());
-                let g_utf16_start = self.utf8_to_utf16[g_utf8_start];
-                if let Some(ph) = self
-                    .placeholders
-                    .iter()
-                    .find(|p| p.utf16_offset == g_utf16_start)
-                {
-                    if ph.span.width > glyph.w {
-                        line_w += ph.span.width - glyph.w;
+            if has_placeholders {
+                for glyph in run.glyphs {
+                    let g_utf8_start = (para_range.start + glyph.start).min(self.text_utf8.len());
+                    let g_utf16_start = utf8_to_utf16.get(g_utf8_start);
+                    if let Some(ph) = self
+                        .placeholders
+                        .iter()
+                        .find(|p| p.utf16_offset == g_utf16_start)
+                    {
+                        if ph.span.width > glyph.w {
+                            line_w += ph.span.width - glyph.w;
+                        }
                     }
                 }
             }
 
-            self.longest_line = self.longest_line.max(line_w);
+            longest_line = longest_line.max(line_w);
 
             let align_dx = if finite_width && max_width > line_w {
                 match effective_align {
@@ -1100,8 +1217,8 @@ impl Paragraph {
             };
 
             let raw_baseline_y = run.line_y.ceil();
-            let y_pad = *first_line_y_pad
-                .get_or_insert_with(|| (max_font_ceil - raw_baseline_y).max(0.0));
+            let y_pad =
+                *first_line_y_pad.get_or_insert_with(|| (max_font_ceil - raw_baseline_y).max(0.0));
             let baseline_y = raw_baseline_y + y_pad;
             let line_top = (run.line_top + y_pad).floor().max(0.0);
             let line_height = run.line_height.max(default_line_h).ceil();
@@ -1122,8 +1239,8 @@ impl Paragraph {
 
                 let g_utf8_start = (para_range.start + glyph.start).min(self.text_utf8.len());
                 let g_utf8_end = (para_range.start + glyph.end).min(self.text_utf8.len());
-                let g_utf16_start = self.utf8_to_utf16[g_utf8_start];
-                let g_utf16_end = self.utf8_to_utf16[g_utf8_end].max(g_utf16_start);
+                let g_utf16_start = utf8_to_utf16.get(g_utf8_start);
+                let g_utf16_end = utf8_to_utf16.get(g_utf8_end).max(g_utf16_start);
 
                 line_start_utf16 = line_start_utf16.min(g_utf16_start);
                 line_end_utf16 = line_end_utf16.max(g_utf16_end);
@@ -1132,11 +1249,15 @@ impl Paragraph {
                     .text_utf8
                     .get(g_utf8_start..g_utf8_end)
                     .unwrap_or_default();
-                let is_whitespace = !cluster_str.is_empty() && cluster_str.chars().all(char::is_whitespace);
+                let is_whitespace = if cluster_str.len() == 1 {
+                    cluster_str.as_bytes()[0].is_ascii_whitespace()
+                } else {
+                    !cluster_str.is_empty() && cluster_str.chars().all(char::is_whitespace)
+                };
                 if !is_whitespace {
                     line_end_no_ws_utf16 = line_end_no_ws_utf16.max(g_utf16_end);
                     current_word_w += glyph.w;
-                    self.min_intrinsic_width = self.min_intrinsic_width.max(current_word_w);
+                    min_intrinsic_width = min_intrinsic_width.max(current_word_w);
                 } else {
                     current_word_w = 0.0;
                 }
@@ -1144,7 +1265,7 @@ impl Paragraph {
                 let glyph_x_local = align_dx + glyph.x + extra_placeholder_dx;
 
                 // Handle inline widget placeholder character ('\u{FFFC}').
-                if cluster_str == "\u{FFFC}" {
+                if has_placeholders && cluster_str == "\u{FFFC}" {
                     if let Some(ph) = self
                         .placeholders
                         .iter()
@@ -1166,8 +1287,8 @@ impl Paragraph {
                         };
                         let ph_rect =
                             Rect::from_xywh(glyph_x_local, ph_top, ph.span.width, ph.span.height);
-                        self.placeholder_boxes.push((ph_rect, ph.text_direction));
-                        self.glyph_clusters.push(PositionedGlyphCluster {
+                        placeholder_boxes.push((ph_rect, ph.text_direction));
+                        glyph_clusters.push(PositionedGlyphCluster {
                             bounds: ph_rect,
                             utf16_start: g_utf16_start,
                             utf16_end: g_utf16_end,
@@ -1184,7 +1305,7 @@ impl Paragraph {
                 let cluster_w = glyph.w.max(1.0);
                 let cluster_rect =
                     Rect::from_xywh(glyph_x_local, line_top, cluster_w, line_bottom - line_top);
-                self.glyph_clusters.push(PositionedGlyphCluster {
+                glyph_clusters.push(PositionedGlyphCluster {
                     bounds: cluster_rect,
                     utf16_start: g_utf16_start,
                     utf16_end: g_utf16_end,
@@ -1192,26 +1313,29 @@ impl Paragraph {
                     is_ltr: glyph.level.is_ltr(),
                 });
 
-                if let Some(last_span) = span_line_bounds.last_mut() {
-                    if last_span.0 == span_idx {
-                        last_span.1 = last_span.1.min(glyph_x_local);
-                        last_span.2 = last_span.2.max(glyph_x_local + glyph.w);
+                if has_bg_or_decoration {
+                    if let Some(last_span) = span_line_bounds.last_mut() {
+                        if last_span.0 == span_idx {
+                            last_span.1 = last_span.1.min(glyph_x_local);
+                            last_span.2 = last_span.2.max(glyph_x_local + glyph.w);
+                        } else {
+                            span_line_bounds.push((
+                                span_idx,
+                                glyph_x_local,
+                                glyph_x_local + glyph.w,
+                            ));
+                        }
                     } else {
-                        span_line_bounds.push((
-                            span_idx,
-                            glyph_x_local,
-                            glyph_x_local + glyph.w,
-                        ));
+                        span_line_bounds.push((span_idx, glyph_x_local, glyph_x_local + glyph.w));
                     }
-                } else {
-                    span_line_bounds.push((span_idx, glyph_x_local, glyph_x_local + glyph.w));
                 }
 
                 let gx = glyph_x_local + glyph.font_size * glyph.x_offset;
                 let gy = baseline_y + (glyph.y - glyph.font_size * glyph.y_offset).trunc();
                 let (int_pos, subpixel_pos) = SubpixelPosition::quantize(Point::new(gx, gy));
 
-                let resolved_builtin = ctx.builtin_for_id(glyph.font_id, BuiltinFont::RobotoRegular);
+                let resolved_builtin =
+                    ctx.builtin_for_id(glyph.font_id, BuiltinFont::RobotoRegular);
                 let scaled_font = ScaledFont::new(resolved_builtin, glyph.font_size);
                 let pair = FontGlyphPair::new(scaled_font, glyph.glyph_id, subpixel_pos);
 
@@ -1233,8 +1357,8 @@ impl Paragraph {
                     .foreground_paint_color
                     .unwrap_or(span.style.color);
 
-                self.uses_alpha |= !is_color;
-                self.uses_color |= is_color;
+                uses_alpha |= !is_color;
+                uses_color |= is_color;
 
                 for shadow in &span.style.shadows {
                     let shadow_dest = Rect::from_xywh(
@@ -1243,11 +1367,11 @@ impl Paragraph {
                         dest_rect.size.width,
                         dest_rect.size.height,
                     );
-                    self.quad_bounds = Some(match self.quad_bounds {
+                    quad_bounds = Some(match quad_bounds {
                         Some(prev) => prev.union(shadow_dest),
                         None => shadow_dest,
                     });
-                    self.quads.push(AtlasGlyphQuad {
+                    quads.push(AtlasGlyphQuad {
                         dest_rect: shadow_dest,
                         atlas_rect,
                         color: shadow.color,
@@ -1255,11 +1379,11 @@ impl Paragraph {
                     });
                 }
 
-                self.quad_bounds = Some(match self.quad_bounds {
+                quad_bounds = Some(match quad_bounds {
                     Some(prev) => prev.union(dest_rect),
                     None => dest_rect,
                 });
-                self.quads.push(AtlasGlyphQuad {
+                quads.push(AtlasGlyphQuad {
                     dest_rect,
                     atlas_rect,
                     color: glyph_color,
@@ -1276,7 +1400,7 @@ impl Paragraph {
                 let span_style = &self.spans[span_idx].style;
                 if let Some(bg_color) = span_style.background_paint_color {
                     if bg_color.alpha > 0.0 {
-                        self.background_rects.push((
+                        background_rects.push((
                             Rect::from_xywh(sx0, line_top, sw, line_bottom - line_top),
                             bg_color,
                         ));
@@ -1293,14 +1417,14 @@ impl Paragraph {
                     // 0x1 = Underline
                     if (span_style.decoration & 0x1) != 0 {
                         let r = Rect::from_xywh(sx0, baseline_y + 1.0, sw, thickness);
-                        self.background_rects.push((r, dec_color));
-                        self.decoration_rects.push((r, dec_color));
+                        background_rects.push((r, dec_color));
+                        decoration_rects.push((r, dec_color));
                     }
                     // 0x2 = Overline
                     if (span_style.decoration & 0x2) != 0 {
                         let r = Rect::from_xywh(sx0, line_top, sw, thickness);
-                        self.background_rects.push((r, dec_color));
-                        self.decoration_rects.push((r, dec_color));
+                        background_rects.push((r, dec_color));
+                        decoration_rects.push((r, dec_color));
                     }
                     // 0x4 = LineThrough
                     if (span_style.decoration & 0x4) != 0 {
@@ -1310,14 +1434,14 @@ impl Paragraph {
                             sw,
                             thickness,
                         );
-                        self.background_rects.push((r, dec_color));
-                        self.decoration_rects.push((r, dec_color));
+                        background_rects.push((r, dec_color));
+                        decoration_rects.push((r, dec_color));
                     }
                 }
             }
 
             if line_start_utf16 == usize::MAX {
-                let para_start_utf16 = self.utf8_to_utf16[para_range.start];
+                let para_start_utf16 = utf8_to_utf16.get(para_range.start);
                 line_start_utf16 = para_start_utf16;
                 line_end_utf16 = para_start_utf16;
                 line_end_no_ws_utf16 = para_start_utf16;
@@ -1326,7 +1450,7 @@ impl Paragraph {
                 line_end_no_ws_utf16 = line_start_utf16;
             }
 
-            let para_end_utf16 = self.utf8_to_utf16[para_range.end];
+            let para_end_utf16 = utf8_to_utf16.get(para_range.end);
             let has_hard_break = line_end_utf16 == para_end_utf16
                 && self
                     .text_utf8
@@ -1342,7 +1466,7 @@ impl Paragraph {
                 } else {
                     1
                 };
-                self.utf8_to_utf16[(para_range.end + nl_bytes).min(self.text_utf8.len())]
+                utf8_to_utf16.get((para_range.end + nl_bytes).min(self.text_utf8.len()))
             } else {
                 line_end_utf16
             };
@@ -1350,7 +1474,7 @@ impl Paragraph {
             let ascent = (baseline_y - line_top).max(1.0);
             let descent = (line_bottom - baseline_y).max(1.0);
 
-            self.lines.push(ParagraphLineMetrics {
+            lines.push(ParagraphLineMetrics {
                 hard_break: has_hard_break,
                 ascent,
                 descent,
@@ -1367,47 +1491,57 @@ impl Paragraph {
             });
         }
 
-        if self.lines.is_empty() {
-            self.height = default_line_h.round();
-            self.alphabetic_baseline = default_ascent.round();
-            self.ideographic_baseline = self.height;
+        SHAPED_BUFFER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= MAX_SHAPED_BUFFER_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(shaping_hash, shaped);
+        });
+
+        let (height, alphabetic_baseline, ideographic_baseline) = if lines.is_empty() {
+            let h = default_line_h.round();
+            (h, default_ascent.round(), h)
         } else {
-            self.height = last_line_bottom.ceil();
-            self.alphabetic_baseline = self.lines[0].baseline;
-            self.ideographic_baseline = self.lines[0].baseline + self.lines[0].descent;
-        }
+            (
+                last_line_bottom.ceil(),
+                lines[0].baseline,
+                lines[0].baseline + lines[0].descent,
+            )
+        };
 
         if !finite_width {
-            self.width = self.longest_line.ceil();
+            width = longest_line.ceil();
         }
-        self.max_intrinsic_width = self.max_intrinsic_width.max(self.longest_line);
-        self.min_intrinsic_width = self.min_intrinsic_width.min(self.max_intrinsic_width);
+        max_intrinsic_width = max_intrinsic_width.max(longest_line);
+        min_intrinsic_width = min_intrinsic_width.min(max_intrinsic_width);
+
+        let cached = Arc::new(CachedParagraphLayout {
+            quads,
+            background_rects,
+            decoration_rects,
+            lines,
+            placeholder_boxes,
+            glyph_clusters,
+            width,
+            height,
+            longest_line,
+            min_intrinsic_width,
+            max_intrinsic_width,
+            alphabetic_baseline,
+            ideographic_baseline,
+            did_exceed_max_lines,
+            quad_bounds,
+            uses_alpha,
+            uses_color,
+        });
 
         if ctx.paragraph_layout_cache.len() >= MAX_PARAGRAPH_LAYOUT_CACHE_ENTRIES {
             ctx.paragraph_layout_cache.clear();
         }
-        ctx.paragraph_layout_cache.insert(
-            layout_hash,
-            Arc::new(CachedParagraphLayout {
-                quads: self.quads.clone(),
-                background_rects: self.background_rects.clone(),
-                decoration_rects: self.decoration_rects.clone(),
-                lines: self.lines.clone(),
-                placeholder_boxes: self.placeholder_boxes.clone(),
-                glyph_clusters: self.glyph_clusters.clone(),
-                width: self.width,
-                height: self.height,
-                longest_line: self.longest_line,
-                min_intrinsic_width: self.min_intrinsic_width,
-                max_intrinsic_width: self.max_intrinsic_width,
-                alphabetic_baseline: self.alphabetic_baseline,
-                ideographic_baseline: self.ideographic_baseline,
-                did_exceed_max_lines: self.did_exceed_max_lines,
-                quad_bounds: self.quad_bounds,
-                uses_alpha: self.uses_alpha,
-                uses_color: self.uses_color,
-            }),
-        );
+        ctx.paragraph_layout_cache
+            .insert(layout_hash, Arc::clone(&cached));
+        self.layout_data = cached;
         self.has_laid_out = true;
         self.laid_out_epoch = ctx.cache_epoch;
         self.last_layout_finite = finite_width;
@@ -1466,9 +1600,10 @@ impl Paragraph {
     }
 
     pub fn get_glyph_info_at(&self, code_unit_offset: usize) -> Option<GlyphInfo> {
-        let cluster = self.glyph_clusters.iter().find(|c| {
-            code_unit_offset >= c.utf16_start && code_unit_offset < c.utf16_end
-        })?;
+        let cluster = self
+            .glyph_clusters
+            .iter()
+            .find(|c| code_unit_offset >= c.utf16_start && code_unit_offset < c.utf16_end)?;
         Some(GlyphInfo {
             grapheme_cluster_bounds: cluster.bounds,
             grapheme_cluster_code_unit_range_start: cluster.utf16_start,
@@ -1521,12 +1656,14 @@ impl Paragraph {
         let total_utf16 = self.text_utf16.len();
         let clamped_pos = char_pos.min(total_utf16.saturating_sub(1));
 
+        let mut u16_pos = 0usize;
         let chars: Vec<(usize, usize, char)> = self
             .text_utf8
-            .char_indices()
-            .map(|(byte_i, ch)| {
-                let u16_start = self.utf8_to_utf16[byte_i];
+            .chars()
+            .map(|ch| {
+                let u16_start = u16_pos;
                 let u16_end = u16_start + ch.len_utf16();
+                u16_pos = u16_end;
                 (u16_start, u16_end, ch)
             })
             .collect();
@@ -1644,7 +1781,8 @@ mod tests {
     #[test]
     fn test_register_font_bytes_and_codepoint_coverage() {
         let mut ctx = TypographerContext::new();
-        let ids = ctx.register_font_bytes(MATERIAL_ICONS_OTF, Some("packages/custom/MaterialIcons"));
+        let ids =
+            ctx.register_font_bytes(MATERIAL_ICONS_OTF, Some("packages/custom/MaterialIcons"));
         assert!(!ids.is_empty());
 
         let chart_cp = MaterialIcon::ShowChart.codepoint() as u32;
@@ -1825,6 +1963,7 @@ mod tests {
         p2.layout(&mut ctx, 260.0);
         assert!(p2.has_laid_out);
         assert_eq!(ctx.cached_paragraph_layout_count(), 1);
+        assert!(Arc::ptr_eq(&p1.layout_data, &p2.layout_data));
         assert_eq!(p2.quads, p1_quads);
         assert_abs_diff_eq!(p2.longest_line, p1_longest);
 
@@ -1867,7 +2006,9 @@ mod tests {
         assert!(!p1.uses_color);
 
         p1.layout(&mut ctx, 320.0);
-        let bounds = p1.quad_bounds.expect("laid-out paragraph must have quad_bounds");
+        let bounds = p1
+            .quad_bounds
+            .expect("laid-out paragraph must have quad_bounds");
         assert!(bounds.get_width() > 50.0);
         assert!(bounds.get_height() > 10.0);
         assert!(p1.uses_alpha);
@@ -1890,5 +2031,55 @@ mod tests {
         assert_eq!(p2.quad_bounds, Some(expected_union));
         assert!(p2.uses_alpha);
         assert!(!p2.uses_color);
+    }
+
+    /// C++ source: typographer_unittests.cc:ParagraphShapedBufferCacheReusesShapingAcrossOscillatingWidths
+    #[test]
+    fn test_paragraph_shaped_buffer_cache_reuses_shaping_across_oscillating_widths() {
+        let mut ctx = TypographerContext::new();
+        SHAPED_BUFFER_CACHE.with(|c| c.borrow_mut().clear());
+
+        let build_sample = || {
+            let mut style = ParagraphStyle::default();
+            style.default_text_style.set_font_size(16.0);
+            let mut b = ParagraphBuilder::new(style);
+            b.add_text("Oscillating container width reuses HarfBuzz shaping across frames");
+            b.build()
+        };
+
+        // First layout at width 320.0 populates SHAPED_BUFFER_CACHE.
+        let mut p_wide = build_sample();
+        p_wide.layout(&mut ctx, 320.0);
+        let wide_hash = p_wide.compute_shaping_hash(&ctx);
+        let cached_after_first = SHAPED_BUFFER_CACHE.with(|c| c.borrow().contains_key(&wide_hash));
+        assert!(cached_after_first);
+
+        // Second layout at oscillating width 140.0 reuses SHAPED_BUFFER_CACHE via Buffer::set_size relayout.
+        let mut p_narrow_reused = build_sample();
+        p_narrow_reused.layout(&mut ctx, 140.0);
+        assert!(p_narrow_reused.lines.len() > p_wide.lines.len());
+
+        // Compare against a cold layout at 140.0 with both caches cleared.
+        SHAPED_BUFFER_CACHE.with(|c| c.borrow_mut().clear());
+        ctx.clear_caches();
+        let mut p_narrow_cold = build_sample();
+        p_narrow_cold.layout(&mut ctx, 140.0);
+
+        assert_eq!(p_narrow_reused.lines.len(), p_narrow_cold.lines.len());
+        assert_eq!(p_narrow_reused.quads.len(), p_narrow_cold.quads.len());
+        for (a, b) in p_narrow_reused.quads.iter().zip(p_narrow_cold.quads.iter()) {
+            assert_eq!(a.dest_rect, b.dest_rect);
+        }
+        assert_abs_diff_eq!(p_narrow_reused.longest_line, p_narrow_cold.longest_line);
+        assert_abs_diff_eq!(
+            p_narrow_reused.max_intrinsic_width,
+            p_narrow_cold.max_intrinsic_width
+        );
+
+        // Verify cache_epoch change invalidates shaping_hash.
+        let hash_before = p_narrow_cold.compute_shaping_hash(&ctx);
+        ctx.register_font_bytes(ROBOTO_BOLD_TTF, Some("DynamicFontAlias"));
+        let hash_after = p_narrow_cold.compute_shaping_hash(&ctx);
+        assert_ne!(hash_before, hash_after);
     }
 }

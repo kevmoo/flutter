@@ -1101,6 +1101,10 @@ impl DisplayListBuilder {
             ops: self.ops.clone(),
         }
     }
+
+    pub fn into_display_list(self) -> DisplayList {
+        DisplayList { ops: self.ops }
+    }
 }
 
 fn make_skew_matrix(sx: Scalar, sy: Scalar) -> Matrix {
@@ -2813,6 +2817,19 @@ impl Canvas {
             if let Some(top) = self.stack.last_mut() {
                 top.stencil_clips.push(pre_clip_scissor);
             }
+        }
+    }
+
+    /// Updates conservative device clip bounds for `path` without tessellating stencil clip geometry.
+    pub fn clip_path_bounds_only(&mut self, path: &Path, op: ClipOperation) {
+        if op == ClipOperation::Intersect {
+            let tx = self.get_current_transform();
+            let transformed = path
+                .get_bounding_box()
+                .filter(|b| !b.is_empty())
+                .and_then(|_| path.get_transformed_bounding_box(&tx))
+                .unwrap_or(Rect::ZERO);
+            self.apply_device_clip_rect(transformed, ClipOperation::Intersect);
         }
     }
 

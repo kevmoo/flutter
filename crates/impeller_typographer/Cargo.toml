@@ -3,6 +3,10 @@ name = "impeller_typographer"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["embedded-fonts"]
+embedded-fonts = []
+
 [dependencies]
 impeller_geometry.workspace = true
 impeller_path.workspace = true

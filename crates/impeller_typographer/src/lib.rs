@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cosmic_text::{
-    Attrs, Buffer, CacheKey, CacheKeyFlags, Command, Family, FontSystem, Metrics, Shaping,
-    Stretch, Style, SwashCache, SwashContent, Weight, Wrap,
+    Attrs, Buffer, CacheKey, CacheKeyFlags, Command, Family, FontSystem, Metrics, Shaping, Stretch,
+    Style, SwashCache, SwashContent, Weight, Wrap,
 };
 use impeller_geometry::{Color, IPoint, ISize, Point, Rect, Scalar};
 use impeller_path::{FillType, Path, PathBuilder};
@@ -24,10 +24,14 @@ use impeller_path::{FillType, Path, PathBuilder};
 pub use paragraph::*;
 pub use rectangle_packer::{AllocId, RectanglePacker, SkylineRectanglePacker};
 
+#[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
 pub const ROBOTO_REGULAR_TTF: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Regular.ttf");
+#[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
 pub const ROBOTO_BOLD_TTF: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Bold.ttf");
+#[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
 pub const ROBOTO_MONO_BOLD_TTF: &[u8] =
     include_bytes!("../../../assets/fonts/DejaVuSansMono-Bold.ttf");
+#[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
 pub const MATERIAL_ICONS_OTF: &[u8] =
     include_bytes!("../../../assets/fonts/MaterialIcons-Regular.otf");
 
@@ -427,6 +431,7 @@ impl Default for TypographerContext {
 
 const MAX_ATLAS_DIM: i64 = 8192;
 
+#[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
 fn load_embedded_face(
     db: &mut cosmic_text::fontdb::Database,
     bytes: &'static [u8],
@@ -478,22 +483,26 @@ impl TypographerContext {
         Self::with_atlas_sizes(1024, 512)
     }
 
-    /// Creates a [`TypographerContext`] with custom initial square dimensions for the
-    /// alpha and color glyph atlases (primarily useful for testing dynamic atlas growth).
-    pub fn with_atlas_sizes(alpha_dim: u32, color_dim: u32) -> Self {
+    /// Creates a [`TypographerContext`] without loading embedded font assets (`0` faces initially),
+    /// initializing placeholder font slots that are populated dynamically by [`Self::register_font_bytes`].
+    pub fn with_atlas_sizes_empty(alpha_dim: u32, color_dim: u32) -> Self {
         let mut db = cosmic_text::fontdb::Database::new();
-        let roboto_reg = load_embedded_face(&mut db, ROBOTO_REGULAR_TTF, false);
-        let roboto_bold = load_embedded_face(&mut db, ROBOTO_BOLD_TTF, false);
-        let roboto_mono_bold = load_embedded_face(&mut db, ROBOTO_MONO_BOLD_TTF, false);
-        let material_icons = load_embedded_face(&mut db, MATERIAL_ICONS_OTF, true);
-
-        db.set_sans_serif_family(roboto_reg.family.clone());
-        db.set_serif_family(roboto_reg.family.clone());
-        db.set_monospace_family(roboto_mono_bold.family.clone());
+        db.set_sans_serif_family("Roboto".to_string());
+        db.set_serif_family("Roboto".to_string());
+        db.set_monospace_family("Roboto".to_string());
 
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         let alpha_w = alpha_dim.max(16);
         let color_w = color_dim.max(16);
+        let dummy_id = cosmic_text::fontdb::ID::dummy();
+
+        let make_placeholder = |family: &str, weight: Weight| RegisteredFont {
+            id: dummy_id,
+            family: family.to_string(),
+            weight,
+            style: Style::Normal,
+            stretch: Stretch::Normal,
+        };
 
         Self {
             alpha_atlas: GlyphAtlas::new(GlyphAtlasType::AlphaBitmap, alpha_w, alpha_w),
@@ -506,7 +515,51 @@ impl TypographerContext {
             cache_epoch: 1,
             font_system,
             swash_cache: SwashCache::new(),
-            fonts: [roboto_reg, roboto_bold, roboto_mono_bold, material_icons],
+            fonts: [
+                make_placeholder("Roboto", Weight::NORMAL),
+                make_placeholder("Roboto", Weight::BOLD),
+                make_placeholder("Roboto", Weight::BOLD),
+                make_placeholder("MaterialIcons", Weight::NORMAL),
+            ],
+        }
+    }
+
+    /// Creates a [`TypographerContext`] with custom initial square dimensions for the
+    /// alpha and color glyph atlases (primarily useful for testing dynamic atlas growth).
+    pub fn with_atlas_sizes(alpha_dim: u32, color_dim: u32) -> Self {
+        #[cfg(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test))]
+        {
+            let mut db = cosmic_text::fontdb::Database::new();
+            let roboto_reg = load_embedded_face(&mut db, ROBOTO_REGULAR_TTF, false);
+            let roboto_bold = load_embedded_face(&mut db, ROBOTO_BOLD_TTF, false);
+            let roboto_mono_bold = load_embedded_face(&mut db, ROBOTO_MONO_BOLD_TTF, false);
+            let material_icons = load_embedded_face(&mut db, MATERIAL_ICONS_OTF, true);
+
+            db.set_sans_serif_family(roboto_reg.family.clone());
+            db.set_serif_family(roboto_reg.family.clone());
+            db.set_monospace_family(roboto_mono_bold.family.clone());
+
+            let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+            let alpha_w = alpha_dim.max(16);
+            let color_w = color_dim.max(16);
+
+            Self {
+                alpha_atlas: GlyphAtlas::new(GlyphAtlasType::AlphaBitmap, alpha_w, alpha_w),
+                color_atlas: GlyphAtlas::new(GlyphAtlasType::ColorBitmap, color_w, color_w),
+                alpha_packer: RectanglePacker::new(i64::from(alpha_w), i64::from(alpha_w)),
+                color_packer: RectanglePacker::new(i64::from(color_w), i64::from(color_w)),
+                glyph_cache: HashMap::new(),
+                paragraph_layout_cache: HashMap::new(),
+                resolved_font_cache: HashMap::new(),
+                cache_epoch: 1,
+                font_system,
+                swash_cache: SwashCache::new(),
+                fonts: [roboto_reg, roboto_bold, roboto_mono_bold, material_icons],
+            }
+        }
+        #[cfg(not(any(all(feature = "embedded-fonts", not(target_arch = "wasm32")), test)))]
+        {
+            Self::with_atlas_sizes_empty(alpha_dim, color_dim)
         }
     }
 
@@ -593,9 +646,7 @@ impl TypographerContext {
                 db.remove_face(raw_id);
                 face.id = cosmic_text::fontdb::ID::dummy();
                 db.push_face_info(face.clone());
-                db.faces()
-                    .last()
-                    .map_or(raw_id, |inserted| inserted.id)
+                db.faces().last().map_or(raw_id, |inserted| inserted.id)
             } else {
                 raw_id
             };
@@ -618,6 +669,91 @@ impl TypographerContext {
                     style: face.style,
                     stretch: face.stretch,
                 };
+            } else if !is_icon_font {
+                let primary_fam = alias_trimmed
+                    .map(str::to_string)
+                    .or_else(|| face.families.first().map(|(n, _)| n.clone()))
+                    .unwrap_or_else(|| "Roboto".to_string());
+                let reg_entry = RegisteredFont {
+                    id: resolved_id,
+                    family: primary_fam.clone(),
+                    weight: face.weight,
+                    style: face.style,
+                    stretch: face.stretch,
+                };
+
+                let matches_mono = alias_trimmed.is_some_and(|a| {
+                    let lower = a.to_ascii_lowercase();
+                    lower == "monospace"
+                        || lower == "robotomono"
+                        || lower == "roboto mono"
+                        || lower.contains("dejavu")
+                        || lower.contains("courier")
+                }) || (alias_trimmed.is_none() && face.monospaced);
+
+                let matches_roboto = alias_trimmed
+                    .is_some_and(|a| a.eq_ignore_ascii_case("Roboto"))
+                    || (alias_trimmed.is_none()
+                        && face
+                            .families
+                            .iter()
+                            .any(|(n, _)| n.eq_ignore_ascii_case("Roboto")));
+
+                if matches_mono {
+                    self.fonts[2] = reg_entry.clone();
+                    self.font_system
+                        .db_mut()
+                        .set_monospace_family(primary_fam.clone());
+                }
+
+                if matches_roboto {
+                    if face.weight.0 >= 600 {
+                        self.fonts[1] = reg_entry.clone();
+                        if self.fonts[0].id == cosmic_text::fontdb::ID::dummy() {
+                            self.fonts[0] = reg_entry.clone();
+                            self.font_system
+                                .db_mut()
+                                .set_sans_serif_family(primary_fam.clone());
+                            self.font_system
+                                .db_mut()
+                                .set_serif_family(primary_fam.clone());
+                        }
+                    } else {
+                        self.fonts[0] = reg_entry.clone();
+                        self.font_system
+                            .db_mut()
+                            .set_sans_serif_family(primary_fam.clone());
+                        self.font_system
+                            .db_mut()
+                            .set_serif_family(primary_fam.clone());
+                        if self.fonts[1].id == cosmic_text::fontdb::ID::dummy()
+                            || self.fonts[1].weight.0 < 600
+                        {
+                            self.fonts[1] = reg_entry.clone();
+                        }
+                    }
+                    if self.fonts[2].id == cosmic_text::fontdb::ID::dummy()
+                        || self.fonts[2].family.eq_ignore_ascii_case("Roboto")
+                    {
+                        self.fonts[2] = reg_entry;
+                        self.font_system.db_mut().set_monospace_family(primary_fam);
+                    }
+                } else if self.fonts[0].id == cosmic_text::fontdb::ID::dummy() {
+                    self.fonts[0] = reg_entry.clone();
+                    self.font_system
+                        .db_mut()
+                        .set_sans_serif_family(primary_fam.clone());
+                    self.font_system
+                        .db_mut()
+                        .set_serif_family(primary_fam.clone());
+                    if self.fonts[1].id == cosmic_text::fontdb::ID::dummy() {
+                        self.fonts[1] = reg_entry.clone();
+                    }
+                    if self.fonts[2].id == cosmic_text::fontdb::ID::dummy() {
+                        self.fonts[2] = reg_entry;
+                        self.font_system.db_mut().set_monospace_family(primary_fam);
+                    }
+                }
             }
 
             final_ids.push(resolved_id);
@@ -804,12 +940,8 @@ impl TypographerContext {
         self.alpha_atlas.generation = self.alpha_atlas.generation.wrapping_add(1);
         self.alpha_atlas.mark_dirty_rows(packed.y, padded_h);
 
-        let atlas_rect = Rect::from_xywh(
-            dst_x as Scalar,
-            dst_y as Scalar,
-            w as Scalar,
-            h as Scalar,
-        );
+        let atlas_rect =
+            Rect::from_xywh(dst_x as Scalar, dst_y as Scalar, w as Scalar, h as Scalar);
         let val = (atlas_rect, false, bearing, size);
         self.glyph_cache.insert(key, val);
         val
@@ -873,7 +1005,11 @@ impl TypographerContext {
             let pts = &polyline.points[contour.start_index..contour.end_index];
             for i in 0..pts.len() {
                 let p0 = pts[i];
-                let p1 = if i + 1 < pts.len() { pts[i + 1] } else { pts[0] };
+                let p1 = if i + 1 < pts.len() {
+                    pts[i + 1]
+                } else {
+                    pts[0]
+                };
                 if (p1.y - p0.y).abs() > 1e-6 {
                     edges.push((p0, p1));
                 }
@@ -889,8 +1025,7 @@ impl TypographerContext {
         for row in 0..h_usize {
             accum.fill(0.0);
             for sub in 0..8 {
-                let scan_y =
-                    (min_y as Scalar) + (row as Scalar) + ((sub as Scalar) + 0.5) * 0.125;
+                let scan_y = (min_y as Scalar) + (row as Scalar) + ((sub as Scalar) + 0.5) * 0.125;
                 crossings.clear();
                 for &(p0, p1) in &edges {
                     let (y0, y1, x0, x1, dir) = if p0.y < p1.y {
@@ -921,8 +1056,7 @@ impl TypographerContext {
                             let lx1 = (x - min_x as Scalar).clamp(0.0, w as Scalar);
                             if lx1 > lx0 {
                                 let col_start = (lx0.floor() as usize).min(w_usize - 1);
-                                let col_end =
-                                    (lx1.ceil() as usize).min(w_usize).max(col_start + 1);
+                                let col_end = (lx1.ceil() as usize).min(w_usize).max(col_start + 1);
                                 for (col, acc) in
                                     accum.iter_mut().enumerate().take(col_end).skip(col_start)
                                 {
@@ -1054,12 +1188,8 @@ impl TypographerContext {
                 self.color_atlas.generation = self.color_atlas.generation.wrapping_add(1);
                 self.color_atlas.mark_dirty_rows(packed.y, padded_h);
 
-                let atlas_rect = Rect::from_xywh(
-                    dst_x as Scalar,
-                    dst_y as Scalar,
-                    w as Scalar,
-                    h as Scalar,
-                );
+                let atlas_rect =
+                    Rect::from_xywh(dst_x as Scalar, dst_y as Scalar, w as Scalar, h as Scalar);
                 let val = (atlas_rect, true, bearing, size);
                 self.glyph_cache.insert(key, val);
                 val
@@ -1091,9 +1221,8 @@ impl TypographerContext {
             longest_line = longest_line.max(run.line_w);
 
             let raw_baseline_y = (origin.y + run.line_y).ceil();
-            let y_pad = *first_line_y_pad.get_or_insert_with(|| {
-                (origin.y.ceil() + font_ceil - raw_baseline_y).max(0.0)
-            });
+            let y_pad = *first_line_y_pad
+                .get_or_insert_with(|| (origin.y.ceil() + font_ceil - raw_baseline_y).max(0.0));
             let baseline_y = raw_baseline_y + y_pad;
 
             for glyph in run.glyphs {
@@ -1192,11 +1321,7 @@ impl TypographerContext {
                     builder.quad_to(map_pt(cp.x, cp.y), map_pt(p.x, p.y));
                 }
                 Command::CurveTo(cp1, cp2, p) => {
-                    builder.cubic_to(
-                        map_pt(cp1.x, cp1.y),
-                        map_pt(cp2.x, cp2.y),
-                        map_pt(p.x, p.y),
-                    );
+                    builder.cubic_to(map_pt(cp1.x, cp1.y), map_pt(cp2.x, cp2.y), map_pt(p.x, p.y));
                 }
                 Command::Close => {
                     builder.close();
@@ -1239,16 +1364,12 @@ impl TypographerContext {
             }
 
             fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-                self.builder
-                    .quad_to(self.map_pt(x1, y1), self.map_pt(x, y));
+                self.builder.quad_to(self.map_pt(x1, y1), self.map_pt(x, y));
             }
 
             fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-                self.builder.cubic_to(
-                    self.map_pt(x1, y1),
-                    self.map_pt(x2, y2),
-                    self.map_pt(x, y),
-                );
+                self.builder
+                    .cubic_to(self.map_pt(x1, y1), self.map_pt(x2, y2), self.map_pt(x, y));
             }
 
             fn close(&mut self) {
@@ -1847,7 +1968,11 @@ mod tests {
                     sum += u64::from(ctx.alpha_atlas.pixels[(y0 + r) * stride + (x0 + c)]);
                 }
             }
-            assert!(sum > 0, "glyph quad {:?} has empty atlas pixels after grow", q);
+            assert!(
+                sum > 0,
+                "glyph quad {:?} has empty atlas pixels after grow",
+                q
+            );
         }
     }
 
@@ -2129,5 +2254,49 @@ mod tests {
             ctx.alpha_atlas.dirty_row_range_since(gen_after_grow),
             Some((0, 128))
         );
+    }
+
+    /// C++ source: typographer_unittests.cc:EmptyTypographerContextPopulatesFallbackSlotsOnRegisterFont
+    #[test]
+    fn test_typographer_context_empty_init_and_dynamic_fallback_slots() {
+        let mut ctx = TypographerContext::with_atlas_sizes_empty(512, 256);
+        assert_eq!(ctx.font_system.db().faces().count(), 0);
+
+        // Register only Roboto-Regular ("Roboto") and MaterialIcons ("MaterialIcons"), matching Flutter Web FontManifest.json.
+        let roboto_ids = ctx.register_font_bytes(ROBOTO_REGULAR_TTF, Some("Roboto"));
+        let icon_ids = ctx.register_font_bytes(MATERIAL_ICONS_OTF, Some("MaterialIcons"));
+        assert!(!roboto_ids.is_empty());
+        assert!(!icon_ids.is_empty());
+
+        // Fallback slots [0], [1], and [2] must all resolve to "Roboto" when Bold/Mono are not registered separately.
+        assert_eq!(ctx.fonts[0].family, "Roboto");
+        assert_eq!(ctx.fonts[1].family, "Roboto");
+        assert_eq!(ctx.fonts[2].family, "Roboto");
+        assert_eq!(ctx.fonts[3].family, "MaterialIcons");
+
+        // Regular, Bold, Monospace, and MaterialIcon shaping must all emit non-empty glyph quads.
+        let reg_frame = ctx.shape_text("Regular", TextStyle::default(), Point::ZERO);
+        let bold_frame = ctx.shape_text(
+            "Bold",
+            TextStyle {
+                font: BuiltinFont::RobotoBold,
+                ..TextStyle::default()
+            },
+            Point::ZERO,
+        );
+        let mono_frame = ctx.shape_text(
+            "Mono",
+            TextStyle {
+                font: BuiltinFont::RobotoMonoBold,
+                ..TextStyle::default()
+            },
+            Point::ZERO,
+        );
+        let icon_frame = ctx.shape_icon(MaterialIcon::Bolt, 24.0, Color::WHITE, Point::ZERO);
+
+        assert_eq!(reg_frame.quads.len(), 7);
+        assert_eq!(bold_frame.quads.len(), 4);
+        assert_eq!(mono_frame.quads.len(), 4);
+        assert_eq!(icon_frame.quads.len(), 1);
     }
 }

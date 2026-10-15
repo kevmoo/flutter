@@ -17,6 +17,18 @@ if [[ ! -f "${WASM_FILE}" ]]; then
   exit 1
 fi
 
+WASM_OPT="/usr/local/google/home/kevmoo/github/flutter/bin/cache/dart-sdk/bin/utils/wasm-opt"
+if [[ -x "${WASM_OPT}" ]]; then
+  echo "=== Optimizing raw Wasm with wasm-opt -Oz --traps-never-happen --converge ==="
+  "${WASM_OPT}" -Oz --traps-never-happen --converge \
+    --enable-bulk-memory \
+    --enable-threads \
+    --enable-nontrapping-float-to-int \
+    --enable-sign-ext \
+    --enable-mutable-globals \
+    "${WASM_FILE}" -o "${WASM_FILE}"
+fi
+
 echo "=== Generating wasm-bindgen ES module into ${OUT_DIR} ==="
 CARGO_TARGET_DIR="${TARGET_DIR}" cargo run --locked --release -p impeller_skwasm_ffi --bin bundle_skwasm_ffi -- "${WASM_FILE}" "${OUT_DIR}"
 

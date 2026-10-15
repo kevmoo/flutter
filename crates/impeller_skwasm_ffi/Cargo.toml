@@ -12,7 +12,7 @@ impeller_geometry.workspace = true
 impeller_path.workspace = true
 impeller_core.workspace = true
 impeller_tessellator.workspace = true
-impeller_typographer.workspace = true
+impeller_typographer = { path = "../impeller_typographer", default-features = false }
 impeller_wgpu.workspace = true
 impeller_canvas.workspace = true
 wgpu.workspace = true
@@ -22,5 +22,6 @@ wasm-bindgen-futures.workspace = true
 web-sys.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+impeller_typographer = { path = "../impeller_typographer", features = ["embedded-fonts"] }
 wasm-bindgen-cli-support.workspace = true
 pollster.workspace = true

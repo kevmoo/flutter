@@ -51,3 +51,38 @@ impeller_wgpu = { path = "crates/impeller_wgpu" }
 impeller_canvas = { path = "crates/impeller_canvas" }
 impeller_web = { path = "crates/impeller_web" }
 impeller_skwasm_ffi = { path = "crates/impeller_skwasm_ffi" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+
+[profile.release.package.impeller_geometry]
+opt-level = 3
+
+[profile.release.package.impeller_path]
+opt-level = 2
+
+[profile.release.package.impeller_core]
+opt-level = 2
+
+[profile.release.package.impeller_tessellator]
+opt-level = 3
+
+[profile.release.package.impeller_typographer]
+opt-level = 2
+
+[profile.release.package.impeller_wgpu]
+opt-level = "s"
+
+[profile.release.package.impeller_canvas]
+opt-level = 2
+
+[profile.release.package.cosmic-text]
+opt-level = "s"
+
+[profile.release.package.etagere]
+opt-level = 3
+
+[profile.release.package.kurbo]
+opt-level = "s"
