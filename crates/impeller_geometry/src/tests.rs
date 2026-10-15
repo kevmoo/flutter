@@ -240,14 +240,20 @@ fn point_to_segment() {
     let seg0 = Point::new(10.0, 10.0);
     let seg1 = Point::new(20.0, 10.0);
     // Left of segment
-    assert_scalar_near(Point::new(5.0, 10.0).get_distance_to_segment(seg0, seg1), 5.0);
+    assert_scalar_near(
+        Point::new(5.0, 10.0).get_distance_to_segment(seg0, seg1),
+        5.0,
+    );
     // On segment
     assert_scalar_near(
         Point::new(15.0, 10.0).get_distance_to_segment(seg0, seg1),
         0.0,
     );
     // 5 pixels above segment
-    assert_scalar_near(Point::new(15.0, 5.0).get_distance_to_segment(seg0, seg1), 5.0);
+    assert_scalar_near(
+        Point::new(15.0, 5.0).get_distance_to_segment(seg0, seg1),
+        5.0,
+    );
     assert_scalar_near(
         Point::new(15.0, 5.0).get_distance_to_segment_squared(seg0, seg1),
         25.0,
@@ -383,9 +389,7 @@ fn matrix_make_column() {
     );
     assert_eq!(
         matrix.m,
-        [
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
-        ]
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
     );
 }
 
@@ -486,8 +490,7 @@ fn matrix_determinant_test() {
 #[test]
 fn matrix_invert() {
     let inverted = Matrix::make_column(
-        10.0, -9.0, -12.0, 8.0, 7.0, -12.0, 11.0, 22.0, -10.0, 10.0, 3.0, 6.0, -2.0, 22.0, 2.0,
-        1.0,
+        10.0, -9.0, -12.0, 8.0, 7.0, -12.0, 11.0, 22.0, -10.0, 10.0, 3.0, 6.0, -2.0, 22.0, 2.0, 1.0,
     )
     .invert();
     let result = Matrix::make_column(
@@ -797,7 +800,10 @@ fn color_premultiply_and_unpremultiply() {
 /// C++ source: geometry_unittests.cc:ColorR8G8B8A8
 #[test]
 fn color_r8g8b8a8() {
-    assert_eq!(Color::new(1.0, 0.5, 0.2, 0.5).to_r8g8b8a8(), [255, 128, 51, 128]);
+    assert_eq!(
+        Color::new(1.0, 0.5, 0.2, 0.5).to_r8g8b8a8(),
+        [255, 128, 51, 128]
+    );
     assert_eq!(Color::TRANSPARENT.to_r8g8b8a8(), [0, 0, 0, 0]);
     assert_eq!(Color::WHITE.to_r8g8b8a8(), [255, 255, 255, 255]);
 }
@@ -1070,5 +1076,449 @@ fn rect_expand_and_union_intersection() {
     assert_eq!(
         rect.intersection(r2),
         Some(Rect::from_ltrb(150.0, 150.0, 200.0, 200.0))
+    );
+}
+
+#[derive(Default)]
+struct SpyPathReceiver {
+    moved: Vec<(Point, bool)>,
+    lines: Vec<Point>,
+    conics: Vec<(Point, Point, Scalar)>,
+    cubics: Vec<(Point, Point, Point)>,
+    closed_count: usize,
+}
+
+impl PathReceiver for SpyPathReceiver {
+    fn move_to(&mut self, p2: Point, will_be_closed: bool) {
+        self.moved.push((p2, will_be_closed));
+    }
+
+    fn line_to(&mut self, p2: Point) {
+        self.lines.push(p2);
+    }
+
+    fn conic_to(&mut self, cp: Point, p2: Point, weight: Scalar) -> bool {
+        self.conics.push((cp, p2, weight));
+        true
+    }
+
+    fn cubic_to(&mut self, cp1: Point, cp2: Point, p2: Point) {
+        self.cubics.push((cp1, cp2, p2));
+    }
+
+    fn close(&mut self) {
+        self.closed_count += 1;
+    }
+}
+
+fn check_point_with_offset(rse: &RoundSuperellipse, p: Point, outward_offset: Point) {
+    assert!(
+        rse.contains(p),
+        "expected {p:?} to be inside RoundSuperellipse"
+    );
+    assert!(
+        !rse.contains(p + outward_offset),
+        "expected {:?} (p + {outward_offset:?}) to be outside RoundSuperellipse",
+        p + outward_offset
+    );
+}
+
+/// C++ source: round_superellipse_unittests.cc:EmptyDeclaration
+#[test]
+fn round_superellipse_empty_declaration_and_default() {
+    let rse = RoundSuperellipse::new();
+    assert!(rse.is_empty());
+    assert!(!rse.is_rect());
+    assert!(!rse.is_oval());
+    assert!(rse.is_finite());
+    assert!(rse.get_bounds().is_empty());
+    assert_eq!(rse.get_bounds(), Rect::ZERO);
+    assert_eq!(rse.get_radii().top_left, Size::ZERO);
+    assert_eq!(rse.get_radii().top_right, Size::ZERO);
+    assert_eq!(rse.get_radii().bottom_left, Size::ZERO);
+    assert_eq!(rse.get_radii().bottom_right, Size::ZERO);
+
+    let rse_def = RoundSuperellipse::default();
+    assert_eq!(rse, rse_def);
+}
+
+/// C++ source: round_superellipse_unittests.cc:RectConstructor
+#[test]
+fn round_superellipse_rect_and_inverted_rect_construction() {
+    let empty_rect = RoundSuperellipse::make_rect(Rect::from_ltrb(20.0, 20.0, 20.0, 20.0));
+    assert!(empty_rect.is_empty());
+    assert!(!empty_rect.is_rect());
+    assert!(!empty_rect.is_oval());
+    assert!(empty_rect.is_finite());
+
+    let rse = RoundSuperellipse::make_rect(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0));
+    assert!(!rse.is_empty());
+    assert!(rse.is_rect());
+    assert!(!rse.is_oval());
+    assert!(rse.is_finite());
+    assert_eq!(rse.get_bounds(), Rect::from_ltrb(10.0, 10.0, 20.0, 20.0));
+    assert_eq!(rse.get_radii(), RoundingRadii::ZERO);
+
+    let inv = RoundSuperellipse::make_rect(Rect::from_ltrb(20.0, 20.0, 10.0, 10.0));
+    assert!(!inv.is_empty());
+    assert!(inv.is_rect());
+    assert_eq!(inv.get_bounds(), Rect::from_ltrb(10.0, 10.0, 20.0, 20.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:OvalConstructor
+#[test]
+fn round_superellipse_oval_and_inverted_oval_construction() {
+    let empty_oval =
+        RoundSuperellipse::make_rect_xy(Rect::from_ltrb(20.0, 20.0, 20.0, 20.0), 10.0, 10.0);
+    assert!(empty_oval.is_empty());
+    assert!(!empty_oval.is_oval());
+
+    let oval = RoundSuperellipse::make_oval(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0));
+    assert!(!oval.is_empty());
+    assert!(!oval.is_rect());
+    assert!(oval.is_oval());
+    assert!(oval.is_finite());
+    assert_eq!(oval.get_bounds(), Rect::from_ltrb(10.0, 10.0, 20.0, 20.0));
+    assert_eq!(oval.get_radii().top_left, Size::new(5.0, 5.0));
+    assert_eq!(oval.get_radii().top_right, Size::new(5.0, 5.0));
+    assert_eq!(oval.get_radii().bottom_left, Size::new(5.0, 5.0));
+    assert_eq!(oval.get_radii().bottom_right, Size::new(5.0, 5.0));
+
+    let inv_oval =
+        RoundSuperellipse::make_rect_xy(Rect::from_ltrb(20.0, 20.0, 10.0, 10.0), 10.0, 10.0);
+    assert!(inv_oval.is_oval());
+    assert_eq!(inv_oval.get_radii().top_left, Size::new(5.0, 5.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:RectRadiiOverflowWidthConstructor
+#[test]
+fn round_superellipse_rect_radii_and_overflow_scaling() {
+    let rse_r = RoundSuperellipse::make_rect_radius(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0), 2.0);
+    assert_eq!(rse_r.get_radii().top_left, Size::new(2.0, 2.0));
+
+    let rse_xy = RoundSuperellipse::make_rect_xy(Rect::from_ltrb(10.0, 10.0, 20.0, 20.0), 2.0, 3.0);
+    assert_eq!(rse_xy.get_radii().top_left, Size::new(2.0, 3.0));
+
+    let rse_size = RoundSuperellipse::make_rect_size(
+        Rect::from_ltrb(10.0, 10.0, 20.0, 20.0),
+        Size::new(2.0, 3.0),
+    );
+    assert_eq!(rse_size, rse_xy);
+
+    let overflow_radii = RoundingRadii::from_radii(
+        Size::new(1.0, 2.0),
+        Size::new(3.0, 4.0),
+        Size::new(5.0, 6.0),
+        Size::new(7.0, 8.0),
+    );
+
+    let rse_w =
+        RoundSuperellipse::make_rect_radii(Rect::from_xywh(10.0, 10.0, 6.0, 30.0), overflow_radii);
+    assert_eq!(rse_w.get_bounds(), Rect::from_ltrb(10.0, 10.0, 16.0, 40.0));
+    assert_eq!(rse_w.get_radii().top_left, Size::new(0.5, 1.0));
+    assert_eq!(rse_w.get_radii().top_right, Size::new(1.5, 2.0));
+    assert_eq!(rse_w.get_radii().bottom_left, Size::new(2.5, 3.0));
+    assert_eq!(rse_w.get_radii().bottom_right, Size::new(3.5, 4.0));
+
+    let rse_h =
+        RoundSuperellipse::make_rect_radii(Rect::from_xywh(10.0, 10.0, 30.0, 6.0), overflow_radii);
+    assert_eq!(rse_h.get_bounds(), Rect::from_ltrb(10.0, 10.0, 40.0, 16.0));
+    assert_eq!(rse_h.get_radii().top_left, Size::new(0.5, 1.0));
+    assert_eq!(rse_h.get_radii().top_right, Size::new(1.5, 2.0));
+    assert_eq!(rse_h.get_radii().bottom_left, Size::new(2.5, 3.0));
+    assert_eq!(rse_h.get_radii().bottom_right, Size::new(3.5, 4.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:ContractAndRequireRadiiAdjustment
+#[test]
+fn round_superellipse_shift_expand_and_contract() {
+    let radii = RoundingRadii::from_radii(
+        Size::new(1.0, 2.0),
+        Size::new(3.0, 4.0),
+        Size::new(5.0, 6.0),
+        Size::new(7.0, 8.0),
+    );
+    let rse = RoundSuperellipse::make_rect_radii(Rect::from_xywh(10.0, 10.0, 30.0, 30.0), radii);
+
+    let shifted = rse.shift(5.0, 6.0);
+    assert_eq!(
+        shifted.get_bounds(),
+        Rect::from_ltrb(15.0, 16.0, 45.0, 46.0)
+    );
+    assert_eq!(shifted.get_radii(), radii);
+
+    assert_eq!(
+        rse.expand(5.0).get_bounds(),
+        Rect::from_ltrb(5.0, 5.0, 45.0, 45.0)
+    );
+    assert_eq!(
+        rse.expand_xy(5.0, 6.0).get_bounds(),
+        Rect::from_ltrb(5.0, 4.0, 45.0, 46.0)
+    );
+    assert_eq!(
+        rse.expand_ltrb(5.0, 6.0, 7.0, 8.0).get_bounds(),
+        Rect::from_ltrb(5.0, 4.0, 47.0, 48.0)
+    );
+
+    assert_eq!(
+        rse.expand(-2.0).get_bounds(),
+        Rect::from_ltrb(12.0, 12.0, 38.0, 38.0)
+    );
+    assert_eq!(
+        rse.expand_xy(-1.0, -2.0).get_bounds(),
+        Rect::from_ltrb(11.0, 12.0, 39.0, 38.0)
+    );
+    assert_eq!(
+        rse.expand_ltrb(-1.0, -1.5, -2.0, -2.5).get_bounds(),
+        Rect::from_ltrb(11.0, 11.5, 38.0, 37.5)
+    );
+
+    let contracted_adj = rse.expand(-12.0);
+    assert_eq!(
+        contracted_adj.get_bounds(),
+        Rect::from_ltrb(22.0, 22.0, 28.0, 28.0)
+    );
+    assert_eq!(contracted_adj.get_radii().top_left, Size::new(0.5, 1.0));
+    assert_eq!(contracted_adj.get_radii().top_right, Size::new(1.5, 2.0));
+    assert_eq!(contracted_adj.get_radii().bottom_left, Size::new(2.5, 3.0));
+    assert_eq!(contracted_adj.get_radii().bottom_right, Size::new(3.5, 4.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:NoCornerRoundSuperellipseContains
+#[test]
+fn round_superellipse_no_corner_and_tiny_corner_contains() {
+    let bounds = Rect::from_ltrb(-50.0, -50.0, 50.0, 50.0);
+    let no_corners =
+        RoundSuperellipse::make_rect_radii(bounds, RoundingRadii::make_radii(Size::new(0.0, 0.0)));
+
+    assert!(no_corners.contains(Point::new(-50.0, -50.0)));
+    assert!(no_corners.contains(Point::new(-50.0, 49.99)));
+    assert!(no_corners.contains(Point::new(49.99, -50.0)));
+    assert!(no_corners.contains(Point::new(49.99, 49.99)));
+    assert!(!no_corners.contains(Point::new(-50.01, -50.0)));
+    assert!(!no_corners.contains(Point::new(-50.0, -50.01)));
+    assert!(!no_corners.contains(Point::new(-50.01, 50.0)));
+    assert!(!no_corners.contains(Point::new(-50.0, 50.01)));
+    assert!(!no_corners.contains(Point::new(50.01, -50.0)));
+    assert!(!no_corners.contains(Point::new(50.0, -50.01)));
+    assert!(!no_corners.contains(Point::new(50.01, 50.0)));
+    assert!(!no_corners.contains(Point::new(50.0, 50.01)));
+
+    let tiny_corners = RoundSuperellipse::make_rect_radii(
+        bounds,
+        RoundingRadii::make_radii(Size::new(0.01, 0.01)),
+    );
+    assert!(!tiny_corners.contains(Point::new(-50.0, -50.0)));
+    assert!(!tiny_corners.contains(Point::new(-50.0, 50.0)));
+    assert!(!tiny_corners.contains(Point::new(50.0, -50.0)));
+    assert!(!tiny_corners.contains(Point::new(50.0, 50.0)));
+}
+
+/// C++ source: round_superellipse_unittests.cc:UniformSquareContains
+#[test]
+fn round_superellipse_uniform_square_contains() {
+    let bounds = Rect::from_ltrb(-50.0, -50.0, 50.0, 50.0);
+    let rr =
+        RoundSuperellipse::make_rect_radii(bounds, RoundingRadii::make_radii(Size::new(5.0, 5.0)));
+
+    let check_mirrors = |p: Point| {
+        check_point_with_offset(&rr, p, Point::new(0.02, 0.02));
+        check_point_with_offset(&rr, p * Point::new(1.0, -1.0), Point::new(0.02, -0.02));
+        check_point_with_offset(&rr, p * Point::new(-1.0, 1.0), Point::new(-0.02, 0.02));
+        check_point_with_offset(&rr, p * Point::new(-1.0, -1.0), Point::new(-0.02, -0.02));
+    };
+
+    check_mirrors(Point::new(0.0, 49.995));
+    check_mirrors(Point::new(44.245, 49.95));
+    check_mirrors(Point::new(45.72, 49.87));
+    check_mirrors(Point::new(48.53, 48.53));
+    check_mirrors(Point::new(49.87, 45.72));
+    check_mirrors(Point::new(49.95, 44.245));
+    check_mirrors(Point::new(49.995, 0.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:UniformEllipticalContains
+#[test]
+fn round_superellipse_uniform_elliptical_contains() {
+    let bounds = Rect::from_ltrb(-50.0, -50.0, 50.0, 50.0);
+    let rr =
+        RoundSuperellipse::make_rect_radii(bounds, RoundingRadii::make_radii(Size::new(5.0, 10.0)));
+
+    let check_mirrors = |p: Point| {
+        check_point_with_offset(&rr, p, Point::new(0.02, 0.02));
+        check_point_with_offset(&rr, p * Point::new(1.0, -1.0), Point::new(0.02, -0.02));
+        check_point_with_offset(&rr, p * Point::new(-1.0, 1.0), Point::new(-0.02, 0.02));
+        check_point_with_offset(&rr, p * Point::new(-1.0, -1.0), Point::new(-0.02, -0.02));
+    };
+
+    check_mirrors(Point::new(0.0, 49.995));
+    check_mirrors(Point::new(44.245, 49.911));
+    check_mirrors(Point::new(45.72, 49.75));
+    check_mirrors(Point::new(48.51, 47.07));
+    check_mirrors(Point::new(49.87, 41.44));
+    check_mirrors(Point::new(49.95, 38.49));
+    check_mirrors(Point::new(49.995, 0.0));
+}
+
+/// C++ source: round_superellipse_unittests.cc:UniformRectangularContains
+#[test]
+fn round_superellipse_uniform_rectangular_contains() {
+    let bounds = Rect::from_ltrb(0.0, 0.0, 50.0, 100.0);
+    let rr = RoundSuperellipse::make_rect_radii(
+        bounds,
+        RoundingRadii::make_radii(Size::new(23.0, 30.0)),
+    );
+    let center = bounds.get_center();
+
+    let check_mirrors = |p: Point| {
+        check_point_with_offset(
+            &rr,
+            (p - center) * Point::new(1.0, 1.0) + center,
+            Point::new(0.02, 0.02),
+        );
+        check_point_with_offset(
+            &rr,
+            (p - center) * Point::new(1.0, -1.0) + center,
+            Point::new(0.02, -0.02),
+        );
+        check_point_with_offset(
+            &rr,
+            (p - center) * Point::new(-1.0, 1.0) + center,
+            Point::new(-0.02, 0.02),
+        );
+        check_point_with_offset(
+            &rr,
+            (p - center) * Point::new(-1.0, -1.0) + center,
+            Point::new(-0.02, -0.02),
+        );
+    };
+
+    check_mirrors(Point::new(24.99, 99.99));
+    check_mirrors(Point::new(29.99, 99.64));
+    check_mirrors(Point::new(34.99, 98.06));
+    check_mirrors(Point::new(39.99, 94.73));
+    check_mirrors(Point::new(44.13, 89.99));
+    check_mirrors(Point::new(48.46, 79.99));
+    check_mirrors(Point::new(49.70, 69.99));
+    check_mirrors(Point::new(49.97, 59.99));
+    check_mirrors(Point::new(49.99, 49.99));
+}
+
+/// C++ source: round_superellipse_unittests.cc:SlimDiagonalContains
+#[test]
+fn round_superellipse_slim_diagonal_contains() {
+    let bounds = Rect::from_ltrb(-50.0, -50.0, 50.0, 50.0);
+    let rr = RoundSuperellipse::make_rect_radii(
+        bounds,
+        RoundingRadii::from_radii(
+            Size::new(1.0, 1.0),
+            Size::new(99.0, 99.0),
+            Size::new(99.0, 99.0),
+            Size::new(1.0, 1.0),
+        ),
+    );
+
+    assert!(rr.contains(Point::new(0.0, 0.0)));
+    assert!(!rr.contains(Point::new(-49.999, -49.999)));
+    assert!(!rr.contains(Point::new(-49.999, 49.999)));
+    assert!(!rr.contains(Point::new(49.999, 49.999)));
+    assert!(!rr.contains(Point::new(49.999, -49.999)));
+
+    check_point_with_offset(&rr, Point::new(-49.70, -49.70), Point::new(-0.02, -0.02));
+    check_point_with_offset(&rr, Point::new(49.70, 49.70), Point::new(0.02, 0.02));
+
+    let check_diagonal = |p: Point| {
+        check_point_with_offset(&rr, p, Point::new(0.02, -0.02));
+        check_point_with_offset(&rr, p * Point::new(-1.0, -1.0), Point::new(-0.02, 0.02));
+    };
+
+    check_diagonal(Point::new(-40.0, -49.59));
+    check_diagonal(Point::new(-20.0, -45.64));
+    check_diagonal(Point::new(0.0, -37.01));
+    check_diagonal(Point::new(20.0, -21.96));
+    check_diagonal(Point::new(21.05, -20.92));
+    check_diagonal(Point::new(40.0, 5.68));
+}
+
+/// C++ source: round_superellipse_unittests.cc:PointsOutsideOfSharpCorner
+#[test]
+fn round_superellipse_points_outside_of_sharp_corner() {
+    let bounds = Rect::from_ltrb(196.0, 0.0, 294.0, 28.0);
+    let rr = RoundSuperellipseParam::make_bounds_radii(
+        bounds,
+        RoundingRadii::from_radii(
+            Size::new(0.0, 0.0),
+            Size::new(3.0, 3.0),
+            Size::new(0.0, 0.0),
+            Size::new(3.0, 3.0),
+        ),
+    );
+    assert!(!rr.contains(Point::new(147.0, 14.0)));
+}
+
+/// C++ source: round_superellipse_unittests.cc:PathForRectangularRseWithShapeCornersShouldBeWithinBounds
+#[test]
+fn round_superellipse_path_for_rectangular_rse_with_sharp_corners_within_bounds() {
+    let bounds = Rect::from_ltrb(34.0, 242.0, 766.0, 358.0);
+    let rr = RoundSuperellipseParam::make_bounds_radii(
+        bounds,
+        RoundingRadii::from_radii(
+            Size::new(14.0, 14.0),
+            Size::new(14.0, 14.0),
+            Size::new(0.0, 0.0),
+            Size::new(0.0, 0.0),
+        ),
+    );
+    let mut spy = SpyPathReceiver::default();
+    rr.dispatch(&mut spy);
+
+    for p2 in spy.lines {
+        assert!(
+            bounds.contains_inclusive(p2),
+            "line_to endpoint {p2:?} outside {bounds:?}"
+        );
+    }
+    for (_cp1, _cp2, p2) in spy.cubics {
+        assert!(
+            bounds.contains_inclusive(p2),
+            "cubic_to endpoint {p2:?} outside {bounds:?}"
+        );
+    }
+    assert_eq!(spy.closed_count, 1);
+}
+
+/// C++ source: round_superellipse_unittests.cc:PathForLongRseShouldBeCorrect
+#[test]
+fn round_superellipse_path_for_long_rse_within_bounds() {
+    let bounds = Rect::from_ltrb(0.0, 0.0, 300.0, 100_000.0);
+    let rr = RoundSuperellipseParam::make_bounds_radius(bounds, 100.0);
+    let mut spy = SpyPathReceiver::default();
+    rr.dispatch(&mut spy);
+
+    for p2 in spy.lines {
+        assert!(bounds.contains_inclusive(p2));
+    }
+    for (cp1, cp2, p2) in spy.cubics {
+        assert!(bounds.contains_inclusive(cp1));
+        assert!(bounds.contains_inclusive(cp2));
+        assert!(bounds.contains_inclusive(p2));
+    }
+    for (cp, p2, _w) in spy.conics {
+        assert!(bounds.contains_inclusive(cp));
+        assert!(bounds.contains_inclusive(p2));
+    }
+    assert_eq!(spy.closed_count, 1);
+}
+
+/// C++ source: round_superellipse_param.cc:ComputeOctant
+#[test]
+fn round_superellipse_octant_evaluate_lame_matches_joint_points() {
+    let bounds = Rect::from_ltrb(0.0, 0.0, 100.0, 100.0);
+    let param = RoundSuperellipseParam::make_bounds_radius(bounds, 20.0);
+    let octant = param.top_right.top;
+    assert_point_near(octant.evaluate_lame(0.0), Point::new(0.0, octant.se_a));
+    assert_point_near(
+        octant.evaluate_lame(octant.se_max_theta),
+        octant.circle_start,
     );
 }

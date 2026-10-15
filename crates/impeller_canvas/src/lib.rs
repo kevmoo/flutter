@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub use impeller_geometry::{
-    BlendMode, Color, ColorMatrix, Matrix, Point, Radians, Rect, Scalar, Size, TileMode,
-    K_EH_CLOSE_ENOUGH,
+    BlendMode, Color, ColorMatrix, Matrix, Point, Radians, Rect, RoundSuperellipse,
+    RoundSuperellipseParam, Scalar, Size, TileMode, K_EH_CLOSE_ENOUGH,
 };
 pub use impeller_path::{Cap, FillType, Join, Path, PathBuilder, PathComponent, RoundingRadii};
 use impeller_tessellator::{
@@ -446,7 +446,7 @@ impl Paint {
 #[derive(Clone, Debug)]
 pub enum DisplayListOp {
     Save,
-    SaveLayer(Option<Rect>, Option<Paint>),
+    SaveLayer(Option<Rect>, Option<Paint>, Option<ImageFilter>),
     Restore,
     RestoreToCount(usize),
     Translate(Scalar, Scalar),
@@ -457,11 +457,13 @@ pub enum DisplayListOp {
     ResetTransform,
     ClipRect(Rect, ClipOperation),
     ClipRRect(Rect, RoundingRadii, ClipOperation),
+    ClipRoundSuperellipse(RoundSuperellipse, ClipOperation),
     ClipPath(Path, ClipOperation),
     DrawPaint(Paint),
     DrawColor(Color, BlendMode),
     DrawRect(Rect, Paint),
     DrawRRect(Rect, RoundingRadii, Paint),
+    DrawRoundSuperellipse(RoundSuperellipse, Paint),
     DrawDiffRRect(Rect, RoundingRadii, Rect, RoundingRadii, Paint),
     DrawOval(Rect, Paint),
     DrawCircle(Point, Scalar, Paint),
@@ -554,9 +556,13 @@ impl DisplayList {
             canvas.replay_stats.op_count += 1;
             match op {
                 DisplayListOp::Save => canvas.save(),
-                DisplayListOp::SaveLayer(bounds, paint) => {
+                DisplayListOp::SaveLayer(bounds, paint, backdrop_filter) => {
                     canvas.replay_stats.save_layer_count += 1;
-                    canvas.save_layer(*bounds, paint.as_ref());
+                    canvas.save_layer_with_backdrop(
+                        *bounds,
+                        paint.as_ref(),
+                        backdrop_filter.as_ref(),
+                    );
                 }
                 DisplayListOp::Restore => {
                     canvas.restore();
@@ -573,6 +579,9 @@ impl DisplayList {
                 DisplayListOp::ResetTransform => canvas.reset_transform(),
                 DisplayListOp::ClipRect(rect, op) => canvas.clip_rect_with_op(*rect, *op),
                 DisplayListOp::ClipRRect(rect, radii, op) => canvas.clip_rrect(*rect, *radii, *op),
+                DisplayListOp::ClipRoundSuperellipse(rse, op) => {
+                    canvas.clip_round_superellipse(*rse, *op)
+                }
                 DisplayListOp::ClipPath(path, op) => canvas.clip_path(path, *op),
                 DisplayListOp::DrawPaint(paint) => canvas.draw_paint(paint),
                 DisplayListOp::DrawColor(color, mode) => canvas.draw_color(*color, *mode),
@@ -580,6 +589,10 @@ impl DisplayList {
                 DisplayListOp::DrawRRect(rect, radii, paint) => {
                     canvas.replay_stats.rrect_count += 1;
                     canvas.draw_rrect(*rect, *radii, paint);
+                }
+                DisplayListOp::DrawRoundSuperellipse(rse, paint) => {
+                    canvas.replay_stats.rrect_count += 1;
+                    canvas.draw_round_superellipse(*rse, paint);
                 }
                 DisplayListOp::DrawDiffRRect(or, orad, ir, irad, paint) => {
                     canvas.replay_stats.drrect_count += 1;
@@ -716,7 +729,17 @@ impl DisplayListBuilder {
     }
 
     pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<Paint>) -> &mut Self {
-        self.ops.push(DisplayListOp::SaveLayer(bounds, paint));
+        self.save_layer_with_backdrop(bounds, paint, None)
+    }
+
+    pub fn save_layer_with_backdrop(
+        &mut self,
+        bounds: Option<Rect>,
+        paint: Option<Paint>,
+        backdrop_filter: Option<ImageFilter>,
+    ) -> &mut Self {
+        self.ops
+            .push(DisplayListOp::SaveLayer(bounds, paint, backdrop_filter));
         self
     }
 
@@ -776,6 +799,15 @@ impl DisplayListBuilder {
         self
     }
 
+    pub fn clip_round_superellipse(
+        &mut self,
+        rse: RoundSuperellipse,
+        op: ClipOperation,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::ClipRoundSuperellipse(rse, op));
+        self
+    }
+
     pub fn clip_path(&mut self, path: Path, op: ClipOperation) -> &mut Self {
         self.ops.push(DisplayListOp::ClipPath(path, op));
         self
@@ -798,6 +830,12 @@ impl DisplayListBuilder {
 
     pub fn draw_rrect(&mut self, rect: Rect, radii: RoundingRadii, paint: Paint) -> &mut Self {
         self.ops.push(DisplayListOp::DrawRRect(rect, radii, paint));
+        self
+    }
+
+    pub fn draw_round_superellipse(&mut self, rse: RoundSuperellipse, paint: Paint) -> &mut Self {
+        self.ops
+            .push(DisplayListOp::DrawRoundSuperellipse(rse, paint));
         self
     }
 
@@ -1868,6 +1906,7 @@ struct CanvasState {
     has_explicit_clip: bool,
     layer_start_cmd_index: Option<usize>,
     layer_paint: Option<Paint>,
+    layer_backdrop_filter: Option<ImageFilter>,
     layer_bounds_device: Option<Rect>,
     layer_clip_rect: Option<Rect>,
     stencil_clips: Vec<Option<Rect>>,
@@ -1919,6 +1958,7 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_backdrop_filter: None,
                 layer_bounds_device: None,
                 layer_clip_rect: None,
                 stencil_clips: Vec::new(),
@@ -1965,6 +2005,7 @@ impl Canvas {
             root.has_explicit_clip = false;
             root.layer_start_cmd_index = None;
             root.layer_paint = None;
+            root.layer_backdrop_filter = None;
             root.layer_bounds_device = None;
             root.layer_clip_rect = None;
             root.stencil_clips.clear();
@@ -1978,6 +2019,7 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_backdrop_filter: None,
                 layer_bounds_device: None,
                 layer_clip_rect: None,
                 stencil_clips: Vec::new(),
@@ -2417,6 +2459,7 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_backdrop_filter: None,
                 layer_bounds_device: None,
                 layer_clip_rect: None,
                 stencil_clips: Vec::new(),
@@ -2425,6 +2468,15 @@ impl Canvas {
     }
 
     pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<&Paint>) {
+        self.save_layer_with_backdrop(bounds, paint, None);
+    }
+
+    pub fn save_layer_with_backdrop(
+        &mut self,
+        bounds: Option<Rect>,
+        paint: Option<&Paint>,
+        backdrop_filter: Option<&ImageFilter>,
+    ) {
         let start_idx = self.commands.len();
         let tx = self.get_current_transform();
         let layer_clip_rect = self.current_scissor_rect();
@@ -2452,6 +2504,7 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: Some(start_idx),
                 layer_paint: paint.cloned(),
+                layer_backdrop_filter: backdrop_filter.cloned(),
                 layer_bounds_device,
                 layer_clip_rect,
                 stencil_clips: Vec::new(),
@@ -2489,7 +2542,9 @@ impl Canvas {
                         .unwrap_or_else(|| Paint::fill(Color::WHITE));
                     let layer_alpha = layer_paint.color.alpha.clamp(0.0, 1.0);
                     let layer_blend = layer_paint.blend_mode;
-                    let is_identity_layer = layer_paint.image_filter.is_none()
+                    let has_backdrop = popped.layer_backdrop_filter.is_some();
+                    let is_identity_layer = !has_backdrop
+                        && layer_paint.image_filter.is_none()
                         && layer_paint.color_filter.is_none()
                         && layer_blend == BlendMode::SrcOver
                         && layer_alpha >= 1.0 - 1e-4;
@@ -2515,7 +2570,8 @@ impl Canvas {
                             }
                         }
 
-                        let can_collapse = layer_paint.image_filter.is_none()
+                        let can_collapse = !has_backdrop
+                            && layer_paint.image_filter.is_none()
                             && !has_child_save_layer
                             && (visual_draw_count == 0
                                 || (visual_draw_count == 1
@@ -2666,6 +2722,10 @@ impl Canvas {
                                     .image_filter
                                     .as_ref()
                                     .map(ImageFilter::to_layer_image_filter),
+                                backdrop_filter: popped
+                                    .layer_backdrop_filter
+                                    .as_ref()
+                                    .map(ImageFilter::to_layer_image_filter),
                                 clip_rect: popped.layer_clip_rect,
                             });
                         }
@@ -2778,6 +2838,16 @@ impl Canvas {
                 top.stencil_clips.push(pre_clip_scissor);
             }
         }
+    }
+
+    pub fn clip_round_superellipse(&mut self, rse: RoundSuperellipse, op: ClipOperation) {
+        if rse.is_empty() || rse.is_rect() {
+            self.clip_rect_with_op(rse.bounds(), op);
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.add_round_superellipse(&rse);
+        self.clip_path(&pb.build(FillType::NonZero), op);
     }
 
     pub fn clip_path(&mut self, path: &Path, op: ClipOperation) {
@@ -3083,6 +3153,7 @@ impl Canvas {
                     blend_mode: paint.blend_mode,
                     color_filter: layer_cf.clone(),
                     image_filter: layer_if.clone(),
+                    backdrop_filter: None,
                     clip_rect,
                 });
             }
@@ -3464,6 +3535,38 @@ impl Canvas {
                 self.emit_mesh_with_clip_targets(mesh, draw_tx, paint, cov, &clip_targets);
             }
         }
+    }
+
+    pub fn draw_round_superellipse(&mut self, rse: RoundSuperellipse, paint: &Paint) {
+        if paint.style == DrawStyle::Fill && rse.is_empty() {
+            return;
+        }
+        if rse.is_rect() {
+            self.draw_rect(rse.bounds(), paint);
+            return;
+        }
+        if rse.is_oval() {
+            self.draw_oval(rse.bounds(), paint);
+            return;
+        }
+        let radii = rse.radii();
+        if paint.is_shadow_blur_draw_operation()
+            && radii.are_all_corners_same()
+            && radii.are_all_corners_circular()
+        {
+            let corner_radius = (radii.top_left.width + radii.top_left.height) * 0.5;
+            self.draw_rrect_shadow_with_blend(
+                rse.bounds(),
+                corner_radius,
+                paint.mask_blur_sigma,
+                paint.effective_solid_color(),
+                paint.blend_mode,
+            );
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.add_round_superellipse(&rse);
+        self.draw_path(&pb.build(FillType::NonZero), paint);
     }
 
     pub fn draw_diff_rrect(
@@ -3932,6 +4035,7 @@ impl Canvas {
                         blend_mode: paint.blend_mode,
                         color_filter: None,
                         image_filter: Some(imf.to_layer_image_filter()),
+                        backdrop_filter: None,
                         clip_rect: self.current_scissor_rect(),
                     });
                 }
@@ -4282,6 +4386,7 @@ impl Canvas {
                     blend_mode: paint.blend_mode,
                     color_filter: layer_cf.clone(),
                     image_filter: layer_if.clone(),
+                    backdrop_filter: None,
                     clip_rect,
                 });
             }
@@ -4416,6 +4521,7 @@ impl Canvas {
                     blend_mode: paint.blend_mode,
                     color_filter: layer_cf.clone(),
                     image_filter: layer_if.clone(),
+                    backdrop_filter: None,
                     clip_rect,
                 });
             }
@@ -4535,6 +4641,7 @@ impl Canvas {
                     blend_mode: effective_blend,
                     color_filter: layer_cf.clone(),
                     image_filter: layer_if.clone(),
+                    backdrop_filter: None,
                     clip_rect,
                 });
             }
@@ -4650,6 +4757,7 @@ impl Canvas {
                         blend_mode: paint.blend_mode,
                         color_filter: layer_cf.clone(),
                         image_filter: layer_if.clone(),
+                        backdrop_filter: None,
                         clip_rect,
                     });
                 }
@@ -4722,6 +4830,7 @@ impl Canvas {
                             blend_mode: paint.blend_mode,
                             color_filter: None,
                             image_filter: Some(imf.to_layer_image_filter()),
+                            backdrop_filter: None,
                             clip_rect: self.current_scissor_rect(),
                         });
                     }
@@ -8689,5 +8798,263 @@ mod tests {
             "green channel must be full intensity after SrcIn(GREEN) filter, got {:?}",
             filtered_px
         );
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderRoundSuperellipseAndClipRoundSuperellipse
+    #[test]
+    fn test_chunk2_draw_and_clip_round_superellipse_and_display_list() {
+        let renderer = shared_test_renderer();
+
+        // 1. DrawRoundSuperellipse via DisplayListBuilder + Canvas (fill + stroke + fast rect/oval paths):
+        let rse =
+            RoundSuperellipse::make_rect_radius(Rect::from_xywh(10.0, 10.0, 100.0, 100.0), 36.0);
+        let rect_rse = RoundSuperellipse::make_rect(Rect::from_xywh(120.0, 10.0, 30.0, 30.0));
+        let oval_rse = RoundSuperellipse::make_oval(Rect::from_xywh(120.0, 50.0, 30.0, 30.0));
+
+        let mut dl_builder = DisplayListBuilder::new();
+        dl_builder
+            .draw_round_superellipse(rse, Paint::fill(Color::RED))
+            .draw_round_superellipse(rse, Paint::stroke(Color::WHITE, 2.0))
+            .draw_round_superellipse(rect_rse, Paint::fill(Color::GREEN))
+            .draw_round_superellipse(oval_rse, Paint::fill(Color::BLUE));
+        let dl = dl_builder.build();
+
+        let mut canvas = Canvas::new(160, 120, Color::BLACK);
+        canvas.draw_display_list(&dl);
+        assert_eq!(canvas.replay_stats().rrect_count, 4);
+
+        let rgba = canvas
+            .render_to_pixels(&renderer)
+            .expect("render round superellipse display list");
+
+        // Center of squircle (60, 60) must be bright red:
+        let center_px = get_pixel(&rgba, 160, 60, 60);
+        assert!(
+            center_px[0] > 245 && center_px[1] < 10 && center_px[2] < 10,
+            "center of filled round superellipse must be red, got {:?}",
+            center_px
+        );
+        // Far corner (12, 12) is outside the r=36 superellipse corner curve and must remain black:
+        assert!(!rse.contains(Point::new(12.0, 12.0)));
+        let outside_corner_px = get_pixel(&rgba, 160, 12, 12);
+        assert!(
+            outside_corner_px[0] < 15 && outside_corner_px[1] < 15 && outside_corner_px[2] < 15,
+            "far corner (12, 12) outside superellipse curve must remain black, got {:?}",
+            outside_corner_px
+        );
+        // Fast-path rect (135, 25) must be green and oval (135, 65) must be blue:
+        let rect_px = get_pixel(&rgba, 160, 135, 25);
+        let oval_px = get_pixel(&rgba, 160, 135, 65);
+        assert!(
+            rect_px[1] > 245 && rect_px[0] < 10,
+            "rect fast path must be green: {:?}",
+            rect_px
+        );
+        assert!(
+            oval_px[2] > 245 && oval_px[0] < 10,
+            "oval fast path must be blue: {:?}",
+            oval_px
+        );
+
+        // 2. ClipRoundSuperellipse (Intersect & Difference) via DisplayListBuilder:
+        let clip_rse =
+            RoundSuperellipse::make_rect_radius(Rect::from_xywh(10.0, 10.0, 80.0, 80.0), 32.0);
+        let mut clip_dl = DisplayListBuilder::new();
+        clip_dl
+            .save()
+            .clip_round_superellipse(clip_rse, ClipOperation::Intersect)
+            .draw_rect(
+                Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                Paint::fill(Color::GREEN),
+            )
+            .restore()
+            .save()
+            .translate(100.0, 0.0)
+            .clip_round_superellipse(clip_rse, ClipOperation::Difference)
+            .draw_rect(
+                Rect::from_xywh(10.0, 10.0, 80.0, 80.0),
+                Paint::fill(Color::RED),
+            )
+            .restore();
+
+        let mut clip_canvas = Canvas::new(200, 100, Color::BLACK);
+        clip_canvas.draw_display_list(&clip_dl.build());
+        let clip_rgba = clip_canvas
+            .render_to_pixels(&renderer)
+            .expect("render clipped round superellipse");
+
+        // Intersect: center (50, 50) is green, clipped corner (12, 12) is black:
+        let inter_center = get_pixel(&clip_rgba, 200, 50, 50);
+        let inter_corner = get_pixel(&clip_rgba, 200, 12, 12);
+        assert!(
+            inter_center[1] > 245,
+            "intersect center must be green: {:?}",
+            inter_center
+        );
+        assert!(
+            inter_corner[1] < 15,
+            "intersect corner must be clipped to black: {:?}",
+            inter_corner
+        );
+
+        // Difference (translated +100x): center (150, 50) is punched out (black), corner (112, 12) is red:
+        let diff_center = get_pixel(&clip_rgba, 200, 150, 50);
+        let diff_corner = get_pixel(&clip_rgba, 200, 112, 12);
+        assert!(
+            diff_center[0] < 15,
+            "difference center must be punched out: {:?}",
+            diff_center
+        );
+        assert!(
+            diff_corner[0] > 240,
+            "difference outer corner must remain red: {:?}",
+            diff_corner
+        );
+    }
+
+    /// C++ source: aiks_unittests.cc:CanRenderBackdropFilterWithEmptyAndPopulatedSaveLayer
+    #[test]
+    fn test_chunk2_save_layer_with_backdrop_including_empty_child() {
+        let renderer = shared_test_renderer();
+
+        // 1. Empty-child save_layer_with_backdrop (Flutter BackdropFilter pattern):
+        //    Left half (x < 60) is white, right half (x >= 60) is black.
+        //    Push an empty SaveLayer with backdrop blur over [20..100, 20..100].
+        let mut empty_bf_canvas = Canvas::new(120, 120, Color::BLACK);
+        empty_bf_canvas.draw_rect(
+            Rect::from_xywh(0.0, 0.0, 60.0, 120.0),
+            &Paint::fill(Color::WHITE),
+        );
+        let backdrop_blur = ImageFilter::Blur {
+            sigma_x: 6.0,
+            sigma_y: 6.0,
+            tile_mode: TileMode::Clamp,
+        };
+        empty_bf_canvas.save_layer_with_backdrop(
+            Some(Rect::from_xywh(20.0, 20.0, 80.0, 80.0)),
+            None,
+            Some(&backdrop_blur),
+        );
+        empty_bf_canvas.restore();
+
+        // Must NOT be collapsed or elided despite 0 child commands and identity paint!
+        assert_eq!(empty_bf_canvas.commands().len(), 2);
+        assert!(
+            matches!(
+                &empty_bf_canvas.commands()[1],
+                DrawCommand::SaveLayer {
+                    commands,
+                    backdrop_filter: Some(LayerImageFilter::Blur { .. }),
+                    image_filter: None,
+                    ..
+                } if commands.is_empty()
+            ),
+            "empty-child save_layer_with_backdrop must emit DrawCommand::SaveLayer with backdrop_filter"
+        );
+
+        let bf_rgba = empty_bf_canvas
+            .render_to_pixels(&renderer)
+            .expect("render empty-child backdrop blur");
+        // Inside backdrop region near split boundary (x=56 and x=64, y=60): blurred intermediate gray!
+        let left_blur_px = get_pixel(&bf_rgba, 120, 56, 60);
+        let right_blur_px = get_pixel(&bf_rgba, 120, 64, 60);
+        assert!(
+            left_blur_px[0] > 130 && left_blur_px[0] < 240,
+            "left of split inside backdrop blur must be intermediate gray, got {:?}",
+            left_blur_px
+        );
+        assert!(
+            right_blur_px[0] > 15 && right_blur_px[0] < 125,
+            "right of split inside backdrop blur must have blurred white bleed, got {:?}",
+            right_blur_px
+        );
+        // Outside backdrop region (y=10): split boundary remains crisp!
+        let unblurred_left = get_pixel(&bf_rgba, 120, 56, 10);
+        let unblurred_right = get_pixel(&bf_rgba, 120, 64, 10);
+        assert!(
+            unblurred_left[0] > 250,
+            "outside backdrop y=10 left must stay crisp white: {:?}",
+            unblurred_left
+        );
+        assert!(
+            unblurred_right[0] < 5,
+            "outside backdrop y=10 right must stay crisp black: {:?}",
+            unblurred_right
+        );
+
+        // 2. DisplayListBuilder::save_layer_with_backdrop with BOTH paint.image_filter AND backdrop_filter:
+        let child_paint = Paint::fill(Color::WHITE).with_image_filter(ImageFilter::Blur {
+            sigma_x: 2.0,
+            sigma_y: 2.0,
+            tile_mode: TileMode::Decal,
+        });
+        let mut dl_builder = DisplayListBuilder::new();
+        dl_builder
+            .draw_rect(
+                Rect::from_xywh(0.0, 0.0, 60.0, 120.0),
+                Paint::fill(Color::RED),
+            )
+            .save_layer_with_backdrop(
+                Some(Rect::from_xywh(20.0, 20.0, 80.0, 80.0)),
+                Some(child_paint),
+                Some(backdrop_blur),
+            )
+            .draw_rect(
+                Rect::from_xywh(45.0, 45.0, 30.0, 30.0),
+                Paint::fill(Color::GREEN),
+            )
+            .restore();
+
+        let mut dual_canvas = Canvas::new(120, 120, Color::BLACK);
+        dual_canvas.draw_display_list(&dl_builder.build());
+        assert_eq!(dual_canvas.commands().len(), 2);
+        assert!(matches!(
+            &dual_canvas.commands()[1],
+            DrawCommand::SaveLayer {
+                image_filter: Some(LayerImageFilter::Blur { sigma_x: sx, .. }),
+                backdrop_filter: Some(LayerImageFilter::Blur { sigma_x: bx, .. }),
+                ..
+            } if (*sx - 2.0).abs() < 1e-4 && (*bx - 6.0).abs() < 1e-4
+        ));
+    }
+
+    /// C++ source: aiks_blend_unittests.cc:CanRenderAdvancedBlendModesOverlayColorDodgeLuminosity
+    #[test]
+    fn test_chunk2_advanced_blend_modes_overlay_color_dodge_luminosity() {
+        let renderer = shared_test_renderer();
+
+        let dst_color = Color::new(0.4, 0.7, 0.2, 1.0);
+        let src_color = Color::new(0.8, 0.25, 0.6, 1.0);
+
+        for (mode, label) in [
+            (BlendMode::Overlay, "Overlay"),
+            (BlendMode::ColorDodge, "ColorDodge"),
+            (BlendMode::Luminosity, "Luminosity"),
+        ] {
+            let mut canvas = Canvas::new(64, 64, Color::BLACK);
+            canvas.draw_rect(
+                Rect::from_xywh(0.0, 0.0, 64.0, 64.0),
+                &Paint::fill(dst_color),
+            );
+            let mut fg_paint = Paint::fill(src_color);
+            fg_paint.blend_mode = mode;
+            canvas.draw_rect(Rect::from_xywh(8.0, 8.0, 48.0, 48.0), &fg_paint);
+
+            let rgba = canvas
+                .render_to_pixels(&renderer)
+                .unwrap_or_else(|e| panic!("render advanced blend mode {label}: {e}"));
+            let actual = get_pixel(&rgba, 64, 32, 32);
+            // Color::blend uses receiver = dst, argument = src (`dst.blend(src, mode)`):
+            let expected = dst_color.blend(src_color, mode).to_r8g8b8a8();
+            for ch in 0..3 {
+                let diff = (actual[ch] as i32 - expected[ch] as i32).abs();
+                assert!(
+                    diff <= 4,
+                    "{label} channel {ch} mismatch: actual={:?}, expected={:?}",
+                    actual,
+                    expected
+                );
+            }
+        }
     }
 }

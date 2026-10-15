@@ -2911,19 +2911,17 @@ pub unsafe extern "C" fn canvas_saveLayer(
 ) {
     let bounds = read_rect_ptr(rect_ptr);
     with_state(|st| {
-        let mut paint = st.paints.get(&paint_handle).cloned();
-        if backdrop_filter_handle != 0 {
-            if let Some(imf) = st.image_filters.get(&backdrop_filter_handle).cloned() {
-                let mut p = paint.unwrap_or_default();
-                if p.image_filter.is_none() {
-                    p.image_filter = Some(imf);
-                }
-                paint = Some(p);
-            }
-        }
+        let paint = st.paints.get(&paint_handle).cloned();
+        let backdrop_filter = if backdrop_filter_handle != 0 {
+            st.image_filters.get(&backdrop_filter_handle).cloned()
+        } else {
+            None
+        };
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.canvas.save_layer(bounds, paint.as_ref());
-            c.dl_builder.save_layer(bounds, paint);
+            c.canvas
+                .save_layer_with_backdrop(bounds, paint.as_ref(), backdrop_filter.as_ref());
+            c.dl_builder
+                .save_layer_with_backdrop(bounds, paint, backdrop_filter);
         }
     });
 }
@@ -5780,6 +5778,115 @@ mod tests {
             paint_dispose(layer_paint);
             colorFilter_dispose(mode_cf);
             imageFilter_dispose(blur_if);
+            picture_dispose(pic);
+            pictureRecorder_dispose(rec);
+        }
+    }
+
+    /// C++ source: skwasm/canvas.cpp:CanvasSaveLayerBackdropFilterAndEmptyLayer
+    #[test]
+    fn test_chunk2_ffi_save_layer_backdrop_preserves_paint_image_filter_and_empty_child() {
+        unsafe {
+            let rec = pictureRecorder_create();
+            let cull_rect = [0.0f32, 0.0, 200.0, 200.0];
+            let canvas = pictureRecorder_beginRecording(rec, cull_rect.as_ptr());
+
+            let backdrop_blur = imageFilter_createBlur(8.0, 8.0, 0); // Clamp
+            let paint_blur = imageFilter_createBlur(2.0, 2.0, 3); // Decal
+
+            // 1. Empty-child saveLayer with backdrop_filter_handle != 0 and paint_handle == 0:
+            let empty_bounds = [10.0f32, 10.0, 90.0, 90.0];
+            canvas_saveLayer(canvas, empty_bounds.as_ptr(), 0, backdrop_blur);
+            canvas_restore(canvas);
+
+            // 2. Populated saveLayer where paint has its own image_filter AND backdrop_filter_handle != 0:
+            //    Both filters must be preserved independently without overwriting paint.image_filter!
+            let dual_paint = paint_create(1, 15, 0xCCFFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0); // BlendMode::Overlay (15)
+            paint_setImageFilter(dual_paint, paint_blur);
+            let dual_bounds = [100.0f32, 10.0, 190.0, 90.0];
+            canvas_saveLayer(canvas, dual_bounds.as_ptr(), dual_paint, backdrop_blur);
+
+            let dodge_paint = paint_create(1, 18, 0xFF8040C0u32 as i32, 0, 1.0, 0, 0, 4.0, 0); // BlendMode::ColorDodge (18)
+            let lum_paint = paint_create(1, 28, 0xFF40C080u32 as i32, 0, 1.0, 0, 0, 4.0, 0); // BlendMode::Luminosity (28)
+            let r1 = [110.0f32, 20.0, 150.0, 60.0];
+            let r2 = [130.0f32, 40.0, 180.0, 80.0];
+            canvas_drawRect(canvas, r1.as_ptr(), dodge_paint);
+            canvas_drawRect(canvas, r2.as_ptr(), lum_paint);
+            canvas_restore(canvas);
+
+            let pic = pictureRecorder_endRecording(rec);
+            let (empty_bf_found, dual_bf_found, child_blends) = with_state(|st| {
+                let dl = &st.pictures.get(&pic).unwrap().display_list;
+                let mut target = Canvas::new(200, 200, Color::TRANSPARENT);
+                target.draw_display_list(dl);
+                let mut empty_ok = false;
+                let mut dual_ok = false;
+                let mut blends = Vec::new();
+                for cmd in target.commands() {
+                    if let impeller_wgpu::DrawCommand::SaveLayer {
+                        commands,
+                        blend_mode,
+                        image_filter,
+                        backdrop_filter,
+                        ..
+                    } = cmd
+                    {
+                        if commands.is_empty()
+                            && image_filter.is_none()
+                            && matches!(
+                                backdrop_filter,
+                                Some(impeller_wgpu::LayerImageFilter::Blur { sigma_x, .. })
+                                    if (*sigma_x - 8.0).abs() < 1e-4
+                            )
+                        {
+                            empty_ok = true;
+                        }
+                        if *blend_mode == BlendMode::Overlay
+                            && matches!(
+                                image_filter,
+                                Some(impeller_wgpu::LayerImageFilter::Blur { sigma_x, .. })
+                                    if (*sigma_x - 2.0).abs() < 1e-4
+                            )
+                            && matches!(
+                                backdrop_filter,
+                                Some(impeller_wgpu::LayerImageFilter::Blur { sigma_x, .. })
+                                    if (*sigma_x - 8.0).abs() < 1e-4
+                            )
+                        {
+                            dual_ok = true;
+                            for sub in commands {
+                                if let impeller_wgpu::DrawCommand::SolidFill {
+                                    blend_mode: bm,
+                                    ..
+                                } = sub
+                                {
+                                    blends.push(*bm);
+                                }
+                            }
+                        }
+                    }
+                }
+                (empty_ok, dual_ok, blends)
+            });
+
+            assert!(
+                empty_bf_found,
+                "empty-child FFI canvas_saveLayer with backdrop_filter must emit SaveLayer"
+            );
+            assert!(
+                dual_bf_found,
+                "FFI canvas_saveLayer must preserve both paint.image_filter (sigma=2) and backdrop_filter (sigma=8)"
+            );
+            assert_eq!(
+                child_blends,
+                vec![BlendMode::ColorDodge, BlendMode::Luminosity]
+            );
+
+            paint_dispose(lum_paint);
+            paint_dispose(dodge_paint);
+            paint_dispose(dual_paint);
+            imageFilter_dispose(paint_blur);
+            imageFilter_dispose(backdrop_blur);
             picture_dispose(pic);
             pictureRecorder_dispose(rec);
         }

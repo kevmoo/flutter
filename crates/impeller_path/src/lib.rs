@@ -2,16 +2,14 @@
 
 use impeller_geometry::{
     compute_cubic_subdivisions, compute_quadratic_subdivisions, Matrix, Point, Radians, Rect,
-    Scalar, Size, K_EH_CLOSE_ENOUGH,
+    Scalar, Size,
 };
-use std::ops::Mul;
+pub use impeller_geometry::{
+    PathReceiver, RoundRect, RoundSuperellipse, RoundSuperellipseOctant, RoundSuperellipseParam,
+    RoundSuperellipseQuadrant, RoundingRadii,
+};
 
 pub const K_ARC_APPROXIMATION_MAGIC: Scalar = 0.551_915_05;
-
-#[inline]
-fn scalar_nearly_equal(a: Scalar, b: Scalar) -> bool {
-    scalar_nearly_equal_tolerance(a, b, K_EH_CLOSE_ENOUGH)
-}
 
 #[inline]
 fn scalar_nearly_equal_tolerance(a: Scalar, b: Scalar, tolerance: Scalar) -> bool {
@@ -19,50 +17,10 @@ fn scalar_nearly_equal_tolerance(a: Scalar, b: Scalar, tolerance: Scalar) -> boo
 }
 
 #[inline]
-fn size_is_finite(s: Size) -> bool {
-    s.width.is_finite() && s.height.is_finite()
-}
-
-#[inline]
-fn point_is_finite(p: Point) -> bool {
-    p.x.is_finite() && p.y.is_finite()
-}
-
-#[inline]
-fn rect_is_finite(r: Rect) -> bool {
-    point_is_finite(r.origin) && size_is_finite(r.size)
-}
-
-#[inline]
-fn rect_positive(r: Rect) -> Rect {
-    r.get_positive()
-}
-
-#[inline]
 fn rect_center(r: Rect) -> Point {
     Point::new(
         r.origin.x + r.size.width * 0.5,
         r.origin.y + r.size.height * 0.5,
-    )
-}
-
-#[inline]
-fn rect_shift(r: Rect, dx: Scalar, dy: Scalar) -> Rect {
-    Rect::from_xywh(
-        r.origin.x + dx,
-        r.origin.y + dy,
-        r.size.width,
-        r.size.height,
-    )
-}
-
-#[inline]
-fn rect_expand_ltrb(r: Rect, left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Rect {
-    Rect::from_xywh(
-        r.origin.x - left,
-        r.origin.y - top,
-        r.size.width + left + right,
-        r.size.height + top + bottom,
     )
 }
 
@@ -94,405 +52,6 @@ pub enum Convexity {
     #[default]
     Unknown,
     Convex,
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct RoundingRadii {
-    pub top_left: Size,
-    pub bottom_left: Size,
-    pub top_right: Size,
-    pub bottom_right: Size,
-}
-
-impl RoundingRadii {
-    pub const ZERO: Self = Self {
-        top_left: Size::ZERO,
-        bottom_left: Size::ZERO,
-        top_right: Size::ZERO,
-        bottom_right: Size::ZERO,
-    };
-
-    pub const fn from_single_radius(radius: Scalar) -> Self {
-        let s = Size::new(radius, radius);
-        Self {
-            top_left: s,
-            bottom_left: s,
-            top_right: s,
-            bottom_right: s,
-        }
-    }
-
-    pub const fn make_radius(radius: Scalar) -> Self {
-        Self::from_single_radius(radius)
-    }
-
-    pub const fn make_radii(radii: Size) -> Self {
-        Self {
-            top_left: radii,
-            bottom_left: radii,
-            top_right: radii,
-            bottom_right: radii,
-        }
-    }
-
-    pub const fn from_size(radii: Size) -> Self {
-        Self::make_radii(radii)
-    }
-
-    pub const fn make_nine_patch(left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Self {
-        Self {
-            top_left: Size::new(left, top),
-            top_right: Size::new(right, top),
-            bottom_left: Size::new(left, bottom),
-            bottom_right: Size::new(right, bottom),
-        }
-    }
-
-    pub const fn from_radii(
-        top_left: Size,
-        top_right: Size,
-        bottom_left: Size,
-        bottom_right: Size,
-    ) -> Self {
-        Self {
-            top_left,
-            bottom_left,
-            top_right,
-            bottom_right,
-        }
-    }
-
-    pub fn are_all_corners_zero(&self) -> bool {
-        self.top_left.is_empty()
-            && self.bottom_left.is_empty()
-            && self.top_right.is_empty()
-            && self.bottom_right.is_empty()
-    }
-
-    pub fn are_all_corners_empty(&self) -> bool {
-        self.are_all_corners_zero()
-    }
-
-    pub fn is_finite(&self) -> bool {
-        size_is_finite(self.top_left)
-            && size_is_finite(self.top_right)
-            && size_is_finite(self.bottom_left)
-            && size_is_finite(self.bottom_right)
-    }
-
-    pub fn are_all_corners_same(&self) -> bool {
-        self.are_all_corners_same_with_tolerance(K_EH_CLOSE_ENOUGH)
-    }
-
-    pub fn are_all_corners_same_with_tolerance(&self, tolerance: Scalar) -> bool {
-        scalar_nearly_equal_tolerance(self.top_left.width, self.top_right.width, tolerance)
-            && scalar_nearly_equal_tolerance(
-                self.top_left.width,
-                self.bottom_right.width,
-                tolerance,
-            )
-            && scalar_nearly_equal_tolerance(self.top_left.width, self.bottom_left.width, tolerance)
-            && scalar_nearly_equal_tolerance(self.top_left.height, self.top_right.height, tolerance)
-            && scalar_nearly_equal_tolerance(
-                self.top_left.height,
-                self.bottom_right.height,
-                tolerance,
-            )
-            && scalar_nearly_equal_tolerance(
-                self.top_left.height,
-                self.bottom_left.height,
-                tolerance,
-            )
-    }
-
-    pub fn are_all_corners_circular(&self) -> bool {
-        scalar_nearly_equal(self.top_left.width, self.top_left.height)
-            && scalar_nearly_equal(self.top_right.width, self.top_right.height)
-            && scalar_nearly_equal(self.bottom_left.width, self.bottom_left.height)
-            && scalar_nearly_equal(self.bottom_right.width, self.bottom_right.height)
-    }
-
-    pub fn scaled(&self, in_bounds: Rect) -> Self {
-        if !rect_is_finite(in_bounds) {
-            return Self::ZERO;
-        }
-        let bounds = rect_positive(in_bounds);
-        if bounds.is_empty() || self.are_all_corners_empty() || !self.is_finite() {
-            return Self::ZERO;
-        }
-
-        let normalize_empty = |s: Size| -> Size {
-            if s.is_empty() {
-                Size::ZERO
-            } else {
-                s
-            }
-        };
-
-        let mut radii = Self {
-            top_left: normalize_empty(self.top_left),
-            top_right: normalize_empty(self.top_right),
-            bottom_left: normalize_empty(self.bottom_left),
-            bottom_right: normalize_empty(self.bottom_right),
-        };
-
-        let adjust_scale = |r1: Scalar, r2: Scalar, dimension: Scalar, scale: &mut Scalar| {
-            if r1 + r2 > dimension {
-                *scale = (*scale).min(dimension / (r1 + r2));
-            }
-        };
-
-        let mut scale: Scalar = 1.0;
-        adjust_scale(
-            radii.top_left.width,
-            radii.top_right.width,
-            bounds.size.width,
-            &mut scale,
-        );
-        adjust_scale(
-            radii.bottom_left.width,
-            radii.bottom_right.width,
-            bounds.size.width,
-            &mut scale,
-        );
-        adjust_scale(
-            radii.top_left.height,
-            radii.bottom_left.height,
-            bounds.size.height,
-            &mut scale,
-        );
-        adjust_scale(
-            radii.top_right.height,
-            radii.bottom_right.height,
-            bounds.size.height,
-            &mut scale,
-        );
-
-        if scale < 1.0 {
-            radii = radii * scale;
-        }
-
-        radii
-    }
-}
-
-impl Mul<Scalar> for RoundingRadii {
-    type Output = Self;
-
-    fn mul(self, scale: Scalar) -> Self {
-        Self {
-            top_left: Size::new(self.top_left.width * scale, self.top_left.height * scale),
-            top_right: Size::new(self.top_right.width * scale, self.top_right.height * scale),
-            bottom_left: Size::new(
-                self.bottom_left.width * scale,
-                self.bottom_left.height * scale,
-            ),
-            bottom_right: Size::new(
-                self.bottom_right.width * scale,
-                self.bottom_right.height * scale,
-            ),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct RoundRect {
-    pub bounds: Rect,
-    pub radii: RoundingRadii,
-}
-
-impl RoundRect {
-    pub const fn new() -> Self {
-        Self {
-            bounds: Rect::ZERO,
-            radii: RoundingRadii::ZERO,
-        }
-    }
-
-    pub fn from_rect(rect: Rect) -> Self {
-        Self::from_rect_radii(rect, RoundingRadii::ZERO)
-    }
-
-    pub fn make_rect(rect: Rect) -> Self {
-        Self::from_rect(rect)
-    }
-
-    pub fn from_oval(rect: Rect) -> Self {
-        let bounds = rect.get_positive();
-        Self::from_rect_radii(
-            bounds,
-            RoundingRadii::make_radii(Size::new(bounds.size.width * 0.5, bounds.size.height * 0.5)),
-        )
-    }
-
-    pub fn make_oval(rect: Rect) -> Self {
-        Self::from_oval(rect)
-    }
-
-    pub fn from_rect_radius(rect: Rect, radius: Scalar) -> Self {
-        Self::from_rect_radii(rect, RoundingRadii::from_single_radius(radius))
-    }
-
-    pub fn make_rect_radius(rect: Rect, radius: Scalar) -> Self {
-        Self::from_rect_radius(rect, radius)
-    }
-
-    pub fn from_rect_xy(rect: Rect, x_radius: Scalar, y_radius: Scalar) -> Self {
-        Self::from_rect_radii(
-            rect,
-            RoundingRadii::make_radii(Size::new(x_radius, y_radius)),
-        )
-    }
-
-    pub fn make_rect_xy(rect: Rect, x_radius: Scalar, y_radius: Scalar) -> Self {
-        Self::from_rect_xy(rect, x_radius, y_radius)
-    }
-
-    pub fn from_rect_size(rect: Rect, corner_radii: Size) -> Self {
-        Self::from_rect_radii(rect, RoundingRadii::make_radii(corner_radii))
-    }
-
-    pub fn make_rect_size(rect: Rect, corner_radii: Size) -> Self {
-        Self::from_rect_size(rect, corner_radii)
-    }
-
-    pub fn from_nine_patch(
-        rect: Rect,
-        left: Scalar,
-        top: Scalar,
-        right: Scalar,
-        bottom: Scalar,
-    ) -> Self {
-        Self::from_rect_radii(
-            rect,
-            RoundingRadii::make_nine_patch(left, top, right, bottom),
-        )
-    }
-
-    pub fn make_nine_patch(
-        rect: Rect,
-        left: Scalar,
-        top: Scalar,
-        right: Scalar,
-        bottom: Scalar,
-    ) -> Self {
-        Self::from_nine_patch(rect, left, top, right, bottom)
-    }
-
-    pub fn from_rect_radii(in_bounds: Rect, in_radii: RoundingRadii) -> Self {
-        if !rect_is_finite(in_bounds) {
-            return Self::default();
-        }
-        let bounds = rect_positive(in_bounds);
-        Self {
-            bounds,
-            radii: in_radii.scaled(bounds),
-        }
-    }
-
-    pub fn make_rect_radii(in_bounds: Rect, in_radii: RoundingRadii) -> Self {
-        Self::from_rect_radii(in_bounds, in_radii)
-    }
-
-    pub const fn get_bounds(&self) -> Rect {
-        self.bounds
-    }
-
-    pub const fn get_radii(&self) -> RoundingRadii {
-        self.radii
-    }
-
-    pub fn is_finite(&self) -> bool {
-        rect_is_finite(self.bounds) && self.radii.is_finite()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bounds.is_empty()
-    }
-
-    pub fn is_rect(&self) -> bool {
-        !self.bounds.is_empty() && self.radii.are_all_corners_empty()
-    }
-
-    pub fn is_oval(&self) -> bool {
-        !self.bounds.is_empty()
-            && self.radii.are_all_corners_same()
-            && scalar_nearly_equal(self.radii.top_left.width, self.bounds.get_width() * 0.5)
-            && scalar_nearly_equal(self.radii.top_left.height, self.bounds.get_height() * 0.5)
-    }
-
-    pub fn contains(&self, p: Point) -> bool {
-        if !self.bounds.contains(p) {
-            return false;
-        }
-        let left = self.bounds.get_left();
-        let top = self.bounds.get_top();
-        let right = self.bounds.get_right();
-        let bottom = self.bounds.get_bottom();
-
-        corner_contains(
-            p,
-            Point::new(left, top),
-            Point::new(-1.0, -1.0),
-            self.radii.top_left,
-        ) && corner_contains(
-            p,
-            Point::new(right, top),
-            Point::new(1.0, -1.0),
-            self.radii.top_right,
-        ) && corner_contains(
-            p,
-            Point::new(left, bottom),
-            Point::new(-1.0, 1.0),
-            self.radii.bottom_left,
-        ) && corner_contains(
-            p,
-            Point::new(right, bottom),
-            Point::new(1.0, 1.0),
-            self.radii.bottom_right,
-        )
-    }
-
-    pub fn shift(&self, dx: Scalar, dy: Scalar) -> Self {
-        Self::from_rect_radii(rect_shift(self.bounds, dx, dy), self.radii)
-    }
-
-    pub fn expand(&self, amount: Scalar) -> Self {
-        self.expand_ltrb(amount, amount, amount, amount)
-    }
-
-    pub fn expand_xy(&self, horizontal: Scalar, vertical: Scalar) -> Self {
-        self.expand_ltrb(horizontal, vertical, horizontal, vertical)
-    }
-
-    pub fn expand_ltrb(&self, left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Self {
-        Self::from_rect_radii(
-            rect_expand_ltrb(self.bounds, left, top, right, bottom),
-            self.radii,
-        )
-    }
-}
-
-fn corner_contains(p: Point, corner: Point, direction: Point, radii: Size) -> bool {
-    if radii.is_empty() {
-        return true;
-    }
-    let corner_relative = Point::new(
-        (corner.x - p.x) * direction.x,
-        (corner.y - p.y) * direction.y,
-    );
-    let quadrant_relative = Point::new(
-        radii.width - corner_relative.x,
-        radii.height - corner_relative.y,
-    );
-    if quadrant_relative.x <= 0.0 || quadrant_relative.y <= 0.0 {
-        return true;
-    }
-    let unit = Point::new(
-        quadrant_relative.x / radii.width,
-        quadrant_relative.y / radii.height,
-    );
-    unit.get_length_squared() <= 1.0
 }
 
 pub trait VertexWriter {
@@ -864,6 +423,24 @@ impl ConicPathComponent {
         Point::new(
             conic_solve(time, self.p1.x, self.cp.x, self.p2.x, self.weight.x),
             conic_solve(time, self.p1.y, self.cp.y, self.p2.y, self.weight.y),
+        )
+    }
+
+    pub fn subdivide(&self) -> (Self, Self) {
+        let w = self.weight.x;
+        let scale = 1.0 / (1.0 + w);
+        let tp1 = self.p1 * scale;
+        let tcp = self.cp * (w * scale);
+        let tp2 = self.p2 * scale;
+
+        let sub_cp1 = tp1 + tcp;
+        let sub_cp2 = tcp + tp2;
+        let sub_mid = (sub_cp1 + sub_cp2) * 0.5;
+        let sub_w = ((1.0 + w) * 0.5).sqrt();
+
+        (
+            Self::new(self.p1, sub_cp1, sub_mid, sub_w),
+            Self::new(sub_mid, sub_cp2, self.p2, sub_w),
         )
     }
 
@@ -1669,6 +1246,14 @@ impl PathBuilder {
             self.add_linear_component(p1, p2);
         } else if (weight - 1.0).abs() <= Scalar::EPSILON {
             self.add_quadratic_component(p1, cp, p2);
+        } else if (weight - 1.0).abs() > 0.25 {
+            let conic = ConicPathComponent::new(p1, cp, p2, weight);
+            let (c0, c1) = conic.subdivide();
+            for sub in [c0, c1] {
+                for quad in sub.to_quadratic_path_components() {
+                    self.add_quadratic_component(quad.p1, quad.cp, quad.p2);
+                }
+            }
         } else {
             let conic = ConicPathComponent::new(p1, cp, p2, weight);
             for quad in conic.to_quadratic_path_components() {
@@ -2085,6 +1670,27 @@ impl PathBuilder {
         );
     }
 
+    pub fn add_round_superellipse(&mut self, rse: &RoundSuperellipse) -> &mut Self {
+        if !rse.is_finite() || rse.is_empty() {
+            return self;
+        }
+        if rse.is_rect() {
+            return self.add_rect(rse.get_bounds());
+        }
+        if rse.is_oval() {
+            return self.add_oval(rse.get_bounds());
+        }
+
+        let was_empty = !self.has_any_segments();
+        let param = rse.to_param();
+        let mut receiver = PathBuilderReceiver { builder: self };
+        param.dispatch(&mut receiver);
+        if was_empty {
+            self.convexity = Convexity::Convex;
+        }
+        self
+    }
+
     pub fn add_arc(
         &mut self,
         oval_bounds: Rect,
@@ -2453,13 +2059,65 @@ impl PathBuilder {
     }
 }
 
+struct PathBuilderReceiver<'a> {
+    builder: &'a mut PathBuilder,
+}
+
+impl PathReceiver for PathBuilderReceiver<'_> {
+    fn move_to(&mut self, p2: Point, _will_be_closed: bool) {
+        self.builder.move_to(p2);
+    }
+
+    fn line_to(&mut self, p2: Point) {
+        self.builder
+            .add_linear_component_if_needed(self.builder.current, p2);
+        self.builder.current = p2;
+    }
+
+    fn quad_to(&mut self, cp: Point, p2: Point) {
+        self.builder.quadratic_curve_to(cp, p2);
+    }
+
+    fn conic_to(&mut self, cp: Point, p2: Point, weight: Scalar) -> bool {
+        if scalar_nearly_equal_tolerance(self.builder.current.x, p2.x, 1e-5)
+            && scalar_nearly_equal_tolerance(self.builder.current.y, p2.y, 1e-5)
+        {
+            self.builder.current = p2;
+            return true;
+        }
+        self.builder.conic_curve_to(cp, p2, weight);
+        true
+    }
+
+    fn cubic_to(&mut self, cp1: Point, cp2: Point, p2: Point) {
+        if scalar_nearly_equal_tolerance(self.builder.current.x, p2.x, 1e-5)
+            && scalar_nearly_equal_tolerance(self.builder.current.y, p2.y, 1e-5)
+            && scalar_nearly_equal_tolerance(self.builder.current.x, cp1.x, 1e-5)
+            && scalar_nearly_equal_tolerance(self.builder.current.y, cp1.y, 1e-5)
+        {
+            self.builder.current = p2;
+            return;
+        }
+        self.builder.cubic_curve_to(cp1, cp2, p2);
+    }
+
+    fn close(&mut self) {
+        self.builder.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use impeller_geometry::Degrees;
+    use impeller_geometry::{Degrees, K_EH_CLOSE_ENOUGH};
 
     const EPS: Scalar = 1e-3;
+
+    #[inline]
+    fn rect_expand_ltrb(r: Rect, left: Scalar, top: Scalar, right: Scalar, bottom: Scalar) -> Rect {
+        r.expand(left, top, right, bottom)
+    }
 
     fn assert_point_near(a: Point, b: Point) {
         assert_abs_diff_eq!(a.x, b.x, epsilon = EPS);
@@ -3979,5 +3637,147 @@ mod tests {
         // Adding a second path to a non-empty PathBuilder resets convexity to Unknown.
         dst_pb.add_path(&convex_src);
         assert_eq!(dst_pb.get_convexity(), Convexity::Unknown);
+    }
+
+    /// C++ source: dl_path_builder_unittests.cc:AddRoundSuperellipse
+    #[test]
+    fn test_add_round_superellipse_matches_cpp_contour_and_bounds() {
+        let bounds = Rect::from_ltrb(10.0, 10.0, 100.0, 100.0);
+        let radii = RoundingRadii::from_radii(
+            Size::new(2.0, 12.0),
+            Size::new(3.0, 13.0),
+            Size::new(4.0, 14.0),
+            Size::new(5.0, 15.0),
+        );
+        let rse = RoundSuperellipse::make_rect_radii(bounds, radii);
+
+        // Verify exact C++ dispatch start/end and weights via SpyReceiver.
+        #[derive(Default)]
+        struct Spy {
+            moved: Vec<Point>,
+            conics: Vec<(Point, Point, Scalar)>,
+            cubics: Vec<(Point, Point, Point)>,
+            closed: bool,
+        }
+        impl PathReceiver for Spy {
+            fn move_to(&mut self, p2: Point, _will_be_closed: bool) {
+                self.moved.push(p2);
+            }
+            fn line_to(&mut self, _p2: Point) {}
+            fn conic_to(&mut self, cp: Point, p2: Point, weight: Scalar) -> bool {
+                self.conics.push((cp, p2, weight));
+                true
+            }
+            fn cubic_to(&mut self, cp1: Point, cp2: Point, p2: Point) {
+                self.cubics.push((cp1, cp2, p2));
+            }
+            fn close(&mut self) {
+                self.closed = true;
+            }
+        }
+        let mut spy = Spy::default();
+        rse.to_param().dispatch(&mut spy);
+        assert_eq!(spy.moved.len(), 1);
+        assert_point_near(spy.moved[0], Point::new(46.0, 10.0));
+        assert_eq!(spy.conics.len(), 16);
+        assert_eq!(spy.cubics.len(), 8);
+        assert!(spy.closed);
+
+        // First octant matches dl_path_builder_unittests.cc:AddRoundSuperellipse.
+        assert_point_near(spy.conics[0].0, Point::new(94.8672, 9.99998));
+        assert_point_near(spy.conics[0].1, Point::new(95.7708, 10.0493));
+        assert_abs_diff_eq!(spy.conics[0].2, 3.631_278_5, epsilon = 1e-4);
+        assert_point_near(spy.conics[1].0, Point::new(96.6558, 10.0976));
+        assert_point_near(spy.conics[1].1, Point::new(97.1856, 10.2338));
+        assert_abs_diff_eq!(spy.conics[1].2, 1.220_872, epsilon = 1e-4);
+        assert_point_near(spy.cubics[0].0, Point::new(97.9096, 10.367));
+        assert_point_near(spy.cubics[0].1, Point::new(98.5976, 11.6373));
+        assert_point_near(spy.cubics[0].2, Point::new(99.1213, 13.8076));
+
+        // Build into PathBuilder and verify closed single contour, convexity, and bounds.
+        let mut pb = PathBuilder::new();
+        pb.add_round_superellipse(&rse);
+        assert_eq!(pb.get_convexity(), Convexity::Convex);
+
+        let path = pb.take_path(FillType::NonZero);
+        assert!(path.is_convex());
+        assert!(path.is_single_contour());
+        let path_bounds = path.get_bounding_box().expect("non-empty bounds");
+        assert_rect_near(path_bounds, bounds);
+
+        let polyline = path.create_polyline(1.0);
+        assert_eq!(polyline.contours.len(), 1);
+        assert!(polyline.contours[0].is_closed);
+        assert_point_near(polyline.points[0], Point::new(46.0, 10.0));
+        assert_point_near(*polyline.points.last().unwrap(), Point::new(46.0, 10.0));
+        for pt in &polyline.points {
+            assert!(
+                bounds.expand_all(1e-3).contains_inclusive(*pt),
+                "polyline point {pt:?} outside {bounds:?}"
+            );
+        }
+    }
+
+    /// C++ source: round_superellipse_unittests.cc:RectConstructor
+    #[test]
+    fn test_add_round_superellipse_degenerate_empty_rect_and_oval() {
+        let empty_rse = RoundSuperellipse::make_rect(Rect::from_ltrb(20.0, 20.0, 20.0, 20.0));
+        let mut pb_empty = PathBuilder::new();
+        pb_empty.add_round_superellipse(&empty_rse);
+        assert!(pb_empty.take_path(FillType::NonZero).is_empty());
+
+        let rect_bounds = Rect::from_ltrb(10.0, 20.0, 60.0, 80.0);
+        let rect_rse = RoundSuperellipse::make_rect(rect_bounds);
+        let mut pb_rect = PathBuilder::new();
+        pb_rect.add_round_superellipse(&rect_rse);
+        assert_eq!(pb_rect.get_convexity(), Convexity::Convex);
+        let path_rect = pb_rect.take_path(FillType::NonZero);
+        assert!(path_rect.is_single_contour());
+        assert_eq!(path_rect.get_bounding_box(), Some(rect_bounds));
+
+        let oval_rse = RoundSuperellipse::make_oval(rect_bounds);
+        let mut pb_oval = PathBuilder::new();
+        pb_oval.add_round_superellipse(&oval_rse);
+        assert_eq!(pb_oval.get_convexity(), Convexity::Convex);
+        let path_oval = pb_oval.take_path(FillType::NonZero);
+        assert!(path_oval.is_single_contour());
+        assert_rect_near(path_oval.get_bounding_box().unwrap(), rect_bounds);
+
+        // Adding a second RoundSuperellipse resets convexity to Unknown.
+        let mut pb_two = PathBuilder::new();
+        pb_two.add_round_superellipse(&RoundSuperellipse::make_rect_radius(rect_bounds, 8.0));
+        assert_eq!(pb_two.get_convexity(), Convexity::Convex);
+        pb_two.add_round_superellipse(&RoundSuperellipse::make_rect_radius(rect_bounds, 8.0));
+        assert_eq!(pb_two.get_convexity(), Convexity::Unknown);
+    }
+
+    /// C++ source: round_superellipse_unittests.cc:PathForRectangularRseWithShapeCornersShouldBeWithinBounds
+    #[test]
+    fn test_add_round_superellipse_mixed_sharp_and_rounded_corners_within_bounds() {
+        let bounds = Rect::from_ltrb(34.0, 242.0, 766.0, 358.0);
+        let rse = RoundSuperellipse::make_rect_radii(
+            bounds,
+            RoundingRadii::from_radii(
+                Size::new(14.0, 14.0),
+                Size::new(14.0, 14.0),
+                Size::new(0.0, 0.0),
+                Size::new(0.0, 0.0),
+            ),
+        );
+        let mut pb = PathBuilder::new();
+        pb.add_round_superellipse(&rse);
+        let path = pb.take_path(FillType::NonZero);
+        assert!(path.is_single_contour());
+        assert!(path.is_convex());
+        let path_bounds = path.get_bounding_box().expect("bounds");
+        assert_rect_near(path_bounds, bounds);
+
+        let poly = path.create_polyline(1.0);
+        for pt in &poly.points {
+            assert!(
+                bounds.expand_all(1e-3).contains_inclusive(*pt),
+                "point {pt:?} outside {bounds:?}"
+            );
+        }
     }
 }
