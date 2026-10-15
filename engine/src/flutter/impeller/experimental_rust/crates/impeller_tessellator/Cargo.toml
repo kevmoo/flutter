@@ -1,0 +1,13 @@
+[package]
+name = "impeller_tessellator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+impeller_geometry.workspace = true
+impeller_path.workspace = true
+impeller_core.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

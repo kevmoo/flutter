@@ -1,0 +1,11 @@
+[package]
+name = "impeller_path"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+impeller_geometry.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

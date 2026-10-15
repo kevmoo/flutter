@@ -1,0 +1,2468 @@
+#![forbid(unsafe_code)]
+
+mod boolean;
+mod convex;
+mod primitives;
+mod pslg;
+mod stroke;
+mod trigs;
+
+use bytemuck::{Pod, Zeroable};
+use impeller_geometry::{Point, Rect, Scalar, Size};
+use impeller_path::{Convexity, Path};
+
+pub use boolean::{combine_paths, PathOp};
+pub use primitives::{
+    ArcGeometry, CircleGeometry, DiffRoundRectGeometry, EllipseGeometry, FillPathGeometry,
+    LineGeometry, RectGeometry, RoundRectGeometry, StrokePathGeometry,
+};
+pub use stroke::{compute_stroke_alpha_coverage, K_MIN_STROKE_SIZE};
+pub use trigs::{compute_quadrant_divisions, Trig, Trigs, K_CIRCLE_TOLERANCE};
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Vertex2D {
+    pub position: [Scalar; 2],
+}
+
+impl Vertex2D {
+    pub const fn new(x: Scalar, y: Scalar) -> Self {
+        Self { position: [x, y] }
+    }
+
+    pub const fn from_point(p: Point) -> Self {
+        Self {
+            position: [p.x, p.y],
+        }
+    }
+
+    pub const fn to_point(&self) -> Point {
+        Point::new(self.position[0], self.position[1])
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TessellatedMesh {
+    pub vertices: Vec<Vertex2D>,
+    pub indices: Vec<u32>,
+}
+
+/// Result status matching `impeller::Tessellator::Result` / `TessellatorLibtess::Result`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TessellationResult {
+    Success,
+    InputError,
+    TessellationError,
+}
+
+/// Classification of the fill tessellation algorithm tier used for a path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FillTessellationKind {
+    ConvexFast,
+    PslgSimpleConvex,
+    PslgDisjointConvex,
+    PslgGeneral,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct StrokeParameters {
+    pub width: Scalar,
+    pub cap: impeller_path::Cap,
+    pub join: impeller_path::Join,
+    pub miter_limit: Scalar,
+}
+
+impl Default for StrokeParameters {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            cap: impeller_path::Cap::Butt,
+            join: impeller_path::Join::Miter,
+            miter_limit: 4.0,
+        }
+    }
+}
+
+pub struct Tessellator;
+
+impl Tessellator {
+    pub const K_CIRCLE_TOLERANCE: Scalar = trigs::K_CIRCLE_TOLERANCE;
+
+    /// Tessellates a path using a Planar Straight-Line Graph (PSLG) decomposition supporting
+    /// convex, concave, multi-contour holes, and self-intersecting polygons under both
+    /// `FillType::NonZero` and `FillType::Odd`.
+    pub fn tessellate(
+        path: &Path,
+        tolerance_scale: Scalar,
+    ) -> Result<TessellatedMesh, TessellationResult> {
+        if tolerance_scale <= 0.0 || !tolerance_scale.is_finite() {
+            return Err(TessellationResult::InputError);
+        }
+        pslg::tessellate_pslg(path, tolerance_scale)
+    }
+
+    /// Tessellates a path and delivers the mesh to `callback`, matching `TessellatorLibtess::Tessellate`.
+    pub fn tessellate_with_callback<F>(
+        path: &Path,
+        tolerance_scale: Scalar,
+        mut callback: F,
+    ) -> TessellationResult
+    where
+        F: FnMut(&[Vertex2D], &[u32]) -> bool,
+    {
+        match Self::tessellate(path, tolerance_scale) {
+            Ok(mesh) => {
+                if callback(&mesh.vertices, &mesh.indices) {
+                    TessellationResult::Success
+                } else {
+                    TessellationResult::InputError
+                }
+            }
+            Err(err) => err,
+        }
+    }
+
+    /// Tessellates a filled path into a `(TessellatedMesh, FillTessellationKind)`.
+    /// Uses the convex strip fast-path when `path.convexity == Convexity::Convex`, and the
+    /// classified PSLG winding-rule tessellator otherwise.
+    pub fn tessellate_fill_classified(
+        path: &Path,
+        tolerance_scale: Scalar,
+    ) -> (TessellatedMesh, FillTessellationKind) {
+        let scale = tolerance_scale.max(1.0);
+        if path.convexity == Convexity::Convex {
+            return (
+                Self::tessellate_convex(path, scale),
+                FillTessellationKind::ConvexFast,
+            );
+        }
+        pslg::tessellate_pslg_classified(path, scale).unwrap_or((
+            TessellatedMesh::default(),
+            FillTessellationKind::PslgGeneral,
+        ))
+    }
+
+    /// Tessellates a filled path into a `TessellatedMesh`.
+    /// Uses the convex strip fast-path when `path.convexity == Convexity::Convex`, and the
+    /// general PSLG winding-rule tessellator otherwise.
+    pub fn tessellate_fill(path: &Path, tolerance_scale: Scalar) -> TessellatedMesh {
+        Self::tessellate_fill_classified(path, tolerance_scale).0
+    }
+
+    /// Ported from `Tessellator::TessellateConvex` in `tessellator.cc`.
+    pub fn tessellate_convex(path: &Path, tolerance_scale: Scalar) -> TessellatedMesh {
+        convex::tessellate_convex(path, tolerance_scale.max(1.0))
+    }
+
+    /// Ported from `Tessellator::TessellateConvexInternal` in `tessellator.cc`.
+    pub fn tessellate_convex_internal(path: &Path, tolerance: Scalar) -> (Vec<Point>, Vec<u16>) {
+        convex::tessellate_convex_internal(path, tolerance)
+    }
+
+    /// Ported from `StrokePathGeometry` / `StrokeSegmentsGeometry` in `stroke_path_geometry.cc`.
+    pub fn tessellate_stroke(
+        path: &Path,
+        stroke: StrokeParameters,
+        tolerance_scale: Scalar,
+    ) -> TessellatedMesh {
+        stroke::tessellate_stroke(path, stroke, tolerance_scale.max(1.0))
+    }
+
+    /// Ported from `StrokeSegmentsGeometry::GenerateSolidStrokeVertices` in `stroke_path_geometry.cc`.
+    pub fn generate_solid_stroke_vertices(
+        path: &Path,
+        stroke: StrokeParameters,
+        scale: Scalar,
+    ) -> Vec<Point> {
+        stroke::generate_solid_stroke_vertices(path, stroke, scale)
+    }
+
+    /// Ported from `Tessellator::FilledCircle` in `tessellator.cc`.
+    pub fn filled_circle_strip(scale: Scalar, center: Point, radius: Scalar) -> Vec<Point> {
+        primitives::generate_filled_circle_strip(scale, center, radius)
+    }
+
+    /// Ported from `Tessellator::StrokedCircle` in `tessellator.cc`.
+    pub fn stroked_circle_strip(
+        scale: Scalar,
+        center: Point,
+        radius: Scalar,
+        half_width: Scalar,
+    ) -> Vec<Point> {
+        primitives::generate_stroked_circle_strip(scale, center, radius, half_width)
+    }
+
+    /// Ported from `Tessellator::RoundCapLine` in `tessellator.cc`.
+    pub fn round_cap_line_strip(scale: Scalar, p0: Point, p1: Point, radius: Scalar) -> Vec<Point> {
+        primitives::generate_round_cap_line_strip(scale, p0, p1, radius)
+    }
+
+    /// Ported from `Tessellator::FilledEllipse` in `tessellator.cc`.
+    pub fn filled_ellipse_strip(scale: Scalar, bounds: Rect) -> Vec<Point> {
+        primitives::generate_filled_ellipse_strip(scale, bounds)
+    }
+
+    /// Ported from `Tessellator::FilledRoundRect` in `tessellator.cc`.
+    pub fn filled_round_rect_strip(scale: Scalar, bounds: Rect, radii: Size) -> Vec<Point> {
+        primitives::generate_filled_round_rect_strip(scale, bounds, radii)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+    use impeller_geometry::{Degrees, Matrix, Radians};
+    use impeller_path::{Cap, FillType, Join, PathBuilder, RoundingRadii};
+
+    fn assert_point_near(a: Point, b: Point, eps: Scalar) {
+        assert!(
+            (a.x - b.x).abs() <= eps && (a.y - b.y).abs() <= eps,
+            "expected {:?} near {:?} (eps = {})",
+            a,
+            b,
+            eps
+        );
+    }
+
+    fn mesh_total_area(mesh: &TessellatedMesh) -> Scalar {
+        let mut area = 0.0;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let a = mesh.vertices[tri[0] as usize].to_point();
+            let b = mesh.vertices[tri[1] as usize].to_point();
+            let c = mesh.vertices[tri[2] as usize].to_point();
+            area += (b - a).cross(c - a).abs() * 0.5;
+        }
+        area
+    }
+
+    fn mesh_containing_triangle_count(mesh: &TessellatedMesh, p: Point) -> usize {
+        let mut count = 0;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let a = mesh.vertices[tri[0] as usize].to_point();
+            let b = mesh.vertices[tri[1] as usize].to_point();
+            let c = mesh.vertices[tri[2] as usize].to_point();
+            let area = (b - a).cross(c - a);
+            let (a, b, c) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
+            let c1 = (b - a).cross(p - a);
+            let c2 = (c - b).cross(p - b);
+            let c3 = (a - c).cross(p - c);
+            if c1 > 1e-4 && c2 > 1e-4 && c3 > 1e-4 {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellatorBuilderReturnsCorrectResultStatus
+    #[test]
+    fn tessellator_builder_returns_correct_result_status() {
+        // Zero points -> InputError
+        {
+            let path = PathBuilder::new().build(FillType::Odd);
+            let res = Tessellator::tessellate_with_callback(&path, 1.0, |_, _| true);
+            assert_eq!(res, TessellationResult::InputError);
+        }
+
+        // One point -> Success
+        {
+            let mut pb = PathBuilder::new();
+            pb.line_to(Point::new(0.0, 0.0));
+            let path = pb.build(FillType::Odd);
+            let res = Tessellator::tessellate_with_callback(&path, 1.0, |_, _| true);
+            assert_eq!(res, TessellationResult::Success);
+        }
+
+        // Two points -> Success
+        {
+            let mut pb = PathBuilder::new();
+            pb.move_to(Point::new(0.0, 0.0))
+                .line_to(Point::new(0.0, 1.0));
+            let path = pb.build(FillType::Odd);
+            let res = Tessellator::tessellate_with_callback(&path, 1.0, |_, _| true);
+            assert_eq!(res, TessellationResult::Success);
+        }
+
+        // Many points -> Success
+        {
+            let mut pb = PathBuilder::new();
+            for i in 0..1000 {
+                let coord = i as Scalar;
+                pb.move_to(Point::new(coord, coord))
+                    .line_to(Point::new(coord + 1.0, coord + 1.0));
+            }
+            let path = pb.build(FillType::Odd);
+            let res = Tessellator::tessellate_with_callback(&path, 1.0, |_, _| true);
+            assert_eq!(res, TessellationResult::Success);
+        }
+
+        // Closure fails -> InputError
+        {
+            let mut pb = PathBuilder::new();
+            pb.move_to(Point::new(0.0, 0.0))
+                .line_to(Point::new(0.0, 1.0));
+            let path = pb.build(FillType::Odd);
+            let res = Tessellator::tessellate_with_callback(&path, 1.0, |_, _| false);
+            assert_eq!(res, TessellationResult::InputError);
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateConvex
+    #[test]
+    fn tessellate_convex() {
+        {
+            let mut pb = PathBuilder::new();
+            pb.add_rect(Rect::from_ltrb(0.0, 0.0, 10.0, 10.0));
+            let path = pb.build(FillType::NonZero);
+            let (points, indices) = Tessellator::tessellate_convex_internal(&path, 1.0);
+            let expected_pts = vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+                Point::new(0.0, 0.0),
+            ];
+            let expected_indices: Vec<u16> = vec![0, 1, 3, 2];
+            assert_eq!(points, expected_pts);
+            assert_eq!(indices, expected_indices);
+        }
+
+        {
+            let mut pb = PathBuilder::new();
+            pb.add_rect(Rect::from_ltrb(0.0, 0.0, 10.0, 10.0))
+                .add_rect(Rect::from_ltrb(20.0, 20.0, 30.0, 30.0));
+            let path = pb.build(FillType::NonZero);
+            let (points, indices) = Tessellator::tessellate_convex_internal(&path, 1.0);
+            let expected_pts = vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+                Point::new(0.0, 0.0),
+                Point::new(20.0, 20.0),
+                Point::new(30.0, 20.0),
+                Point::new(30.0, 30.0),
+                Point::new(20.0, 30.0),
+                Point::new(20.0, 20.0),
+            ];
+            let expected_indices: Vec<u16> = vec![0, 1, 3, 2, 2, 5, 5, 6, 8, 7];
+            assert_eq!(points, expected_pts);
+            assert_eq!(indices, expected_indices);
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateConvexUnclosedPath
+    #[test]
+    fn tessellate_convex_unclosed_path() {
+        let mut pb = PathBuilder::new();
+        pb.line_to(Point::new(100.0, 0.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(0.0, 100.0));
+        let path = pb.build(FillType::NonZero);
+        let (points, indices) = Tessellator::tessellate_convex_internal(&path, 1.0);
+        let expected_pts = vec![
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 0.0),
+            Point::new(100.0, 100.0),
+            Point::new(0.0, 100.0),
+            Point::new(0.0, 0.0),
+        ];
+        let expected_indices: Vec<u16> = vec![0, 1, 3, 2];
+        assert_eq!(points, expected_pts);
+        assert_eq!(indices, expected_indices);
+    }
+
+    /// C++ source: tessellator_unittests.cc:EarlyReturnEmptyConvexShape
+    #[test]
+    fn early_return_empty_convex_shape() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(0.0, 0.0))
+            .move_to(Point::new(10.0, 10.0));
+        let path = pb.build(FillType::NonZero);
+        let (points, indices) = Tessellator::tessellate_convex_internal(&path, 3.0);
+        assert!(points.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    /// C++ source: tessellator_unittests.cc:CircleVertexCounts
+    #[test]
+    fn circle_vertex_counts() {
+        let check = |scale: Scalar, radius: Scalar| {
+            let strip = Tessellator::filled_circle_strip(scale, Point::ZERO, radius);
+            let quadrant_divisions = strip.len() / 4;
+            let angle = std::f64::consts::FRAC_PI_2 / (quadrant_divisions as f64);
+            let first = Point::new(radius, 0.0);
+            let next = Point::new(
+                (angle.cos() * radius as f64) as Scalar,
+                (angle.sin() * radius as f64) as Scalar,
+            );
+            let midpoint = (first + next) * 0.5;
+            assert!(
+                midpoint.get_length() >= radius - Tessellator::K_CIRCLE_TOLERANCE * 1.01,
+                "scale={}, radius={}, divisions={}",
+                scale,
+                radius,
+                quadrant_divisions
+            );
+        };
+
+        check(1.0, 0.0);
+        check(1.0, 0.9);
+        check(1.0, 1.0);
+        check(1.0, 1.9);
+        check(2.0, 0.95);
+        check(1.0, 2.0);
+        check(2.0, 1.0);
+        check(1.0, 11.9);
+        check(1.0, 12.0);
+        check(1.0, 35.9);
+        for i in (36..2000).step_by(40) {
+            check(1.0, i as Scalar);
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:StrokedCircleVertexCounts
+    #[test]
+    fn stroked_circle_vertex_counts() {
+        let check = |scale: Scalar, radius: Scalar, half_width: Scalar, label: &str| {
+            assert!(half_width < radius, "{}", label);
+            let stroked = Tessellator::stroked_circle_strip(scale, Point::ZERO, radius, half_width);
+            let filled = Tessellator::filled_circle_strip(scale, Point::ZERO, radius + half_width);
+            assert!(
+                stroked.len() / 8 >= filled.len() / 4,
+                "{}: stroked={}, filled={}",
+                label,
+                stroked.len(),
+                filled.len()
+            );
+        };
+
+        check(1.0, 2.0, 1.0, "small radius");
+        check(1.0, 100.0, 10.0, "large radius");
+        check(500.0, 2.0, 1.0, "small radius, scaled up");
+        check(500.0, 100.0, 10.0, "large radius, scaled up");
+        check(0.002, 1000.0, 10.0, "large radius, scaled down");
+    }
+
+    /// C++ source: tessellator_unittests.cc:FilledCircleTessellationVertices
+    #[test]
+    fn filled_circle_tessellation_vertices() {
+        let check = |scale: Scalar, center: Point, radius: Scalar| {
+            let vertices = Tessellator::filled_circle_strip(scale, center, radius);
+            let vertex_count = vertices.len();
+            assert_eq!(vertex_count % 4, 0);
+
+            let quadrant_count = vertex_count / 4;
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let rsin = (angle.sin() * radius as f64) as Scalar;
+                let rcos = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    (angle.cos() * radius as f64) as Scalar
+                };
+                assert_point_near(
+                    vertices[i * 2],
+                    Point::new(center.x - rcos, center.y + rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[i * 2 + 1],
+                    Point::new(center.x - rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 1],
+                    Point::new(center.x + rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 2],
+                    Point::new(center.x + rcos, center.y + rsin),
+                    1e-3,
+                );
+            }
+        };
+
+        check(1.0, Point::ZERO, 2.0);
+        check(1.0, Point::new(10.0, 10.0), 2.0);
+        check(500.0, Point::ZERO, 2.0);
+        check(0.002, Point::ZERO, 1000.0);
+    }
+
+    /// C++ source: tessellator_unittests.cc:StrokedCircleTessellationVertices
+    #[test]
+    fn stroked_circle_tessellation_vertices() {
+        let check = |scale: Scalar, center: Point, radius: Scalar, half_width: Scalar| {
+            assert!(radius > half_width);
+            let vertices = Tessellator::stroked_circle_strip(scale, center, radius, half_width);
+            let vertex_count = vertices.len();
+            assert_eq!(vertex_count % 8, 0);
+            let quadrant_count = vertex_count / 8;
+
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let r_outer = (radius + half_width) as f64;
+                let rsin = (angle.sin() * r_outer) as Scalar;
+                let rcos = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    (angle.cos() * r_outer) as Scalar
+                };
+                assert_point_near(
+                    vertices[i * 2],
+                    Point::new(center.x - rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 2 + i * 2],
+                    Point::new(center.x + rsin, center.y - rcos),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 4 + i * 2],
+                    Point::new(center.x + rcos, center.y + rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 6 + i * 2],
+                    Point::new(center.x - rsin, center.y + rcos),
+                    1e-3,
+                );
+            }
+
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let r_inner = (radius - half_width) as f64;
+                let rsin = (angle.sin() * r_inner) as Scalar;
+                let rcos = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    (angle.cos() * r_inner) as Scalar
+                };
+                assert_point_near(
+                    vertices[i * 2 + 1],
+                    Point::new(center.x - rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 2 + i * 2 + 1],
+                    Point::new(center.x + rsin, center.y - rcos),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 4 + i * 2 + 1],
+                    Point::new(center.x + rcos, center.y + rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[quadrant_count * 6 + i * 2 + 1],
+                    Point::new(center.x - rsin, center.y + rcos),
+                    1e-3,
+                );
+            }
+        };
+
+        check(1.0, Point::ZERO, 2.0, 1.0);
+        check(1.0, Point::ZERO, 2.0, 0.5);
+        check(1.0, Point::new(10.0, 10.0), 2.0, 1.0);
+        check(500.0, Point::ZERO, 2.0, 1.0);
+        check(0.002, Point::ZERO, 1000.0, 10.0);
+    }
+
+    /// C++ source: tessellator_unittests.cc:StrokedCircleWideStrokeTessellationVertices
+    #[test]
+    fn stroked_circle_wide_stroke_tessellation_vertices() {
+        let check = |scale: Scalar, center: Point, radius: Scalar, half_width: Scalar| {
+            assert!(half_width >= radius);
+            let stroked = Tessellator::stroked_circle_strip(scale, center, radius, half_width);
+            let filled = Tessellator::filled_circle_strip(scale, center, radius + half_width);
+            assert_eq!(stroked.len(), filled.len());
+            for (a, b) in stroked.iter().zip(filled.iter()) {
+                assert_point_near(*a, *b, 1e-4);
+            }
+        };
+
+        check(1.0, Point::ZERO, 2.0, 2.0);
+        check(1.0, Point::ZERO, 2.0, 4.0);
+        check(1.0, Point::new(10.0, 10.0), 2.0, 2.0);
+        check(500.0, Point::ZERO, 2.0, 2.0);
+        check(0.002, Point::ZERO, 1000.0, 1000.0);
+    }
+
+    /// C++ source: tessellator_unittests.cc:RoundCapLineTessellationVertices
+    #[test]
+    fn round_cap_line_tessellation_vertices() {
+        let check = |scale: Scalar, p0: Point, p1: Point, radius: Scalar| {
+            let vertices = Tessellator::round_cap_line_strip(scale, p0, p1, radius);
+            let vertex_count = vertices.len();
+            assert_eq!(vertex_count % 4, 0);
+
+            let mut along = p1 - p0;
+            let length = along.get_length();
+            if length > 0.0 {
+                along *= radius / length;
+            } else {
+                along = Point::new(radius, 0.0);
+            }
+            let across = Point::new(-along.y, along.x);
+
+            let quadrant_count = vertex_count / 4;
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let cos_a = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    angle.cos() as Scalar
+                };
+                let sin_a = angle.sin() as Scalar;
+                let rel_along = along * cos_a;
+                let rel_across = across * sin_a;
+
+                assert_point_near(vertices[i * 2], p0 - rel_along + rel_across, 1e-3);
+                assert_point_near(vertices[i * 2 + 1], p0 - rel_along - rel_across, 1e-3);
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 1],
+                    p1 + rel_along - rel_across,
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 2],
+                    p1 + rel_along + rel_across,
+                    1e-3,
+                );
+            }
+        };
+
+        check(1.0, Point::ZERO, Point::ZERO, 10.0);
+        check(1.0, Point::ZERO, Point::new(10.0, 0.0), 2.0);
+        check(1.0, Point::new(10.0, 0.0), Point::ZERO, 2.0);
+        check(1.0, Point::ZERO, Point::new(10.0, 10.0), 2.0);
+        check(500.0, Point::ZERO, Point::new(10.0, 0.0), 2.0);
+        check(0.002, Point::ZERO, Point::new(10.0, 10.0), 2.0);
+    }
+
+    /// C++ source: tessellator_unittests.cc:FilledEllipseTessellationVertices
+    #[test]
+    fn filled_ellipse_tessellation_vertices() {
+        let check = |scale: Scalar, bounds: Rect| {
+            let center = Point::new(
+                bounds.get_left() + bounds.get_width() * 0.5,
+                bounds.get_top() + bounds.get_height() * 0.5,
+            );
+            let half_w = bounds.get_width() * 0.5;
+            let half_h = bounds.get_height() * 0.5;
+
+            let vertices = Tessellator::filled_ellipse_strip(scale, bounds);
+            let vertex_count = vertices.len();
+            assert_eq!(vertex_count % 4, 0);
+
+            let quadrant_count = vertex_count / 4;
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let rcos = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    (angle.cos() * half_w as f64) as Scalar
+                };
+                let rsin = (angle.sin() * half_h as f64) as Scalar;
+
+                assert_point_near(
+                    vertices[i * 2],
+                    Point::new(center.x - rcos, center.y + rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[i * 2 + 1],
+                    Point::new(center.x - rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 1],
+                    Point::new(center.x + rcos, center.y - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 2],
+                    Point::new(center.x + rcos, center.y + rsin),
+                    1e-3,
+                );
+            }
+        };
+
+        check(1.0, Rect::from_xywh(0.0, 0.0, 2.0, 2.0));
+        check(1.0, Rect::from_xywh(0.0, 0.0, 2.0, 3.0));
+        check(1.0, Rect::from_xywh(0.0, 0.0, 3.0, 2.0));
+        check(1.0, Rect::from_xywh(5.0, 10.0, 2.0, 3.0));
+        check(500.0, Rect::from_xywh(5.0, 10.0, 3.0, 2.0));
+        check(0.002, Rect::from_xywh(5000.0, 10000.0, 3000.0, 2000.0));
+    }
+
+    /// C++ source: tessellator_unittests.cc:FilledRoundRectTessellationVertices
+    #[test]
+    fn filled_round_rect_tessellation_vertices() {
+        let check = |scale: Scalar, bounds: Rect, radii: Size| {
+            let middle_left = bounds.get_left() + radii.width;
+            let middle_top = bounds.get_top() + radii.height;
+            let middle_right = bounds.get_right() - radii.width;
+            let middle_bottom = bounds.get_bottom() - radii.height;
+
+            let vertices = Tessellator::filled_round_rect_strip(scale, bounds, radii);
+            let vertex_count = vertices.len();
+            assert_eq!(vertex_count % 4, 0);
+
+            let quadrant_count = vertex_count / 4;
+            for i in 0..quadrant_count {
+                let angle =
+                    std::f64::consts::FRAC_PI_2 * (i as f64) / ((quadrant_count - 1) as f64);
+                let rcos = if i == quadrant_count - 1 {
+                    0.0
+                } else {
+                    (angle.cos() * radii.width as f64) as Scalar
+                };
+                let rsin = (angle.sin() * radii.height as f64) as Scalar;
+
+                assert_point_near(
+                    vertices[i * 2],
+                    Point::new(middle_left - rcos, middle_bottom + rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[i * 2 + 1],
+                    Point::new(middle_left - rcos, middle_top - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 1],
+                    Point::new(middle_right + rcos, middle_top - rsin),
+                    1e-3,
+                );
+                assert_point_near(
+                    vertices[vertex_count - i * 2 - 2],
+                    Point::new(middle_right + rcos, middle_bottom + rsin),
+                    1e-3,
+                );
+            }
+        };
+
+        check(
+            1.0,
+            Rect::from_xywh(0.0, 0.0, 20.0, 20.0),
+            Size::new(10.0, 10.0),
+        );
+        check(
+            1.0,
+            Rect::from_xywh(0.0, 0.0, 20.0, 20.0),
+            Size::new(10.0, 5.0),
+        );
+        check(
+            1.0,
+            Rect::from_xywh(0.0, 0.0, 20.0, 20.0),
+            Size::new(5.0, 10.0),
+        );
+        check(
+            1.0,
+            Rect::from_xywh(0.0, 0.0, 20.0, 30.0),
+            Size::new(2.0, 2.0),
+        );
+        check(
+            1.0,
+            Rect::from_xywh(5.0, 10.0, 20.0, 30.0),
+            Size::new(2.0, 3.0),
+        );
+        check(
+            500.0,
+            Rect::from_xywh(5.0, 10.0, 30.0, 20.0),
+            Size::new(2.0, 3.0),
+        );
+        check(
+            0.002,
+            Rect::from_xywh(5000.0, 10000.0, 3000.0, 2000.0),
+            Size::new(50.0, 70.0),
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateConcaveLShapeAndUShape
+    #[test]
+    fn tessellate_concave_l_shape_and_u_shape() {
+        // Concave L-shape: 100x100 minus top-right 60x60 ([40..100] x [0..60]).
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(40.0, 0.0))
+            .line_to(Point::new(40.0, 60.0))
+            .line_to(Point::new(100.0, 60.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(0.0, 100.0))
+            .close();
+
+        for fill_type in [FillType::NonZero, FillType::Odd] {
+            let mesh = Tessellator::tessellate(&pb.build(fill_type), 1.0).unwrap();
+            assert_relative_eq!(mesh_total_area(&mesh), 6400.0, epsilon = 0.5);
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(20.0, 20.0)),
+                1
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(80.0, 80.0)),
+                1
+            );
+            // Concave notch must NOT be filled!
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(70.0, 30.0)),
+                0
+            );
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateMultiContourConcentricRingsNonZeroVsOdd
+    #[test]
+    fn tessellate_multi_contour_concentric_rings_non_zero_vs_odd() {
+        // Outer [0, 100]x[0, 100] CCW + Inner [20, 80]x[20, 80] SAME winding (CCW).
+        let mut pb_same = PathBuilder::new();
+        pb_same
+            .move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(100.0, 0.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(0.0, 100.0))
+            .close()
+            .move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(80.0, 20.0))
+            .line_to(Point::new(80.0, 80.0))
+            .line_to(Point::new(20.0, 80.0))
+            .close();
+
+        // Under FillType::Odd, winding 2 at center is a hole (area = 10000 - 3600 = 6400).
+        let mesh_odd = Tessellator::tessellate(&pb_same.build(FillType::Odd), 1.0).unwrap();
+        assert_relative_eq!(mesh_total_area(&mesh_odd), 6400.0, epsilon = 0.5);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh_odd, Point::new(10.0, 50.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh_odd, Point::new(45.0, 50.0)),
+            0
+        );
+
+        // Under FillType::NonZero, winding 2 at center is filled with non-overlapping triangles (area = 10000).
+        let mesh_nz = Tessellator::tessellate(&pb_same.build(FillType::NonZero), 1.0).unwrap();
+        assert_relative_eq!(mesh_total_area(&mesh_nz), 10000.0, epsilon = 0.5);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh_nz, Point::new(10.0, 50.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh_nz, Point::new(45.0, 50.0)),
+            1
+        );
+
+        // Opposite winding (Inner CW): hole under BOTH NonZero and Odd!
+        let mut pb_opp = PathBuilder::new();
+        pb_opp
+            .move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(100.0, 0.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(0.0, 100.0))
+            .close()
+            .move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(20.0, 80.0))
+            .line_to(Point::new(80.0, 80.0))
+            .line_to(Point::new(80.0, 20.0))
+            .close();
+        for ft in [FillType::NonZero, FillType::Odd] {
+            let mesh = Tessellator::tessellate(&pb_opp.build(ft), 1.0).unwrap();
+            assert_relative_eq!(mesh_total_area(&mesh), 6400.0, epsilon = 0.5);
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(50.0, 50.0)),
+                0
+            );
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateSelfIntersectingBowtie
+    #[test]
+    fn tessellate_self_intersecting_bowtie() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(100.0, 0.0))
+            .line_to(Point::new(0.0, 100.0))
+            .close();
+
+        for ft in [FillType::NonZero, FillType::Odd] {
+            let mesh = Tessellator::tessellate(&pb.build(ft), 1.0).unwrap();
+            assert_relative_eq!(mesh_total_area(&mesh), 5000.0, epsilon = 0.5);
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(20.0, 50.0)),
+                1
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(80.0, 50.0)),
+                1
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(50.0, 20.0)),
+                0
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(50.0, 80.0)),
+                0
+            );
+        }
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateSelfIntersectingPentagramNonZeroVsOdd
+    #[test]
+    fn tessellate_self_intersecting_pentagram_non_zero_vs_odd() {
+        let center = Point::new(100.0, 100.0);
+        let radius = 80.0;
+        let star_order = [0usize, 2, 4, 1, 3];
+        let mut pb = PathBuilder::new();
+        for (idx, &k) in star_order.iter().enumerate() {
+            let angle =
+                -std::f32::consts::FRAC_PI_2 + (k as f32) * 2.0 * std::f32::consts::PI / 5.0;
+            let pt = Point::new(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            );
+            if idx == 0 {
+                pb.move_to(pt);
+            } else {
+                pb.line_to(pt);
+            }
+        }
+        pb.close();
+
+        let mesh_nz = Tessellator::tessellate(&pb.build(FillType::NonZero), 1.0).unwrap();
+        let mesh_odd = Tessellator::tessellate(&pb.build(FillType::Odd), 1.0).unwrap();
+
+        // Center of pentagram has winding number 2: filled in NonZero, hole in Odd!
+        assert_eq!(mesh_containing_triangle_count(&mesh_nz, center), 1);
+        assert_eq!(mesh_containing_triangle_count(&mesh_odd, center), 0);
+        assert!(mesh_total_area(&mesh_nz) > mesh_total_area(&mesh_odd) + 500.0);
+    }
+
+    /// C++ source: tessellator_unittests.cc:TessellateNestedIslandInHole
+    #[test]
+    fn tessellate_nested_island_in_hole() {
+        // Outer [0..100] CCW (10000) + Hole [20..80] CW (-3600) + Island [40..60] CCW (+400) = 6800.
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(100.0, 0.0))
+            .line_to(Point::new(100.0, 100.0))
+            .line_to(Point::new(0.0, 100.0))
+            .close()
+            .move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(20.0, 80.0))
+            .line_to(Point::new(80.0, 80.0))
+            .line_to(Point::new(80.0, 20.0))
+            .close()
+            .move_to(Point::new(40.0, 40.0))
+            .line_to(Point::new(60.0, 40.0))
+            .line_to(Point::new(60.0, 60.0))
+            .line_to(Point::new(40.0, 60.0))
+            .close();
+
+        for ft in [FillType::NonZero, FillType::Odd] {
+            let mesh = Tessellator::tessellate(&pb.build(ft), 1.0).unwrap();
+            assert_relative_eq!(mesh_total_area(&mesh), 6800.0, epsilon = 0.5);
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(10.0, 50.0)),
+                1
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(30.0, 50.0)),
+                0
+            );
+            assert_eq!(
+                mesh_containing_triangle_count(&mesh, Point::new(45.0, 50.0)),
+                1
+            );
+        }
+    }
+
+    /// C++ source: geometry_unittests.cc:RectGeometryCoversArea
+    #[test]
+    fn rect_geometry_covers_area() {
+        let geom = RectGeometry::new(Rect::from_ltrb(0.0, 0.0, 100.0, 100.0));
+        let id = Matrix::IDENTITY;
+        assert!(geom.covers_area(&id, Rect::from_ltrb(0.0, 0.0, 100.0, 100.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(-1.0, 0.0, 100.0, 100.0)));
+        assert!(geom.covers_area(&id, Rect::from_ltrb(1.0, 1.0, 100.0, 100.0)));
+        assert!(geom.covers_area(&id, Rect::ZERO));
+    }
+
+    /// C++ source: geometry_unittests.cc:FillPathGeometryCoversArea
+    #[test]
+    fn fill_path_geometry_covers_area() {
+        let mut pb = PathBuilder::new();
+        pb.add_rect(Rect::from_ltrb(0.0, 0.0, 100.0, 100.0));
+        let geom = FillPathGeometry::new(pb.build(FillType::NonZero));
+        let inner = Some(Rect::from_ltrb(0.0, 0.0, 100.0, 100.0));
+        let id = Matrix::IDENTITY;
+        assert!(geom.covers_area(&id, inner, Rect::from_ltrb(0.0, 0.0, 100.0, 100.0)));
+        assert!(!geom.covers_area(&id, inner, Rect::from_ltrb(-1.0, 0.0, 100.0, 100.0)));
+        assert!(geom.covers_area(&id, inner, Rect::from_ltrb(1.0, 1.0, 100.0, 100.0)));
+        assert!(geom.covers_area(&id, inner, Rect::ZERO));
+    }
+
+    /// C++ source: geometry_unittests.cc:FillPathGeometryCoversAreaNoInnerRect
+    #[test]
+    fn fill_path_geometry_covers_area_no_inner_rect() {
+        let mut pb = PathBuilder::new();
+        pb.add_rect(Rect::from_ltrb(0.0, 0.0, 100.0, 100.0));
+        let geom = FillPathGeometry::new(pb.build(FillType::NonZero));
+        let id = Matrix::IDENTITY;
+        assert!(!geom.covers_area(&id, None, Rect::from_ltrb(0.0, 0.0, 100.0, 100.0)));
+        assert!(!geom.covers_area(&id, None, Rect::from_ltrb(-1.0, 0.0, 100.0, 100.0)));
+        assert!(!geom.covers_area(&id, None, Rect::from_ltrb(1.0, 1.0, 100.0, 100.0)));
+        assert!(!geom.covers_area(&id, None, Rect::ZERO));
+    }
+
+    /// C++ source: geometry_unittests.cc:FillRoundRectGeometryCoversArea
+    #[test]
+    fn fill_round_rect_geometry_covers_area() {
+        let bounds = Rect::from_ltrb(100.0, 100.0, 200.0, 200.0);
+        let radii = RoundingRadii::from_radii(
+            Size::new(1.0, 11.0),
+            Size::new(2.0, 12.0),
+            Size::new(3.0, 13.0),
+            Size::new(4.0, 14.0),
+        );
+        let geom = RoundRectGeometry::new(bounds, radii);
+        let id = Matrix::IDENTITY;
+
+        assert!(geom.covers_area(&id, Rect::from_ltrb(103.0, 100.0, 196.0, 200.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(102.0, 100.0, 196.0, 200.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(103.0, 99.0, 196.0, 200.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(103.0, 100.0, 197.0, 200.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(103.0, 100.0, 196.0, 201.0)));
+
+        assert!(geom.covers_area(&id, Rect::from_ltrb(100.0, 112.0, 200.0, 186.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(99.0, 112.0, 200.0, 186.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(100.0, 111.0, 200.0, 186.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(100.0, 112.0, 201.0, 186.0)));
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(100.0, 112.0, 200.0, 187.0)));
+    }
+
+    /// C++ source: geometry_unittests.cc:LineGeometryCoverage
+    #[test]
+    fn line_geometry_coverage() {
+        let id = Matrix::IDENTITY;
+        {
+            let geom = LineGeometry::new(
+                Point::new(10.0, 10.0),
+                Point::new(20.0, 10.0),
+                2.0,
+                Cap::Butt,
+            );
+            assert_eq!(
+                geom.get_coverage(&id),
+                Some(Rect::from_ltrb(10.0, 9.0, 20.0, 11.0))
+            );
+            assert!(geom.covers_area(&id, Rect::from_ltrb(10.0, 9.0, 20.0, 11.0)));
+        }
+        {
+            let geom = LineGeometry::new(
+                Point::new(10.0, 10.0),
+                Point::new(20.0, 10.0),
+                2.0,
+                Cap::Square,
+            );
+            assert_eq!(
+                geom.get_coverage(&id),
+                Some(Rect::from_ltrb(9.0, 9.0, 21.0, 11.0))
+            );
+            assert!(geom.covers_area(&id, Rect::from_ltrb(9.0, 9.0, 21.0, 11.0)));
+        }
+        {
+            let geom = LineGeometry::new(
+                Point::new(10.0, 10.0),
+                Point::new(10.0, 20.0),
+                2.0,
+                Cap::Butt,
+            );
+            assert_eq!(
+                geom.get_coverage(&id),
+                Some(Rect::from_ltrb(9.0, 10.0, 11.0, 20.0))
+            );
+            assert!(geom.covers_area(&id, Rect::from_ltrb(9.0, 10.0, 11.0, 20.0)));
+        }
+        {
+            let geom = LineGeometry::new(
+                Point::new(10.0, 10.0),
+                Point::new(10.0, 20.0),
+                2.0,
+                Cap::Square,
+            );
+            assert_eq!(
+                geom.get_coverage(&id),
+                Some(Rect::from_ltrb(9.0, 9.0, 11.0, 21.0))
+            );
+            assert!(geom.covers_area(&id, Rect::from_ltrb(9.0, 9.0, 11.0, 21.0)));
+        }
+    }
+
+    /// C++ source: geometry_unittests.cc:RoundRectGeometryCoversArea
+    #[test]
+    fn round_rect_geometry_covers_area() {
+        let geom = RoundRectGeometry::new(
+            Rect::from_ltrb(0.0, 0.0, 100.0, 100.0),
+            RoundingRadii::from_single_radius(20.0),
+        );
+        let id = Matrix::IDENTITY;
+        assert!(!geom.covers_area(&id, Rect::from_ltrb(15.0, 15.0, 85.0, 85.0)));
+        assert!(geom.covers_area(&id, Rect::from_ltrb(20.0, 20.0, 80.0, 80.0)));
+        assert!(geom.covers_area(&id, Rect::from_ltrb(30.0, 1.0, 70.0, 99.0)));
+        assert!(geom.covers_area(&id, Rect::from_ltrb(1.0, 30.0, 99.0, 70.0)));
+    }
+
+    /// C++ source: geometry_unittests.cc:AlphaCoverageStrokePaths
+    #[test]
+    fn alpha_coverage_stroke_paths() {
+        let matrix = Matrix::make_scale(3.0, 3.0, 1.0);
+        assert_eq!(compute_stroke_alpha_coverage(&matrix, 0.5), 1.0);
+        assert_relative_eq!(
+            compute_stroke_alpha_coverage(&matrix, 0.1),
+            0.6,
+            epsilon = 0.05
+        );
+        assert_relative_eq!(
+            compute_stroke_alpha_coverage(&matrix, 0.05),
+            0.3,
+            epsilon = 0.05
+        );
+        assert_relative_eq!(
+            compute_stroke_alpha_coverage(&matrix, 0.01),
+            0.1,
+            epsilon = 0.1
+        );
+        assert_relative_eq!(
+            compute_stroke_alpha_coverage(&matrix, 0.0000005),
+            1e-5,
+            epsilon = 0.001
+        );
+        assert_eq!(compute_stroke_alpha_coverage(&matrix, 0.0), 1.0);
+        assert_eq!(compute_stroke_alpha_coverage(&matrix, 40.0), 1.0);
+    }
+
+    /// C++ source: geometry_unittests.cc:SimpleTwoLineStrokeVerticesButtCap
+    #[test]
+    fn simple_two_line_stroke_vertices_butt_cap() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .move_to(Point::new(120.0, 20.0))
+            .line_to(Point::new(130.0, 20.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(30.0, 20.0),
+            Point::new(30.0, 20.0),
+            Point::new(120.0, 20.0),
+            Point::new(120.0, 20.0),
+            Point::new(120.0, 25.0),
+            Point::new(120.0, 15.0),
+            Point::new(130.0, 25.0),
+            Point::new(130.0, 15.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:SimpleTwoLineStrokeVerticesRoundCap
+    #[test]
+    fn simple_two_line_stroke_vertices_round_cap() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .move_to(Point::new(120.0, 20.0))
+            .line_to(Point::new(130.0, 20.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Round,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        assert_eq!(points.len(), 40);
+
+        let offset = |step: i32, left: bool, backwards: bool| -> Point {
+            let angle = std::f32::consts::FRAC_PI_2 * (step as f32 / 4.0);
+            let along = Point::new(5.0, 0.0) * angle.cos();
+            let across = Point::new(0.0, 5.0) * angle.sin();
+            let center = if backwards { -along } else { along };
+            if left {
+                center + across
+            } else {
+                center - across
+            }
+        };
+
+        assert_point_near(points[0], Point::new(15.0, 20.0), 1e-4);
+        assert_point_near(
+            points[1],
+            Point::new(20.0, 20.0) + offset(1, true, true),
+            1e-4,
+        );
+        assert_point_near(
+            points[2],
+            Point::new(20.0, 20.0) + offset(1, false, true),
+            1e-4,
+        );
+        assert_point_near(
+            points[3],
+            Point::new(20.0, 20.0) + offset(2, true, true),
+            1e-4,
+        );
+        assert_point_near(
+            points[4],
+            Point::new(20.0, 20.0) + offset(2, false, true),
+            1e-4,
+        );
+        assert_point_near(
+            points[5],
+            Point::new(20.0, 20.0) + offset(3, true, true),
+            1e-4,
+        );
+        assert_point_near(
+            points[6],
+            Point::new(20.0, 20.0) + offset(3, false, true),
+            1e-4,
+        );
+        assert_point_near(points[7], Point::new(20.0, 25.0), 1e-4);
+        assert_point_near(points[8], Point::new(20.0, 15.0), 1e-4);
+        assert_point_near(points[9], Point::new(30.0, 25.0), 1e-4);
+        assert_point_near(points[10], Point::new(30.0, 15.0), 1e-4);
+        assert_point_near(
+            points[11],
+            Point::new(30.0, 20.0) + offset(3, true, false),
+            1e-4,
+        );
+        assert_point_near(
+            points[12],
+            Point::new(30.0, 20.0) + offset(3, false, false),
+            1e-4,
+        );
+        assert_point_near(points[17], Point::new(35.0, 20.0), 1e-4);
+        assert_point_near(points[18], Point::new(30.0, 20.0), 1e-4);
+        assert_point_near(points[21], Point::new(120.0, 20.0), 1e-4);
+        assert_point_near(points[22], Point::new(115.0, 20.0), 1e-4);
+        assert_point_near(points[39], Point::new(135.0, 20.0), 1e-4);
+    }
+
+    /// C++ source: geometry_unittests.cc:SimpleTwoLineStrokeVerticesSquareCap
+    #[test]
+    fn simple_two_line_stroke_vertices_square_cap() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .move_to(Point::new(120.0, 20.0))
+            .line_to(Point::new(130.0, 20.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Square,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(15.0, 25.0),
+            Point::new(15.0, 15.0),
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(35.0, 25.0),
+            Point::new(35.0, 15.0),
+            Point::new(30.0, 20.0),
+            Point::new(30.0, 20.0),
+            Point::new(120.0, 20.0),
+            Point::new(120.0, 20.0),
+            Point::new(115.0, 25.0),
+            Point::new(115.0, 15.0),
+            Point::new(120.0, 25.0),
+            Point::new(120.0, 15.0),
+            Point::new(130.0, 25.0),
+            Point::new(130.0, 15.0),
+            Point::new(135.0, 25.0),
+            Point::new(135.0, 15.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsRightTurnStrokeVerticesBevelJoin
+    #[test]
+    fn two_line_segments_right_turn_stroke_vertices_bevel_join() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .line_to(Point::new(30.0, 30.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(25.0, 20.0),
+            Point::new(35.0, 20.0),
+            Point::new(25.0, 30.0),
+            Point::new(35.0, 30.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsLeftTurnStrokeVerticesBevelJoin
+    #[test]
+    fn two_line_segments_left_turn_stroke_vertices_bevel_join() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .line_to(Point::new(30.0, 10.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(35.0, 20.0),
+            Point::new(25.0, 20.0),
+            Point::new(35.0, 10.0),
+            Point::new(25.0, 10.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsInDifferentContoursAreNotJoined
+    #[test]
+    fn two_line_segments_in_different_contours_are_not_joined() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .move_to(Point::new(30.0, 20.0))
+            .line_to(Point::new(30.0, 30.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(30.0, 20.0),
+            Point::new(30.0, 20.0),
+            Point::new(30.0, 20.0),
+            Point::new(30.0, 20.0),
+            Point::new(25.0, 20.0),
+            Point::new(35.0, 20.0),
+            Point::new(25.0, 30.0),
+            Point::new(35.0, 30.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsRightTurnStrokeVerticesMiterJoin
+    #[test]
+    fn two_line_segments_right_turn_stroke_vertices_miter_join() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .line_to(Point::new(30.0, 30.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(35.0, 15.0),
+            Point::new(25.0, 20.0),
+            Point::new(35.0, 20.0),
+            Point::new(25.0, 30.0),
+            Point::new(35.0, 30.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsLeftTurnStrokeVerticesMiterJoin
+    #[test]
+    fn two_line_segments_left_turn_stroke_vertices_miter_join() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .line_to(Point::new(30.0, 20.0))
+            .line_to(Point::new(30.0, 10.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(20.0, 25.0),
+            Point::new(20.0, 15.0),
+            Point::new(30.0, 25.0),
+            Point::new(30.0, 15.0),
+            Point::new(35.0, 25.0),
+            Point::new(35.0, 20.0),
+            Point::new(25.0, 20.0),
+            Point::new(35.0, 10.0),
+            Point::new(25.0, 10.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TinyQuadGeneratesCaps
+    #[test]
+    fn tiny_quad_generates_caps() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0))
+            .quad_to(Point::new(20.125, 20.0), Point::new(20.250, 20.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 4.0,
+                cap: Cap::Square,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(18.0, 22.0),
+            Point::new(18.0, 18.0),
+            Point::new(20.0, 22.0),
+            Point::new(20.0, 18.0),
+            Point::new(20.25, 22.0),
+            Point::new(20.25, 18.0),
+            Point::new(22.25, 22.0),
+            Point::new(22.25, 18.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TinyCubicGeneratesCaps
+    #[test]
+    fn tiny_cubic_generates_caps() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(20.0, 20.0)).cubic_to(
+            Point::new(20.0625, 20.0),
+            Point::new(20.125, 20.0),
+            Point::new(20.250, 20.0),
+        );
+        let path = pb.build(FillType::NonZero);
+
+        let points = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 4.0,
+                cap: Cap::Square,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+
+        let expected = vec![
+            Point::new(18.0, 22.0),
+            Point::new(18.0, 18.0),
+            Point::new(20.0, 22.0),
+            Point::new(20.0, 18.0),
+            Point::new(20.25, 22.0),
+            Point::new(20.25, 18.0),
+            Point::new(22.25, 22.0),
+            Point::new(22.25, 18.0),
+        ];
+        assert_eq!(points, expected);
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegmentsMiterLimit
+    #[test]
+    fn two_line_segments_miter_limit() {
+        for degrees in (10..180).step_by(10) {
+            for width in 2..=10 {
+                let r: Radians = Degrees(degrees as Scalar).into();
+                let pixel_delta = Point::new(r.0.cos(), r.0.sin());
+                if pixel_delta.get_distance(Point::new(1.0, 0.0)) * (width as Scalar) < 1.0 {
+                    continue;
+                }
+                let r_between: Radians = Degrees((180 - degrees) as Scalar).into();
+                let limit = 1.0 / (r_between.0 * 0.5).sin();
+
+                let mut pb = PathBuilder::new();
+                pb.move_to(Point::new(20.0, 20.0))
+                    .line_to(Point::new(30.0, 20.0))
+                    .line_to(Point::new(30.0, 20.0) + pixel_delta * 10.0);
+                let path = pb.build(FillType::NonZero);
+
+                // 99% of required limit -> bevel fallback (8 points)
+                let pts1 = Tessellator::generate_solid_stroke_vertices(
+                    &path,
+                    StrokeParameters {
+                        width: width as Scalar,
+                        cap: Cap::Butt,
+                        join: Join::Miter,
+                        miter_limit: limit * 0.99,
+                    },
+                    1.0,
+                );
+                assert_eq!(pts1.len(), 8, "deg={}, width={}", degrees, width);
+
+                // 101% of required limit -> miter join (9 points)
+                let pts2 = Tessellator::generate_solid_stroke_vertices(
+                    &path,
+                    StrokeParameters {
+                        width: width as Scalar,
+                        cap: Cap::Butt,
+                        join: Join::Miter,
+                        miter_limit: limit * 1.01,
+                    },
+                    1.0,
+                );
+                assert_eq!(pts2.len(), 9, "deg={}, width={}", degrees, width);
+                assert!(
+                    pts2[4].get_distance(Point::new(30.0, 20.0))
+                        <= (width as Scalar) * limit * 1.05
+                );
+            }
+        }
+    }
+
+    /// C++ source: geometry_unittests.cc:TwoLineSegments180DegreeJoins
+    #[test]
+    fn two_line_segments_180_degree_joins() {
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(10.0, 10.0))
+            .line_to(Point::new(100.0, 10.0))
+            .line_to(Point::new(10.0, 10.0));
+        let path = pb.build(FillType::NonZero);
+
+        let points_bevel = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 20.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_eq!(points_bevel.len(), 8);
+
+        let points_miter = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 20.0,
+                cap: Cap::Butt,
+                join: Join::Miter,
+                miter_limit: 400.0,
+            },
+            1.0,
+        );
+        assert_eq!(points_miter.len(), 8);
+
+        let points_round = Tessellator::generate_solid_stroke_vertices(
+            &path,
+            StrokeParameters {
+                width: 20.0,
+                cap: Cap::Butt,
+                join: Join::Round,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_eq!(points_round.len(), 19);
+    }
+
+    /// C++ source: geometry_unittests.cc:TightQuadratic180DegreeJoins
+    #[test]
+    fn tight_quadratic_180_degree_joins() {
+        let mut pb_ref = PathBuilder::new();
+        pb_ref
+            .move_to(Point::new(10.0, 10.0))
+            .quad_to(Point::new(100.0, 10.0), Point::new(100.0, 100.0));
+        let path_ref = pb_ref.build(FillType::NonZero);
+
+        let pts_ref = Tessellator::generate_solid_stroke_vertices(
+            &path_ref,
+            StrokeParameters {
+                width: 20.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_eq!(pts_ref.len(), 74);
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(10.0, 10.0))
+            .quad_to(Point::new(100.0, 10.0), Point::new(10.0, 10.0));
+        let path = pb.build(FillType::NonZero);
+
+        for join in [Join::Bevel, Join::Miter, Join::Round] {
+            let pts = Tessellator::generate_solid_stroke_vertices(
+                &path,
+                StrokeParameters {
+                    width: 20.0,
+                    cap: Cap::Butt,
+                    join,
+                    miter_limit: 400.0,
+                },
+                1.0,
+            );
+            assert!(pts.len() > pts_ref.len());
+        }
+    }
+
+    /// C++ source: geometry_unittests.cc:TightCubic180DegreeJoins
+    #[test]
+    fn tight_cubic_180_degree_joins() {
+        let mut pb_ref = PathBuilder::new();
+        pb_ref.move_to(Point::new(10.0, 10.0)).cubic_to(
+            Point::new(60.0, 10.0),
+            Point::new(100.0, 40.0),
+            Point::new(100.0, 90.0),
+        );
+        let path_ref = pb_ref.build(FillType::NonZero);
+
+        let pts_ref = Tessellator::generate_solid_stroke_vertices(
+            &path_ref,
+            StrokeParameters {
+                width: 20.0,
+                cap: Cap::Butt,
+                join: Join::Bevel,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_eq!(pts_ref.len(), 76);
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(10.0, 10.0)).cubic_to(
+            Point::new(60.0, 10.0),
+            Point::new(100.0, 40.0),
+            Point::new(60.0, 10.0),
+        );
+        let path = pb.build(FillType::NonZero);
+
+        for join in [Join::Bevel, Join::Miter, Join::Round] {
+            let pts = Tessellator::generate_solid_stroke_vertices(
+                &path,
+                StrokeParameters {
+                    width: 20.0,
+                    cap: Cap::Butt,
+                    join,
+                    miter_limit: 400.0,
+                },
+                1.0,
+            );
+            assert!(pts.len() > pts_ref.len());
+        }
+    }
+
+    /// C++ source: geometry_unittests.cc:RotatedFilledCircleGeometryCoverage
+    #[test]
+    fn rotated_filled_circle_geometry_coverage() {
+        let center = Point::new(50.0, 50.0);
+        let geom = CircleGeometry::new(center, 50.0);
+        let circle_bounds = Rect::from_ltrb(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(geom.get_coverage(&Matrix::IDENTITY), Some(circle_bounds));
+
+        let transform45 = Matrix::make_translation(center.x, center.y, 0.0)
+            * Matrix::make_rotation_z(Degrees(45.0).into())
+            * Matrix::make_translation(-center.x, -center.y, 0.0);
+        let bounds = geom.get_coverage(&transform45).unwrap();
+        assert!(primitives::rect_contains_rect(bounds, circle_bounds));
+    }
+
+    /// C++ source: geometry_unittests.cc:RotatedStrokedCircleGeometryCoverage
+    #[test]
+    fn rotated_stroked_circle_geometry_coverage() {
+        let center = Point::new(50.0, 50.0);
+        let geom = CircleGeometry::new(center, 50.0);
+        let circle_bounds = Rect::from_ltrb(-5.0, -5.0, 105.0, 105.0);
+        assert_eq!(
+            geom.get_stroked_coverage(10.0, &Matrix::IDENTITY),
+            Some(circle_bounds)
+        );
+
+        let transform45 = Matrix::make_translation(center.x, center.y, 0.0)
+            * Matrix::make_rotation_z(Degrees(45.0).into())
+            * Matrix::make_translation(-center.x, -center.y, 0.0);
+        let bounds = geom.get_stroked_coverage(10.0, &transform45).unwrap();
+        assert!(primitives::rect_contains_rect(bounds, circle_bounds));
+    }
+
+    /// C++ source: geometry_unittests.cc:RoundRectGeometryPerCornerDivisions
+    #[test]
+    fn test_asymmetric_round_rect_trig_corner_smoothness() {
+        let rect = Rect::from_xywh(10.0, 20.0, 160.0, 100.0);
+        let radii = RoundingRadii {
+            top_left: Size::new(28.0, 28.0),
+            top_right: Size::new(6.0, 6.0),
+            bottom_left: Size::new(6.0, 6.0),
+            bottom_right: Size::new(28.0, 28.0),
+        };
+        let geom = RoundRectGeometry::new(rect, radii);
+        let mesh = geom.get_mesh(1.0);
+
+        // At r_max = 28 >= 4.0, each of the 4 corners has >= 12 divisions (>= 48 perimeter vertices).
+        assert!(
+            mesh.vertices.len() >= 48,
+            "expected >= 48 trig vertices on asymmetric rrect, got {}",
+            mesh.vertices.len()
+        );
+
+        // Verify vertices on the top-left corner arc (center = (38, 48), r = 28) lie on the true circle.
+        let tl_center = Point::new(10.0 + 28.0, 20.0 + 28.0);
+        let mut tl_arc_count = 0usize;
+        for v in &mesh.vertices {
+            let p = v.to_point();
+            if p.x <= tl_center.x + 1e-4 && p.y <= tl_center.y + 1e-4 {
+                let dist = (p - tl_center).get_length();
+                assert_relative_eq!(dist, 28.0, epsilon = 1e-3);
+                tl_arc_count += 1;
+            }
+        }
+        assert!(
+            tl_arc_count >= 13,
+            "expected >= 13 vertices on top-left corner arc, got {}",
+            tl_arc_count
+        );
+
+        // Exact inscribed polygon area and continuous analytical area.
+        let divs = (tl_arc_count - 1) as f32;
+        let inscribed_quadrant_factor = 0.5 * divs * (std::f32::consts::FRAC_PI_2 / divs).sin();
+        let sum_r2 = 28.0 * 28.0 + 6.0 * 6.0 + 6.0 * 6.0 + 28.0 * 28.0;
+        let expected_inscribed = 160.0 * 100.0 - (1.0 - inscribed_quadrant_factor) * sum_r2;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_inscribed, epsilon = 0.1);
+        let expected_continuous = 160.0 * 100.0 - (1.0 - std::f32::consts::FRAC_PI_4) * sum_r2;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_continuous, epsilon = 2.5);
+    }
+
+    /// C++ source: geometry_unittests.cc:StrokeRoundRectGeometryCoversRing
+    #[test]
+    fn test_stroked_round_rect_geometry_ring() {
+        let rect = Rect::from_xywh(20.0, 20.0, 120.0, 80.0);
+        let radii = RoundingRadii {
+            top_left: Size::new(20.0, 20.0),
+            top_right: Size::new(8.0, 8.0),
+            bottom_left: Size::new(8.0, 8.0),
+            bottom_right: Size::new(20.0, 20.0),
+        };
+        let geom = RoundRectGeometry::new(rect, radii);
+        let stroke = StrokeParameters {
+            width: 6.0,
+            cap: Cap::Butt,
+            join: Join::Round,
+            miter_limit: 4.0,
+        };
+        let mesh = geom.get_stroked_mesh(stroke, 1.0);
+        assert!(!mesh.vertices.is_empty());
+        assert!(!mesh.indices.is_empty());
+
+        // Hollow center is NOT covered.
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(80.0, 60.0)),
+            0
+        );
+        // Points on the top, bottom, left, right stroke bands ARE covered once.
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(80.0, 20.5)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(80.0, 99.5)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(20.5, 60.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(139.5, 60.0)),
+            1
+        );
+
+        // Ring area matches analytical outer_rrect_area - inner_rrect_area.
+        let rrect_area = |w: f32, h: f32, r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32| -> f32 {
+            w * h
+                - (1.0 - std::f32::consts::FRAC_PI_4)
+                    * (r_tl * r_tl + r_tr * r_tr + r_bl * r_bl + r_br * r_br)
+        };
+        let outer_area = rrect_area(126.0, 86.0, 23.0, 11.0, 11.0, 23.0);
+        let inner_area = rrect_area(114.0, 74.0, 17.0, 5.0, 5.0, 17.0);
+        assert_relative_eq!(
+            mesh_total_area(&mesh),
+            outer_area - inner_area,
+            epsilon = 1.5
+        );
+
+        // Subpixel stroke width (0.25 at scale 1.0) clamps to 1.0 physical device pixel wide.
+        let subpixel_mesh = geom.get_stroked_mesh(
+            StrokeParameters {
+                width: 0.25,
+                ..stroke
+            },
+            1.0,
+        );
+        let min_clamped_outer = rrect_area(121.0, 81.0, 20.5, 8.5, 8.5, 20.5);
+        let min_clamped_inner = rrect_area(119.0, 79.0, 19.5, 7.5, 7.5, 19.5);
+        assert_relative_eq!(
+            mesh_total_area(&subpixel_mesh),
+            min_clamped_outer - min_clamped_inner,
+            epsilon = 1.0
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:TrigsStaticCacheReuse
+    #[test]
+    fn test_trigs_static_cache_reuse() {
+        for d in 1..=64 {
+            let t1 = Trigs::from_divisions(d);
+            let t2 = Trigs::from_divisions(d);
+            assert_eq!(t1.len(), d + 1);
+            assert!(
+                std::ptr::eq(t1.as_slice().as_ptr(), t2.as_slice().as_ptr()),
+                "expected static slice reuse for divisions = {d}"
+            );
+        }
+        let uncached = Trigs::from_divisions(80);
+        assert_eq!(uncached.len(), 81);
+    }
+
+    /// C++ source: geometry_unittests.cc:RoundRectGeometryUniformStripFastPath
+    #[test]
+    fn test_uniform_round_rect_strip_fast_path() {
+        let rect = Rect::from_xywh(10.0, 20.0, 120.0, 80.0);
+        let radii = RoundingRadii::from_single_radius(16.0);
+        let geom = RoundRectGeometry::new(rect, radii);
+        let mesh = geom.get_mesh(1.0);
+        assert!(!mesh.vertices.is_empty());
+        assert!(!mesh.indices.is_empty());
+
+        let expected_continuous = 120.0 * 80.0 - (4.0 - std::f32::consts::PI) * 16.0 * 16.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_continuous, epsilon = 1.5);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 60.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(75.0, 60.0)),
+            1
+        );
+    }
+
+    /// C++ source: geometry_unittests.cc:ArcGeometryFillAndStroke
+    #[test]
+    fn test_arc_geometry_fill_and_stroke() {
+        let oval = Rect::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let divs = compute_quadrant_divisions(50.0) as f32;
+
+        // 90-degree pie wedge (use_center = true), radius = 50
+        let wedge = ArcGeometry::new(
+            oval,
+            Radians(0.0),
+            Radians(std::f32::consts::FRAC_PI_2),
+            true,
+        );
+        let wedge_mesh = wedge.get_mesh(1.0);
+        let expected_wedge_inscribed =
+            0.5 * divs * 50.0 * 50.0 * (std::f32::consts::FRAC_PI_2 / divs).sin();
+        assert_relative_eq!(
+            mesh_total_area(&wedge_mesh),
+            expected_wedge_inscribed,
+            epsilon = 0.1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&wedge_mesh, Point::new(65.0, 65.0)),
+            1
+        );
+
+        // 180-degree semicircle chord (use_center = false)
+        let chord = ArcGeometry::new(oval, Radians(0.0), Radians(std::f32::consts::PI), false);
+        let chord_mesh = chord.get_mesh(1.0);
+        let semi_divs = 2.0 * divs;
+        let expected_chord_inscribed =
+            0.5 * semi_divs * 50.0 * 50.0 * (std::f32::consts::PI / semi_divs).sin();
+        assert_relative_eq!(
+            mesh_total_area(&chord_mesh),
+            expected_chord_inscribed,
+            epsilon = 0.2
+        );
+
+        // 90-degree stroked arc (r_in = 45, r_out = 55, width = 10)
+        let arc_open = ArcGeometry::new(
+            oval,
+            Radians(0.0),
+            Radians(std::f32::consts::FRAC_PI_2),
+            false,
+        );
+        let stroke_divs = compute_quadrant_divisions(55.0) as f32;
+        let butt_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Butt,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        let expected_butt = 0.5
+            * stroke_divs
+            * (55.0 * 55.0 - 45.0 * 45.0)
+            * (std::f32::consts::FRAC_PI_2 / stroke_divs).sin();
+        assert_relative_eq!(mesh_total_area(&butt_mesh), expected_butt, epsilon = 0.2);
+
+        let square_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Square,
+                join: Join::Miter,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        assert_relative_eq!(
+            mesh_total_area(&square_mesh),
+            expected_butt + 100.0,
+            epsilon = 0.2
+        );
+
+        let round_mesh = arc_open.get_stroked_mesh(
+            StrokeParameters {
+                width: 10.0,
+                cap: Cap::Round,
+                join: Join::Round,
+                miter_limit: 4.0,
+            },
+            1.0,
+        );
+        let cap_divs = compute_quadrant_divisions(5.0) as f32;
+        let expected_cap_area = 2.0
+            * (0.5 * 2.0 * cap_divs * 5.0 * 5.0 * (std::f32::consts::FRAC_PI_2 / cap_divs).sin());
+        assert_relative_eq!(
+            mesh_total_area(&round_mesh),
+            expected_butt + expected_cap_area,
+            epsilon = 0.2
+        );
+    }
+
+    /// C++ source: geometry_unittests.cc:DiffRoundRectGeometryCoversNestedBorderAndRejectsInvalidInner
+    #[test]
+    fn test_diff_round_rect_geometry_ring_and_containment() {
+        let outer = Rect::from_xywh(10.0, 20.0, 120.0, 80.0);
+        let outer_radii = RoundingRadii::from_single_radius(16.0);
+        let inner = Rect::from_xywh(16.0, 26.0, 108.0, 68.0);
+        let inner_radii = RoundingRadii::from_single_radius(10.0);
+
+        let geom = DiffRoundRectGeometry::new(outer, outer_radii, inner, inner_radii);
+        let mesh = geom
+            .get_mesh(1.0)
+            .expect("valid nested DiffRoundRectGeometry");
+
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(70.0, 60.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 23.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(13.0, 55.0)),
+            1
+        );
+
+        let rrect_area =
+            |w: f32, h: f32, r: f32| -> f32 { w * h - (4.0 - std::f32::consts::PI) * r * r };
+        let expected_ring = rrect_area(120.0, 80.0, 16.0) - rrect_area(108.0, 68.0, 10.0);
+        assert_relative_eq!(mesh_total_area(&mesh), expected_ring, epsilon = 1.5);
+
+        // Square inner hole poking out of a rounded outer corner must return None.
+        let poking_inner = Rect::from_xywh(11.0, 21.0, 118.0, 78.0);
+        let poking = DiffRoundRectGeometry::new(
+            outer,
+            RoundingRadii::from_single_radius(24.0),
+            poking_inner,
+            RoundingRadii::ZERO,
+        );
+        assert!(poking.get_mesh(1.0).is_none());
+
+        // Inner rect extending outside outer rect must return None.
+        let outside_inner = Rect::from_xywh(0.0, 20.0, 120.0, 80.0);
+        let outside = DiffRoundRectGeometry::new(outer, outer_radii, outside_inner, inner_radii);
+        assert!(outside.get_mesh(1.0).is_none());
+    }
+
+    /// C++ source: tessellator_unittests.cc:PslgSingleConvexFastPathAndAntiStarGuard
+    #[test]
+    fn test_pslg_single_convex_fast_path_and_anti_star_guard() {
+        // 1. Stadium / rounded rect path with Convexity::Unknown hits the single-contour convex fast path.
+        let mut pb = PathBuilder::new();
+        pb.add_rounded_rect(
+            Rect::from_xywh(0.0, 0.0, 140.0, 60.0),
+            RoundingRadii::from_single_radius(30.0),
+        );
+        let mut stadium = pb.build(FillType::NonZero);
+        stadium.set_convexity(Convexity::Unknown);
+
+        let mesh = Tessellator::tessellate(&stadium, 1.0).expect("stadium tessellates");
+        let convex_ref = Tessellator::tessellate_convex(&stadium, 1.0);
+        assert_relative_eq!(
+            mesh_total_area(&mesh),
+            mesh_total_area(&convex_ref),
+            epsilon = 1e-2
+        );
+        let expected_area = 80.0 * 60.0 + std::f32::consts::PI * 30.0 * 30.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_area, epsilon = 8.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 20.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(65.0, 40.0)),
+            1
+        );
+
+        // 2. 5-pointed star pentagram {5/2} has uniform turn sign but winding number 2 (4 sign flips):
+        // must be rejected by `is_simple_convex_contour` so `FillType::Odd` leaves the center hollow!
+        let mut star_pb = PathBuilder::new();
+        for k in 0..5 {
+            let angle =
+                -std::f32::consts::FRAC_PI_2 + (k as f32) * (4.0 * std::f32::consts::PI / 5.0);
+            let p = Point::new(50.0 + 40.0 * angle.cos(), 50.0 + 40.0 * angle.sin());
+            if k == 0 {
+                star_pb.move_to(p);
+            } else {
+                star_pb.line_to(p);
+            }
+        }
+        star_pb.close();
+        let star_odd = star_pb.build(FillType::Odd);
+        let star_mesh = Tessellator::tessellate(&star_odd, 1.0).expect("star tessellates");
+        assert_eq!(
+            mesh_containing_triangle_count(&star_mesh, Point::new(50.0, 50.0)),
+            0,
+            "pentagram center must remain hollow under FillType::Odd"
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:RetinaArcToOvalPillClassifiesAsSimpleConvex
+    #[test]
+    fn test_retina_arc_to_oval_pill_classifies_as_simple_convex() {
+        let mut pb = PathBuilder::new();
+        let ox = 1800.0;
+        let oy = 1200.0;
+        let pi = std::f32::consts::PI;
+        let half_pi = std::f32::consts::FRAC_PI_2;
+
+        // Build a 120x30 pill / slider track at large Retina coordinates via arc_to_oval(..., false).
+        pb.arc_to_oval(
+            Rect::from_xywh(ox, oy, 30.0, 30.0),
+            Radians(pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox + 90.0, oy, 30.0, 30.0),
+            Radians(-half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox + 90.0, oy, 30.0, 30.0),
+            Radians(0.0),
+            Radians(half_pi),
+            false,
+        );
+        pb.arc_to_oval(
+            Rect::from_xywh(ox, oy, 30.0, 30.0),
+            Radians(half_pi),
+            Radians(half_pi),
+            false,
+        );
+        pb.close();
+
+        let pill = pb.build(FillType::NonZero);
+        assert_eq!(pill.convexity, Convexity::Unknown);
+
+        let (mesh, kind) = Tessellator::tessellate_fill_classified(&pill, 2.0);
+        assert_eq!(kind, FillTessellationKind::PslgSimpleConvex);
+
+        let expected_area = 90.0 * 30.0 + std::f32::consts::PI * 15.0 * 15.0;
+        assert_relative_eq!(mesh_total_area(&mesh), expected_area, epsilon = 2.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(ox + 55.0, oy + 11.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&mesh, Point::new(ox + 55.0, oy + 19.0)),
+            1
+        );
+
+        // Verify PathBuilder::add_path preserves Convexity::Convex -> ConvexFast.
+        let mut rrect_pb = PathBuilder::new();
+        rrect_pb.add_rounded_rect(
+            Rect::from_xywh(ox, oy, 120.0, 30.0),
+            RoundingRadii::from_single_radius(15.0),
+        );
+        let rrect_path = rrect_pb.build(FillType::NonZero);
+        let mut copied_pb = PathBuilder::new();
+        copied_pb.add_path(&rrect_path);
+        let copied_path = copied_pb.build(FillType::NonZero);
+        assert_eq!(copied_path.convexity, Convexity::Convex);
+        let (_, copied_kind) = Tessellator::tessellate_fill_classified(&copied_path, 2.0);
+        assert_eq!(copied_kind, FillTessellationKind::ConvexFast);
+    }
+
+    /// C++ source: tessellator_unittests.cc:DisjointMultiContourConvexVsNestedHoleClassification
+    #[test]
+    fn test_disjoint_multi_contour_convex_vs_nested_hole_classification() {
+        // 1. Three pairwise-disjoint rounded rects -> PslgDisjointConvex.
+        let mut disjoint_pb = PathBuilder::new();
+        for k in 0..3 {
+            let x = (k as f32) * 150.0;
+            disjoint_pb.add_rounded_rect(
+                Rect::from_xywh(x, 20.0, 100.0, 50.0),
+                RoundingRadii::from_single_radius(10.0),
+            );
+        }
+        let disjoint_path = disjoint_pb.build(FillType::NonZero);
+        assert_eq!(disjoint_path.convexity, Convexity::Unknown);
+
+        let (disjoint_mesh, disjoint_kind) =
+            Tessellator::tessellate_fill_classified(&disjoint_path, 2.0);
+        assert_eq!(disjoint_kind, FillTessellationKind::PslgDisjointConvex);
+
+        let single_rrect_area = 100.0 * 50.0 - (4.0 - std::f32::consts::PI) * 100.0;
+        assert_relative_eq!(
+            mesh_total_area(&disjoint_mesh),
+            3.0 * single_rrect_area,
+            epsilon = 4.0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(45.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(195.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(345.0, 38.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&disjoint_mesh, Point::new(125.0, 38.0)),
+            0
+        );
+
+        // 2. Concentric nested squares (outer + inner hole) -> PslgGeneral with exact Odd/NonZero hole.
+        let mut ring_odd_pb = PathBuilder::new();
+        ring_odd_pb.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        ring_odd_pb.add_rect(Rect::from_xywh(25.0, 25.0, 50.0, 50.0));
+        let ring_odd = ring_odd_pb.build(FillType::Odd);
+        let (ring_odd_mesh, ring_odd_kind) =
+            Tessellator::tessellate_fill_classified(&ring_odd, 2.0);
+        assert_eq!(ring_odd_kind, FillTessellationKind::PslgGeneral);
+        assert_relative_eq!(mesh_total_area(&ring_odd_mesh), 7500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_odd_mesh, Point::new(50.0, 50.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_odd_mesh, Point::new(12.0, 50.0)),
+            1
+        );
+
+        // Opposite-winding nested hole under FillType::NonZero -> PslgGeneral with hollow interior.
+        let mut ring_nz_pb = PathBuilder::new();
+        ring_nz_pb.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        ring_nz_pb.move_to(Point::new(25.0, 25.0));
+        ring_nz_pb.line_to(Point::new(25.0, 75.0));
+        ring_nz_pb.line_to(Point::new(75.0, 75.0));
+        ring_nz_pb.line_to(Point::new(75.0, 25.0));
+        ring_nz_pb.close();
+        let ring_nz = ring_nz_pb.build(FillType::NonZero);
+        let (ring_nz_mesh, ring_nz_kind) = Tessellator::tessellate_fill_classified(&ring_nz, 2.0);
+        assert_eq!(ring_nz_kind, FillTessellationKind::PslgGeneral);
+        assert_relative_eq!(mesh_total_area(&ring_nz_mesh), 7500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&ring_nz_mesh, Point::new(50.0, 50.0)),
+            0
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:CombinePathsOverlappingRectanglesAllOps
+    #[test]
+    fn test_combine_paths_overlapping_rects_all_five_ops() {
+        let mut pb_a = PathBuilder::new();
+        pb_a.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let rect_a = pb_a.build(FillType::NonZero);
+
+        let mut pb_b = PathBuilder::new();
+        pb_b.add_rect(Rect::from_xywh(50.0, 50.0, 100.0, 100.0));
+        let rect_b = pb_b.build(FillType::NonZero);
+
+        // 1. Intersect ([50, 50, 100, 100], area = 2500) -> single convex contour.
+        let inter = combine_paths(&rect_a, &rect_b, PathOp::Intersect, 1.0);
+        assert_eq!(inter.convexity, Convexity::Convex);
+        let inter_mesh = Tessellator::tessellate_fill(&inter, 1.0);
+        assert_relative_eq!(mesh_total_area(&inter_mesh), 2500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&inter_mesh, Point::new(70.0, 80.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&inter_mesh, Point::new(20.0, 20.0)),
+            0
+        );
+
+        // 2. Union (area = 10000 + 10000 - 2500 = 17500).
+        let union = combine_paths(&rect_a, &rect_b, PathOp::Union, 1.0);
+        let union_mesh = Tessellator::tessellate_fill(&union, 1.0);
+        assert_relative_eq!(mesh_total_area(&union_mesh), 17500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(70.0, 80.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(130.0, 20.0)),
+            0
+        );
+
+        // 3. Difference A \ B (area = 7500).
+        let diff = combine_paths(&rect_a, &rect_b, PathOp::Difference, 1.0);
+        let diff_mesh = Tessellator::tessellate_fill(&diff, 1.0);
+        assert_relative_eq!(mesh_total_area(&diff_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&diff_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&diff_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 4. ReverseDifference B \ A (area = 7500).
+        let rev_diff = combine_paths(&rect_a, &rect_b, PathOp::ReverseDifference, 1.0);
+        let rev_diff_mesh = Tessellator::tessellate_fill(&rev_diff, 1.0);
+        assert_relative_eq!(mesh_total_area(&rev_diff_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(20.0, 30.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 5. Xor (symmetric difference, area = 15000).
+        let xor = combine_paths(&rect_a, &rect_b, PathOp::Xor, 1.0);
+        let xor_mesh = Tessellator::tessellate_fill(&xor, 1.0);
+        assert_relative_eq!(mesh_total_area(&xor_mesh), 15000.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 6. Difference punching a central hole (outer [0..100] \ inner [25..75] -> area 7500).
+        let mut pb_inner = PathBuilder::new();
+        pb_inner.add_rect(Rect::from_xywh(25.0, 25.0, 50.0, 50.0));
+        let inner_rect = pb_inner.build(FillType::NonZero);
+        let punched = combine_paths(&rect_a, &inner_rect, PathOp::Difference, 1.0);
+        let punched_mesh = Tessellator::tessellate_fill(&punched, 1.0);
+        assert_relative_eq!(mesh_total_area(&punched_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&punched_mesh, Point::new(50.0, 50.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&punched_mesh, Point::new(12.0, 50.0)),
+            1
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:CombinePathsDisjointAndCurvedCirclesCrescentAndLens
+    #[test]
+    fn test_combine_paths_disjoint_and_curved_circles() {
+        // 1. Disjoint fast-path checks.
+        let mut pb_left = PathBuilder::new();
+        pb_left.add_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0));
+        let left_rect = pb_left.build(FillType::NonZero);
+
+        let mut pb_right = PathBuilder::new();
+        pb_right.add_rect(Rect::from_xywh(100.0, 0.0, 40.0, 40.0));
+        let right_rect = pb_right.build(FillType::NonZero);
+
+        let disjoint_inter = combine_paths(&left_rect, &right_rect, PathOp::Intersect, 1.0);
+        assert!(disjoint_inter.get_bounding_box().is_none());
+
+        let disjoint_diff = combine_paths(&left_rect, &right_rect, PathOp::Difference, 1.0);
+        assert_eq!(disjoint_diff, left_rect);
+
+        let disjoint_union = combine_paths(&left_rect, &right_rect, PathOp::Union, 1.0);
+        let disjoint_union_mesh = Tessellator::tessellate_fill(&disjoint_union, 1.0);
+        assert_relative_eq!(
+            mesh_total_area(&disjoint_union_mesh),
+            3200.0,
+            epsilon = 1e-2
+        );
+
+        // 2. Overlapping circles (r = 50, centers at (50, 50) and (100, 50), d = 50 = r).
+        let mut pb_c1 = PathBuilder::new();
+        pb_c1.add_oval(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let c1 = pb_c1.build(FillType::NonZero);
+
+        let mut pb_c2 = PathBuilder::new();
+        pb_c2.add_oval(Rect::from_xywh(50.0, 0.0, 100.0, 100.0));
+        let c2 = pb_c2.build(FillType::NonZero);
+
+        let r_sq = 50.0f32 * 50.0f32;
+        let expected_circle = std::f32::consts::PI * r_sq;
+        let expected_lens = r_sq * (2.0 * std::f32::consts::PI / 3.0 - 3.0f32.sqrt() * 0.5);
+        let expected_crescent = expected_circle - expected_lens;
+
+        let lens = combine_paths(&c1, &c2, PathOp::Intersect, 2.0);
+        let lens_mesh = Tessellator::tessellate_fill(&lens, 2.0);
+        assert_relative_eq!(mesh_total_area(&lens_mesh), expected_lens, epsilon = 12.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&lens_mesh, Point::new(75.0, 42.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&lens_mesh, Point::new(25.0, 50.0)),
+            0
+        );
+
+        let crescent = combine_paths(&c1, &c2, PathOp::Difference, 2.0);
+        let crescent_mesh = Tessellator::tessellate_fill(&crescent, 2.0);
+        assert_relative_eq!(
+            mesh_total_area(&crescent_mesh),
+            expected_crescent,
+            epsilon = 12.0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&crescent_mesh, Point::new(25.0, 50.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&crescent_mesh, Point::new(75.0, 50.0)),
+            0
+        );
+
+        // Verify PathOp::from_i32 mappings match SkPathOp.
+        assert_eq!(PathOp::from_i32(0), Some(PathOp::Difference));
+        assert_eq!(PathOp::from_i32(1), Some(PathOp::Intersect));
+        assert_eq!(PathOp::from_i32(2), Some(PathOp::Union));
+        assert_eq!(PathOp::from_i32(3), Some(PathOp::Xor));
+        assert_eq!(PathOp::from_i32(4), Some(PathOp::ReverseDifference));
+        assert_eq!(PathOp::from_i32(5), None);
+    }
+}

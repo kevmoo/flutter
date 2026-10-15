@@ -1,0 +1,23 @@
+[package]
+name = "impeller_canvas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+impeller_geometry.workspace = true
+impeller_path.workspace = true
+impeller_core.workspace = true
+impeller_tessellator.workspace = true
+impeller_typographer.workspace = true
+impeller_wgpu.workspace = true
+kurbo.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/impeller_geometry",
+    "crates/impeller_path",
+    "crates/impeller_core",
+    "crates/impeller_tessellator",
+    "crates/impeller_typographer",
+    "crates/impeller_wgpu",
+    "crates/impeller_canvas",
+    "crates/impeller_web",
+    "crates/impeller_skwasm_ffi",
+    "crates/impeller_interop_c",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+pollster = "0.4"
+wgpu = "24.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+approx = "0.5"
+cosmic-text = { version = "0.12", default-features = false, features = ["std", "swash"] }
+etagere = "0.2.10"
+kurbo = "0.13"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-cli-support = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "ImageBitmap",
+    "OffscreenCanvas",
+    "Performance",
+    "Window",
+    "Navigator",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+] }
+impeller_geometry = { path = "crates/impeller_geometry" }
+impeller_path = { path = "crates/impeller_path" }
+impeller_core = { path = "crates/impeller_core" }
+impeller_tessellator = { path = "crates/impeller_tessellator" }
+impeller_typographer = { path = "crates/impeller_typographer" }
+impeller_wgpu = { path = "crates/impeller_wgpu" }
+impeller_canvas = { path = "crates/impeller_canvas" }
+impeller_web = { path = "crates/impeller_web" }
+impeller_skwasm_ffi = { path = "crates/impeller_skwasm_ffi" }
+impeller_interop_c = { path = "crates/impeller_interop_c" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+
+[profile.release.package.impeller_geometry]
+opt-level = 3
+
+[profile.release.package.impeller_path]
+opt-level = 2
+
+[profile.release.package.impeller_core]
+opt-level = 2
+
+[profile.release.package.impeller_tessellator]
+opt-level = 3
+
+[profile.release.package.impeller_typographer]
+opt-level = 2
+
+[profile.release.package.impeller_wgpu]
+opt-level = "s"
+
+[profile.release.package.impeller_canvas]
+opt-level = 2
+
+[profile.release.package.cosmic-text]
+opt-level = "s"
+
+[profile.release.package.etagere]
+opt-level = 3
+
+[profile.release.package.kurbo]
+opt-level = "s"
