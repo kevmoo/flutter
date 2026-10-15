@@ -4,19 +4,19 @@ use impeller_geometry::{Point, Scalar};
 use impeller_path::{CubicPathComponent, FillType, Path, PathComponent, QuadPathComponent};
 use std::collections::BTreeMap;
 
-const SNAP_EPS: f64 = 1e-5;
-const INTERSECT_EPS: f64 = 1e-7;
-const AREA_EPS: f64 = 1e-8;
+pub(crate) const SNAP_EPS: f64 = 1e-5;
+pub(crate) const INTERSECT_EPS: f64 = 1e-7;
+pub(crate) const AREA_EPS: f64 = 1e-8;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-struct Pt2 {
-    x: f64,
-    y: f64,
+pub(crate) struct Pt2 {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
 }
 
 impl Pt2 {
     #[inline]
-    fn from_point(p: Point) -> Self {
+    pub(crate) fn from_point(p: Point) -> Self {
         Self {
             x: p.x as f64,
             y: p.y as f64,
@@ -24,12 +24,12 @@ impl Pt2 {
     }
 
     #[inline]
-    fn to_point(self) -> Point {
+    pub(crate) fn to_point(self) -> Point {
         Point::new(self.x as Scalar, self.y as Scalar)
     }
 
     #[inline]
-    fn sub(self, other: Self) -> Self {
+    pub(crate) fn sub(self, other: Self) -> Self {
         Self {
             x: self.x - other.x,
             y: self.y - other.y,
@@ -37,7 +37,7 @@ impl Pt2 {
     }
 
     #[inline]
-    fn add(self, other: Self) -> Self {
+    pub(crate) fn add(self, other: Self) -> Self {
         Self {
             x: self.x + other.x,
             y: self.y + other.y,
@@ -45,7 +45,7 @@ impl Pt2 {
     }
 
     #[inline]
-    fn scale(self, s: f64) -> Self {
+    pub(crate) fn scale(self, s: f64) -> Self {
         Self {
             x: self.x * s,
             y: self.y * s,
@@ -53,22 +53,22 @@ impl Pt2 {
     }
 
     #[inline]
-    fn dot(self, other: Self) -> f64 {
+    pub(crate) fn dot(self, other: Self) -> f64 {
         self.x * other.x + self.y * other.y
     }
 
     #[inline]
-    fn cross(self, other: Self) -> f64 {
+    pub(crate) fn cross(self, other: Self) -> f64 {
         self.x * other.y - self.y * other.x
     }
 
     #[inline]
-    fn len_sq(self) -> f64 {
+    pub(crate) fn len_sq(self) -> f64 {
         self.x * self.x + self.y * self.y
     }
 
     #[inline]
-    fn dist_sq(self, other: Self) -> f64 {
+    pub(crate) fn dist_sq(self, other: Self) -> f64 {
         self.sub(other).len_sq()
     }
 }
@@ -108,7 +108,7 @@ fn solve_cubic_f64(c: &CubicPathComponent, t: f64) -> Pt2 {
 
 /// Extracts flattened fill contours from `Path` matching `PathTessellator::PathToFilledVertices`.
 /// Returns `(contours, has_any_segment)`.
-fn extract_fill_contours(path: &Path, tolerance_scale: Scalar) -> (Vec<Vec<Pt2>>, bool) {
+pub(crate) fn extract_fill_contours(path: &Path, tolerance_scale: Scalar) -> (Vec<Vec<Pt2>>, bool) {
     let scale = tolerance_scale.max(1.0);
     let mut contours: Vec<Vec<Pt2>> = Vec::new();
     let mut current_contour: Vec<Pt2> = Vec::new();
@@ -214,7 +214,7 @@ fn extract_fill_contours(path: &Path, tolerance_scale: Scalar) -> (Vec<Vec<Pt2>>
     (contours, has_any_segment)
 }
 
-fn intern_vertex(verts: &mut Vec<Pt2>, p: Pt2) -> usize {
+pub(crate) fn intern_vertex(verts: &mut Vec<Pt2>, p: Pt2) -> usize {
     let eps_sq = SNAP_EPS * SNAP_EPS;
     for (i, v) in verts.iter().enumerate() {
         if v.dist_sq(p) <= eps_sq {
@@ -228,7 +228,7 @@ fn intern_vertex(verts: &mut Vec<Pt2>, p: Pt2) -> usize {
 
 /// Checks in $O(V)$ whether a single flattened contour is a strictly simple convex polygon
 /// (winding number $\pm 1$, uniform turn sign, no self-intersections or star-polygon wraps).
-fn is_simple_convex_contour(pts: &[Pt2]) -> bool {
+pub(crate) fn is_simple_convex_contour(pts: &[Pt2]) -> bool {
     let n = pts.len();
     if n < 3 {
         return false;

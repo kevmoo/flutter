@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod boolean;
 mod convex;
 mod primitives;
 mod pslg;
@@ -10,6 +11,7 @@ use bytemuck::{Pod, Zeroable};
 use impeller_geometry::{Point, Rect, Scalar, Size};
 use impeller_path::{Convexity, Path};
 
+pub use boolean::{combine_paths, PathOp};
 pub use primitives::{
     ArcGeometry, CircleGeometry, DiffRoundRectGeometry, EllipseGeometry, FillPathGeometry,
     LineGeometry, RectGeometry, RoundRectGeometry, StrokePathGeometry,
@@ -2275,5 +2277,192 @@ mod tests {
             mesh_containing_triangle_count(&ring_nz_mesh, Point::new(50.0, 50.0)),
             0
         );
+    }
+
+    /// C++ source: tessellator_unittests.cc:CombinePathsOverlappingRectanglesAllOps
+    #[test]
+    fn test_combine_paths_overlapping_rects_all_five_ops() {
+        let mut pb_a = PathBuilder::new();
+        pb_a.add_rect(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let rect_a = pb_a.build(FillType::NonZero);
+
+        let mut pb_b = PathBuilder::new();
+        pb_b.add_rect(Rect::from_xywh(50.0, 50.0, 100.0, 100.0));
+        let rect_b = pb_b.build(FillType::NonZero);
+
+        // 1. Intersect ([50, 50, 100, 100], area = 2500) -> single convex contour.
+        let inter = combine_paths(&rect_a, &rect_b, PathOp::Intersect, 1.0);
+        assert_eq!(inter.convexity, Convexity::Convex);
+        let inter_mesh = Tessellator::tessellate_fill(&inter, 1.0);
+        assert_relative_eq!(mesh_total_area(&inter_mesh), 2500.0, epsilon = 1e-2);
+        assert_eq!(
+            mesh_containing_triangle_count(&inter_mesh, Point::new(70.0, 80.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&inter_mesh, Point::new(20.0, 20.0)),
+            0
+        );
+
+        // 2. Union (area = 10000 + 10000 - 2500 = 17500).
+        let union = combine_paths(&rect_a, &rect_b, PathOp::Union, 1.0);
+        let union_mesh = Tessellator::tessellate_fill(&union, 1.0);
+        assert_relative_eq!(mesh_total_area(&union_mesh), 17500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(70.0, 80.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&union_mesh, Point::new(130.0, 20.0)),
+            0
+        );
+
+        // 3. Difference A \ B (area = 7500).
+        let diff = combine_paths(&rect_a, &rect_b, PathOp::Difference, 1.0);
+        let diff_mesh = Tessellator::tessellate_fill(&diff, 1.0);
+        assert_relative_eq!(mesh_total_area(&diff_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&diff_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&diff_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 4. ReverseDifference B \ A (area = 7500).
+        let rev_diff = combine_paths(&rect_a, &rect_b, PathOp::ReverseDifference, 1.0);
+        let rev_diff_mesh = Tessellator::tessellate_fill(&rev_diff, 1.0);
+        assert_relative_eq!(mesh_total_area(&rev_diff_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(20.0, 30.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&rev_diff_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 5. Xor (symmetric difference, area = 15000).
+        let xor = combine_paths(&rect_a, &rect_b, PathOp::Xor, 1.0);
+        let xor_mesh = Tessellator::tessellate_fill(&xor, 1.0);
+        assert_relative_eq!(mesh_total_area(&xor_mesh), 15000.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(20.0, 30.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(120.0, 130.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&xor_mesh, Point::new(70.0, 80.0)),
+            0
+        );
+
+        // 6. Difference punching a central hole (outer [0..100] \ inner [25..75] -> area 7500).
+        let mut pb_inner = PathBuilder::new();
+        pb_inner.add_rect(Rect::from_xywh(25.0, 25.0, 50.0, 50.0));
+        let inner_rect = pb_inner.build(FillType::NonZero);
+        let punched = combine_paths(&rect_a, &inner_rect, PathOp::Difference, 1.0);
+        let punched_mesh = Tessellator::tessellate_fill(&punched, 1.0);
+        assert_relative_eq!(mesh_total_area(&punched_mesh), 7500.0, epsilon = 1e-1);
+        assert_eq!(
+            mesh_containing_triangle_count(&punched_mesh, Point::new(50.0, 50.0)),
+            0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&punched_mesh, Point::new(12.0, 50.0)),
+            1
+        );
+    }
+
+    /// C++ source: tessellator_unittests.cc:CombinePathsDisjointAndCurvedCirclesCrescentAndLens
+    #[test]
+    fn test_combine_paths_disjoint_and_curved_circles() {
+        // 1. Disjoint fast-path checks.
+        let mut pb_left = PathBuilder::new();
+        pb_left.add_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0));
+        let left_rect = pb_left.build(FillType::NonZero);
+
+        let mut pb_right = PathBuilder::new();
+        pb_right.add_rect(Rect::from_xywh(100.0, 0.0, 40.0, 40.0));
+        let right_rect = pb_right.build(FillType::NonZero);
+
+        let disjoint_inter = combine_paths(&left_rect, &right_rect, PathOp::Intersect, 1.0);
+        assert!(disjoint_inter.get_bounding_box().is_none());
+
+        let disjoint_diff = combine_paths(&left_rect, &right_rect, PathOp::Difference, 1.0);
+        assert_eq!(disjoint_diff, left_rect);
+
+        let disjoint_union = combine_paths(&left_rect, &right_rect, PathOp::Union, 1.0);
+        let disjoint_union_mesh = Tessellator::tessellate_fill(&disjoint_union, 1.0);
+        assert_relative_eq!(
+            mesh_total_area(&disjoint_union_mesh),
+            3200.0,
+            epsilon = 1e-2
+        );
+
+        // 2. Overlapping circles (r = 50, centers at (50, 50) and (100, 50), d = 50 = r).
+        let mut pb_c1 = PathBuilder::new();
+        pb_c1.add_oval(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let c1 = pb_c1.build(FillType::NonZero);
+
+        let mut pb_c2 = PathBuilder::new();
+        pb_c2.add_oval(Rect::from_xywh(50.0, 0.0, 100.0, 100.0));
+        let c2 = pb_c2.build(FillType::NonZero);
+
+        let r_sq = 50.0f32 * 50.0f32;
+        let expected_circle = std::f32::consts::PI * r_sq;
+        let expected_lens = r_sq * (2.0 * std::f32::consts::PI / 3.0 - 3.0f32.sqrt() * 0.5);
+        let expected_crescent = expected_circle - expected_lens;
+
+        let lens = combine_paths(&c1, &c2, PathOp::Intersect, 2.0);
+        let lens_mesh = Tessellator::tessellate_fill(&lens, 2.0);
+        assert_relative_eq!(mesh_total_area(&lens_mesh), expected_lens, epsilon = 12.0);
+        assert_eq!(
+            mesh_containing_triangle_count(&lens_mesh, Point::new(75.0, 42.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&lens_mesh, Point::new(25.0, 50.0)),
+            0
+        );
+
+        let crescent = combine_paths(&c1, &c2, PathOp::Difference, 2.0);
+        let crescent_mesh = Tessellator::tessellate_fill(&crescent, 2.0);
+        assert_relative_eq!(
+            mesh_total_area(&crescent_mesh),
+            expected_crescent,
+            epsilon = 12.0
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&crescent_mesh, Point::new(25.0, 50.0)),
+            1
+        );
+        assert_eq!(
+            mesh_containing_triangle_count(&crescent_mesh, Point::new(75.0, 50.0)),
+            0
+        );
+
+        // Verify PathOp::from_i32 mappings match SkPathOp.
+        assert_eq!(PathOp::from_i32(0), Some(PathOp::Difference));
+        assert_eq!(PathOp::from_i32(1), Some(PathOp::Intersect));
+        assert_eq!(PathOp::from_i32(2), Some(PathOp::Union));
+        assert_eq!(PathOp::from_i32(3), Some(PathOp::Xor));
+        assert_eq!(PathOp::from_i32(4), Some(PathOp::ReverseDifference));
+        assert_eq!(PathOp::from_i32(5), None);
     }
 }

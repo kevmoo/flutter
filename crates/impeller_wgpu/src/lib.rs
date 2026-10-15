@@ -17,11 +17,15 @@ use std::sync::{Arc, Mutex};
 const SOLID_FILL_WGSL: &str = include_str!("shaders/solid_fill.wgsl");
 const LINEAR_GRADIENT_FILL_WGSL: &str = include_str!("shaders/linear_gradient_fill.wgsl");
 const RADIAL_GRADIENT_FILL_WGSL: &str = include_str!("shaders/radial_gradient_fill.wgsl");
+const SWEEP_GRADIENT_FILL_WGSL: &str = include_str!("shaders/sweep_gradient_fill.wgsl");
+const CONICAL_GRADIENT_FILL_WGSL: &str = include_str!("shaders/conical_gradient_fill.wgsl");
 const RRECT_BLUR_WGSL: &str = include_str!("shaders/rrect_blur.wgsl");
 const GLYPH_ATLAS_WGSL: &str = include_str!("shaders/glyph_atlas.wgsl");
 const TEXTURE_FILL_WGSL: &str = include_str!("shaders/texture_fill.wgsl");
+const STENCIL_CLIP_WGSL: &str = include_str!("shaders/stencil_clip.wgsl");
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -201,6 +205,115 @@ impl RadialGradientParams {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepGradientParams {
+    pub center: Point,
+    pub start_angle_deg: Scalar,
+    pub end_angle_deg: Scalar,
+    pub stops: Vec<GradientStop>,
+    pub tile_mode: TileMode,
+    pub alpha: Scalar,
+}
+
+impl SweepGradientParams {
+    pub fn new(
+        center: Point,
+        start_angle_deg: Scalar,
+        end_angle_deg: Scalar,
+        stops: Vec<GradientStop>,
+        tile_mode: TileMode,
+        alpha: Scalar,
+    ) -> Self {
+        Self {
+            center,
+            start_angle_deg,
+            end_angle_deg,
+            stops,
+            tile_mode,
+            alpha,
+        }
+    }
+
+    pub fn two_stop(
+        center: Point,
+        start_angle_deg: Scalar,
+        end_angle_deg: Scalar,
+        start_color: Color,
+        end_color: Color,
+        tile_mode: TileMode,
+    ) -> Self {
+        Self {
+            center,
+            start_angle_deg,
+            end_angle_deg,
+            stops: vec![
+                GradientStop::new(0.0, start_color),
+                GradientStop::new(1.0, end_color),
+            ],
+            tile_mode,
+            alpha: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConicalGradientParams {
+    pub start_center: Point,
+    pub start_radius: Scalar,
+    pub end_center: Point,
+    pub end_radius: Scalar,
+    pub stops: Vec<GradientStop>,
+    pub tile_mode: TileMode,
+    pub alpha: Scalar,
+}
+
+impl ConicalGradientParams {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        start_center: Point,
+        start_radius: Scalar,
+        end_center: Point,
+        end_radius: Scalar,
+        stops: Vec<GradientStop>,
+        tile_mode: TileMode,
+        alpha: Scalar,
+    ) -> Self {
+        Self {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+            stops,
+            tile_mode,
+            alpha,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn two_stop(
+        start_center: Point,
+        start_radius: Scalar,
+        end_center: Point,
+        end_radius: Scalar,
+        start_color: Color,
+        end_color: Color,
+        tile_mode: TileMode,
+    ) -> Self {
+        Self {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+            stops: vec![
+                GradientStop::new(0.0, start_color),
+                GradientStop::new(1.0, end_color),
+            ],
+            tile_mode,
+            alpha: 1.0,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct RRectBlurParams {
     pub rect: Rect,
@@ -210,12 +323,7 @@ pub struct RRectBlurParams {
 }
 
 impl RRectBlurParams {
-    pub const fn new(
-        rect: Rect,
-        corner_radius: Scalar,
-        blur_sigma: Scalar,
-        color: Color,
-    ) -> Self {
+    pub const fn new(rect: Rect, corner_radius: Scalar, blur_sigma: Scalar, color: Color) -> Self {
         Self {
             rect,
             corner_radius,
@@ -263,6 +371,24 @@ pub struct RadialGradientBatch {
     pub mesh: TessellatedMesh,
     pub transform: Matrix,
     pub gradient: RadialGradientParams,
+    pub blend_mode: BlendMode,
+    pub clip_rect: Option<Rect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepGradientBatch {
+    pub mesh: TessellatedMesh,
+    pub transform: Matrix,
+    pub gradient: SweepGradientParams,
+    pub blend_mode: BlendMode,
+    pub clip_rect: Option<Rect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConicalGradientBatch {
+    pub mesh: TessellatedMesh,
+    pub transform: Matrix,
+    pub gradient: ConicalGradientParams,
     pub blend_mode: BlendMode,
     pub clip_rect: Option<Rect>,
 }
@@ -521,6 +647,20 @@ pub enum DrawCommand {
         blend_mode: BlendMode,
         clip_rect: Option<Rect>,
     },
+    SweepGradientFill {
+        mesh: TessellatedMesh,
+        transform: Matrix,
+        gradient: SweepGradientParams,
+        blend_mode: BlendMode,
+        clip_rect: Option<Rect>,
+    },
+    ConicalGradientFill {
+        mesh: TessellatedMesh,
+        transform: Matrix,
+        gradient: ConicalGradientParams,
+        blend_mode: BlendMode,
+        clip_rect: Option<Rect>,
+    },
     RRectBlur {
         transform: Matrix,
         params: RRectBlurParams,
@@ -529,6 +669,15 @@ pub enum DrawCommand {
     },
     GlyphAtlas(GlyphAtlasBatch),
     TextureFill(TextureFillBatch),
+    PushClip {
+        mesh: TessellatedMesh,
+        transform: Matrix,
+        is_difference: bool,
+        clip_rect: Option<Rect>,
+    },
+    PopClip {
+        clip_rect: Option<Rect>,
+    },
 }
 
 impl DrawCommand {
@@ -537,7 +686,11 @@ impl DrawCommand {
             DrawCommand::SolidFill { clip_rect, .. }
             | DrawCommand::LinearGradientFill { clip_rect, .. }
             | DrawCommand::RadialGradientFill { clip_rect, .. }
-            | DrawCommand::RRectBlur { clip_rect, .. } => *clip_rect,
+            | DrawCommand::SweepGradientFill { clip_rect, .. }
+            | DrawCommand::ConicalGradientFill { clip_rect, .. }
+            | DrawCommand::RRectBlur { clip_rect, .. }
+            | DrawCommand::PushClip { clip_rect, .. }
+            | DrawCommand::PopClip { clip_rect } => *clip_rect,
             DrawCommand::GlyphAtlas(batch) => batch.clip_rect,
             DrawCommand::TextureFill(batch) => batch.clip_rect,
         }
@@ -548,9 +701,12 @@ impl DrawCommand {
             DrawCommand::SolidFill { blend_mode, .. }
             | DrawCommand::LinearGradientFill { blend_mode, .. }
             | DrawCommand::RadialGradientFill { blend_mode, .. }
+            | DrawCommand::SweepGradientFill { blend_mode, .. }
+            | DrawCommand::ConicalGradientFill { blend_mode, .. }
             | DrawCommand::RRectBlur { blend_mode, .. } => *blend_mode,
             DrawCommand::GlyphAtlas(batch) => batch.blend_mode,
             DrawCommand::TextureFill(batch) => batch.blend_mode,
+            DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => BlendMode::SrcOver,
         }
     }
 
@@ -559,7 +715,11 @@ impl DrawCommand {
             DrawCommand::SolidFill { clip_rect, .. }
             | DrawCommand::LinearGradientFill { clip_rect, .. }
             | DrawCommand::RadialGradientFill { clip_rect, .. }
-            | DrawCommand::RRectBlur { clip_rect, .. } => {
+            | DrawCommand::SweepGradientFill { clip_rect, .. }
+            | DrawCommand::ConicalGradientFill { clip_rect, .. }
+            | DrawCommand::RRectBlur { clip_rect, .. }
+            | DrawCommand::PushClip { clip_rect, .. }
+            | DrawCommand::PopClip { clip_rect } => {
                 *clip_rect = new_clip;
             }
             DrawCommand::GlyphAtlas(batch) => {
@@ -609,6 +769,30 @@ impl From<RadialGradientBatch> for DrawCommand {
     }
 }
 
+impl From<SweepGradientBatch> for DrawCommand {
+    fn from(b: SweepGradientBatch) -> Self {
+        DrawCommand::SweepGradientFill {
+            mesh: b.mesh,
+            transform: b.transform,
+            gradient: b.gradient,
+            blend_mode: b.blend_mode,
+            clip_rect: b.clip_rect,
+        }
+    }
+}
+
+impl From<ConicalGradientBatch> for DrawCommand {
+    fn from(b: ConicalGradientBatch) -> Self {
+        DrawCommand::ConicalGradientFill {
+            mesh: b.mesh,
+            transform: b.transform,
+            gradient: b.gradient,
+            blend_mode: b.blend_mode,
+            clip_rect: b.clip_rect,
+        }
+    }
+}
+
 impl From<RRectBlurBatch> for DrawCommand {
     fn from(b: RRectBlurBatch) -> Self {
         DrawCommand::RRectBlur {
@@ -637,9 +821,13 @@ pub enum PipelineKind {
     SolidFill,
     LinearGradientFill,
     RadialGradientFill,
+    SweepGradientFill,
+    ConicalGradientFill,
     RRectBlur,
     GlyphAtlas,
     TextureFill,
+    StencilIncrement,
+    StencilDecrement,
 }
 
 #[repr(C)]
@@ -693,6 +881,39 @@ struct RadialGradientFragUniform {
     center: [f32; 2],
     radius: f32,
     alpha: f32,
+    decal_border_color: [f32; 4],
+    fast_color_0: [f32; 4],
+    fast_color_1: [f32; 4],
+    tile_mode: u32,
+    colors_length: u32,
+    is_fast_two_stop: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct SweepGradientFragUniform {
+    center: [f32; 2],
+    bias: f32,
+    scale: f32,
+    decal_border_color: [f32; 4],
+    fast_color_0: [f32; 4],
+    fast_color_1: [f32; 4],
+    tile_mode: u32,
+    colors_length: u32,
+    is_fast_two_stop: u32,
+    alpha: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct ConicalGradientFragUniform {
+    start_center: [f32; 2],
+    start_radius: f32,
+    end_radius: f32,
+    end_center: [f32; 2],
+    alpha: f32,
+    kind: u32,
     decal_border_color: [f32; 4],
     fast_color_0: [f32; 4],
     fast_color_1: [f32; 4],
@@ -922,7 +1143,10 @@ fn build_gpu_color_points(
         && (sorted[0].offset - 0.0).abs() <= K_EH_CLOSE_ENOUGH
         && (sorted[1].offset - 1.0).abs() <= K_EH_CLOSE_ENOUGH;
 
-    let c0 = sorted.first().map(|s| s.color).unwrap_or(Color::TRANSPARENT);
+    let c0 = sorted
+        .first()
+        .map(|s| s.color)
+        .unwrap_or(Color::TRANSPARENT);
     let c1 = sorted.last().map(|s| s.color).unwrap_or(c0);
     let fast_0 = [c0.red, c0.green, c0.blue, c0.alpha];
     let fast_1 = [c1.red, c1.green, c1.blue, c1.alpha];
@@ -1037,7 +1261,12 @@ fn compatible_atlas_slot(
 }
 
 fn shift_rect(r: Rect, dx: Scalar, dy: Scalar) -> Rect {
-    Rect::from_xywh(r.origin.x + dx, r.origin.y + dy, r.size.width, r.size.height)
+    Rect::from_xywh(
+        r.origin.x + dx,
+        r.origin.y + dy,
+        r.size.width,
+        r.size.height,
+    )
 }
 
 #[inline]
@@ -1169,6 +1398,18 @@ fn inspect_command_for_clustering(cmd: &DrawCommand) -> CommandClusterInfo {
             transform,
             clip_rect,
             ..
+        }
+        | DrawCommand::SweepGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        }
+        | DrawCommand::ConicalGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
         } => {
             let is_2d = *transform == Matrix::IDENTITY || is_2d_affine_transform(transform);
             let dev_bounds = if mesh.vertices.is_empty() || mesh.indices.is_empty() {
@@ -1186,6 +1427,12 @@ fn inspect_command_for_clustering(cmd: &DrawCommand) -> CommandClusterInfo {
                 uses_color: false,
             }
         }
+        DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => CommandClusterInfo {
+            dev_bounds: None,
+            clusterable: false,
+            uses_alpha: false,
+            uses_color: false,
+        },
         DrawCommand::RRectBlur {
             transform,
             params,
@@ -1360,13 +1607,17 @@ fn is_slot_compatible(
             } else {
                 &prev_b.color_atlas
             };
-            compatible_atlas_slot(prev_alpha, slot.uses_alpha, &cur_b.alpha_atlas, cur_uses_alpha)
-                && compatible_atlas_slot(
-                    prev_color,
-                    slot.uses_color,
-                    &cur_b.color_atlas,
-                    cur_uses_color,
-                )
+            compatible_atlas_slot(
+                prev_alpha,
+                slot.uses_alpha,
+                &cur_b.alpha_atlas,
+                cur_uses_alpha,
+            ) && compatible_atlas_slot(
+                prev_color,
+                slot.uses_color,
+                &cur_b.color_atlas,
+                cur_uses_color,
+            )
         }
         _ => false,
     }
@@ -1747,6 +1998,8 @@ enum DrawCallBinding {
     RRectBlur,
     LinearGradient,
     RadialGradient,
+    SweepGradient,
+    ConicalGradient,
     GlyphAtlas {
         alpha_gpu: Arc<CachedGpuAtlas>,
         color_gpu: Arc<CachedGpuAtlas>,
@@ -1787,6 +2040,7 @@ struct PendingArenaCall {
     index_byte_len: u64,
     index_count: u32,
     scissor: [u32; 4],
+    stencil_ref: u32,
     coalesce_tag: CoalesceTag,
 }
 
@@ -1813,6 +2067,8 @@ struct FrameArena {
     rrect_blur_bg: Option<Arc<wgpu::BindGroup>>,
     linear_gradient_bg: Option<Arc<wgpu::BindGroup>>,
     radial_gradient_bg: Option<Arc<wgpu::BindGroup>>,
+    sweep_gradient_bg: Option<Arc<wgpu::BindGroup>>,
+    conical_gradient_bg: Option<Arc<wgpu::BindGroup>>,
     glyph_atlas_bgs: HashMap<(usize, usize, bool), CachedGlyphBgValue>,
     texture_fill_bgs: HashMap<(usize, bool), CachedTextureBgValue>,
     ssaa_resolve_bg: Option<CachedSsaaBgValue>,
@@ -1841,6 +2097,8 @@ impl FrameArena {
         self.rrect_blur_bg = None;
         self.linear_gradient_bg = None;
         self.radial_gradient_bg = None;
+        self.sweep_gradient_bg = None;
+        self.conical_gradient_bg = None;
         self.glyph_atlas_bgs.clear();
         self.texture_fill_bgs.clear();
         self.ssaa_resolve_bg = None;
@@ -1857,6 +2115,8 @@ impl FrameArena {
             + usize::from(self.rrect_blur_bg.is_some())
             + usize::from(self.linear_gradient_bg.is_some())
             + usize::from(self.radial_gradient_bg.is_some())
+            + usize::from(self.sweep_gradient_bg.is_some())
+            + usize::from(self.conical_gradient_bg.is_some())
             + self.glyph_atlas_bgs.len()
             + self.texture_fill_bgs.len()
             + usize::from(self.ssaa_resolve_bg.is_some())
@@ -1957,7 +2217,7 @@ impl FrameArena {
     }
 }
 
-type PipelineCacheKey = (PipelineKind, u32, u32, wgpu::TextureFormat);
+type PipelineCacheKey = (PipelineKind, u32, u32, wgpu::TextureFormat, bool);
 type ImageCacheKey = (u64, u32, u32);
 
 struct SsaaScratchTarget {
@@ -1976,6 +2236,14 @@ struct SurfaceMsaaScratch {
     view: wgpu::TextureView,
 }
 
+struct StencilScratchTarget {
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 pub struct WgpuRenderer {
     pub adapter_name: String,
     pub backend_name: String,
@@ -1986,13 +2254,18 @@ pub struct WgpuRenderer {
     solid_shader: wgpu::ShaderModule,
     linear_gradient_shader: wgpu::ShaderModule,
     radial_gradient_shader: wgpu::ShaderModule,
+    sweep_gradient_shader: wgpu::ShaderModule,
+    conical_gradient_shader: wgpu::ShaderModule,
     rrect_blur_shader: wgpu::ShaderModule,
     glyph_atlas_shader: wgpu::ShaderModule,
     texture_fill_shader: wgpu::ShaderModule,
+    stencil_clip_shader: wgpu::ShaderModule,
     solid_fill_layout: wgpu::BindGroupLayout,
     rrect_blur_layout: wgpu::BindGroupLayout,
     linear_gradient_layout: wgpu::BindGroupLayout,
     radial_gradient_layout: wgpu::BindGroupLayout,
+    sweep_gradient_layout: wgpu::BindGroupLayout,
+    conical_gradient_layout: wgpu::BindGroupLayout,
     glyph_atlas_layout: wgpu::BindGroupLayout,
     texture_fill_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
@@ -2005,6 +2278,7 @@ pub struct WgpuRenderer {
     image_cache: Mutex<HashMap<ImageCacheKey, Arc<CachedGpuAtlas>>>,
     ssaa_scratch: Mutex<Option<Arc<SsaaScratchTarget>>>,
     surface_msaa_scratch: Mutex<Option<Arc<SurfaceMsaaScratch>>>,
+    stencil_scratch: Mutex<Option<Arc<StencilScratchTarget>>>,
     frame_arena: Mutex<FrameArena>,
 }
 
@@ -2137,8 +2411,8 @@ impl WgpuRenderer {
                 backends: wgpu::Backends::BROWSER_WEBGPU,
                 ..Default::default()
             });
-            if let Ok(surface) = webgpu_instance
-                .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas.clone()))
+            if let Ok(surface) =
+                webgpu_instance.create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas.clone()))
             {
                 if let Ok(ok) =
                     Self::init_with_surface(webgpu_instance, surface, width, height, false).await
@@ -2249,6 +2523,14 @@ impl WgpuRenderer {
             label: Some("Impeller radial_gradient_fill.wgsl"),
             source: wgpu::ShaderSource::Wgsl(RADIAL_GRADIENT_FILL_WGSL.into()),
         });
+        let sweep_gradient_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Impeller sweep_gradient_fill.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(SWEEP_GRADIENT_FILL_WGSL.into()),
+        });
+        let conical_gradient_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Impeller conical_gradient_fill.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(CONICAL_GRADIENT_FILL_WGSL.into()),
+        });
         let rrect_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Impeller rrect_blur.wgsl"),
             source: wgpu::ShaderSource::Wgsl(RRECT_BLUR_WGSL.into()),
@@ -2260,6 +2542,10 @@ impl WgpuRenderer {
         let texture_fill_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Impeller texture_fill.wgsl"),
             source: wgpu::ShaderSource::Wgsl(TEXTURE_FILL_WGSL.into()),
+        });
+        let stencil_clip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Impeller stencil_clip.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(STENCIL_CLIP_WGSL.into()),
         });
 
         let dyn_uniform_entry = |binding: u32,
@@ -2278,39 +2564,37 @@ impl WgpuRenderer {
             }
         };
 
-        let solid_fill_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Impeller SolidFill BindGroupLayout"),
-                entries: &[
-                    dyn_uniform_entry(
-                        0,
-                        wgpu::ShaderStages::VERTEX,
-                        std::mem::size_of::<SolidFrameUniform>(),
-                    ),
-                    dyn_uniform_entry(
-                        1,
-                        wgpu::ShaderStages::FRAGMENT,
-                        std::mem::size_of::<SolidFragUniform>(),
-                    ),
-                ],
-            });
+        let solid_fill_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Impeller SolidFill BindGroupLayout"),
+            entries: &[
+                dyn_uniform_entry(
+                    0,
+                    wgpu::ShaderStages::VERTEX,
+                    std::mem::size_of::<SolidFrameUniform>(),
+                ),
+                dyn_uniform_entry(
+                    1,
+                    wgpu::ShaderStages::FRAGMENT,
+                    std::mem::size_of::<SolidFragUniform>(),
+                ),
+            ],
+        });
 
-        let rrect_blur_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Impeller RRectBlur BindGroupLayout"),
-                entries: &[
-                    dyn_uniform_entry(
-                        0,
-                        wgpu::ShaderStages::VERTEX,
-                        std::mem::size_of::<SolidFrameUniform>(),
-                    ),
-                    dyn_uniform_entry(
-                        1,
-                        wgpu::ShaderStages::FRAGMENT,
-                        std::mem::size_of::<RRectBlurFragUniform>(),
-                    ),
-                ],
-            });
+        let rrect_blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Impeller RRectBlur BindGroupLayout"),
+            entries: &[
+                dyn_uniform_entry(
+                    0,
+                    wgpu::ShaderStages::VERTEX,
+                    std::mem::size_of::<SolidFrameUniform>(),
+                ),
+                dyn_uniform_entry(
+                    1,
+                    wgpu::ShaderStages::FRAGMENT,
+                    std::mem::size_of::<RRectBlurFragUniform>(),
+                ),
+            ],
+        });
 
         let linear_gradient_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2347,6 +2631,50 @@ impl WgpuRenderer {
                         1,
                         wgpu::ShaderStages::FRAGMENT,
                         std::mem::size_of::<RadialGradientFragUniform>(),
+                    ),
+                    dyn_uniform_entry(
+                        2,
+                        wgpu::ShaderStages::FRAGMENT,
+                        std::mem::size_of::<[GpuColorPoint; MAX_GRADIENT_STOPS]>(),
+                    ),
+                ],
+            });
+
+        let sweep_gradient_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Impeller SweepGradient BindGroupLayout"),
+                entries: &[
+                    dyn_uniform_entry(
+                        0,
+                        wgpu::ShaderStages::VERTEX,
+                        std::mem::size_of::<GradientFrameUniform>(),
+                    ),
+                    dyn_uniform_entry(
+                        1,
+                        wgpu::ShaderStages::FRAGMENT,
+                        std::mem::size_of::<SweepGradientFragUniform>(),
+                    ),
+                    dyn_uniform_entry(
+                        2,
+                        wgpu::ShaderStages::FRAGMENT,
+                        std::mem::size_of::<[GpuColorPoint; MAX_GRADIENT_STOPS]>(),
+                    ),
+                ],
+            });
+
+        let conical_gradient_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Impeller ConicalGradient BindGroupLayout"),
+                entries: &[
+                    dyn_uniform_entry(
+                        0,
+                        wgpu::ShaderStages::VERTEX,
+                        std::mem::size_of::<GradientFrameUniform>(),
+                    ),
+                    dyn_uniform_entry(
+                        1,
+                        wgpu::ShaderStages::FRAGMENT,
+                        std::mem::size_of::<ConicalGradientFragUniform>(),
                     ),
                     dyn_uniform_entry(
                         2,
@@ -2483,13 +2811,18 @@ impl WgpuRenderer {
             solid_shader,
             linear_gradient_shader,
             radial_gradient_shader,
+            sweep_gradient_shader,
+            conical_gradient_shader,
             rrect_blur_shader,
             glyph_atlas_shader,
             texture_fill_shader,
+            stencil_clip_shader,
             solid_fill_layout,
             rrect_blur_layout,
             linear_gradient_layout,
             radial_gradient_layout,
+            sweep_gradient_layout,
+            conical_gradient_layout,
             glyph_atlas_layout,
             texture_fill_layout,
             linear_sampler,
@@ -2502,6 +2835,7 @@ impl WgpuRenderer {
             image_cache: Mutex::new(HashMap::new()),
             ssaa_scratch: Mutex::new(None),
             surface_msaa_scratch: Mutex::new(None),
+            stencil_scratch: Mutex::new(None),
             frame_arena: Mutex::new(FrameArena::default()),
         }
     }
@@ -2785,8 +3119,39 @@ impl WgpuRenderer {
         sample_count: u32,
         format: wgpu::TextureFormat,
     ) -> Arc<wgpu::RenderPipeline> {
+        let is_stencil_clip = matches!(
+            kind,
+            PipelineKind::StencilIncrement | PipelineKind::StencilDecrement
+        );
+        self.get_or_create_pipeline_full(kind, blend_mode, sample_count, format, is_stencil_clip)
+    }
+
+    pub fn get_or_create_pipeline_full(
+        &self,
+        kind: PipelineKind,
+        blend_mode: BlendMode,
+        sample_count: u32,
+        format: wgpu::TextureFormat,
+        has_stencil: bool,
+    ) -> Arc<wgpu::RenderPipeline> {
         let samples = normalize_sample_count(sample_count);
-        let key = (kind, blend_mode as u32, samples, format);
+        let is_stencil_clip = matches!(
+            kind,
+            PipelineKind::StencilIncrement | PipelineKind::StencilDecrement
+        );
+        let effective_stencil = has_stencil || is_stencil_clip;
+        let effective_blend = if is_stencil_clip {
+            BlendMode::SrcOver
+        } else {
+            blend_mode
+        };
+        let key = (
+            kind,
+            effective_blend as u32,
+            samples,
+            format,
+            effective_stencil,
+        );
         if let Ok(cache) = self.pipeline_cache.lock() {
             if let Some(existing) = cache.get(&key) {
                 return Arc::clone(existing);
@@ -2809,6 +3174,16 @@ impl WgpuRenderer {
                 &self.radial_gradient_layout,
                 "Impeller RadialGradientFill Pipeline",
             ),
+            PipelineKind::SweepGradientFill => (
+                &self.sweep_gradient_shader,
+                &self.sweep_gradient_layout,
+                "Impeller SweepGradientFill Pipeline",
+            ),
+            PipelineKind::ConicalGradientFill => (
+                &self.conical_gradient_shader,
+                &self.conical_gradient_layout,
+                "Impeller ConicalGradientFill Pipeline",
+            ),
             PipelineKind::RRectBlur => (
                 &self.rrect_blur_shader,
                 &self.rrect_blur_layout,
@@ -2824,15 +3199,25 @@ impl WgpuRenderer {
                 &self.texture_fill_layout,
                 "Impeller TextureFill Pipeline",
             ),
+            PipelineKind::StencilIncrement => (
+                &self.stencil_clip_shader,
+                &self.solid_fill_layout,
+                "Impeller StencilIncrement Pipeline",
+            ),
+            PipelineKind::StencilDecrement => (
+                &self.stencil_clip_shader,
+                &self.solid_fill_layout,
+                "Impeller StencilDecrement Pipeline",
+            ),
         };
 
-        let pipeline_layout =
-            self.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(label),
-                    bind_group_layouts: &[bgl],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[bgl],
+                push_constant_ranges: &[],
+            });
 
         let solid_attrs = [wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x2,
@@ -2909,7 +3294,47 @@ impl WgpuRenderer {
             },
         };
 
-        let blend_state = blend_state_for_mode(blend_mode);
+        let color_target = if is_stencil_clip {
+            wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            }
+        } else {
+            wgpu::ColorTargetState {
+                format,
+                blend: Some(blend_state_for_mode(effective_blend)),
+                write_mask: wgpu::ColorWrites::ALL,
+            }
+        };
+
+        let depth_stencil = if effective_stencil {
+            let (pass_op, write_mask) = match kind {
+                PipelineKind::StencilIncrement => (wgpu::StencilOperation::IncrementClamp, 0xFF),
+                PipelineKind::StencilDecrement => (wgpu::StencilOperation::DecrementClamp, 0xFF),
+                _ => (wgpu::StencilOperation::Keep, 0x00),
+            };
+            let stencil_face = wgpu::StencilFaceState {
+                compare: wgpu::CompareFunction::Equal,
+                fail_op: wgpu::StencilOperation::Keep,
+                depth_fail_op: wgpu::StencilOperation::Keep,
+                pass_op,
+            };
+            Some(wgpu::DepthStencilState {
+                format: STENCIL_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState {
+                    front: stencil_face,
+                    back: stencil_face,
+                    read_mask: 0xFF,
+                    write_mask,
+                },
+                bias: wgpu::DepthBiasState::default(),
+            })
+        } else {
+            None
+        };
 
         let pipeline = Arc::new(self.device.create_render_pipeline(
             &wgpu::RenderPipelineDescriptor {
@@ -2924,11 +3349,7 @@ impl WgpuRenderer {
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
                     entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(blend_state),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &[Some(color_target)],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
@@ -2940,7 +3361,7 @@ impl WgpuRenderer {
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
                 },
-                depth_stencil: None,
+                depth_stencil,
                 multisample: wgpu::MultisampleState {
                     count: samples,
                     mask: !0,
@@ -2955,6 +3376,52 @@ impl WgpuRenderer {
             cache.insert(key, Arc::clone(&pipeline));
         }
         pipeline
+    }
+
+    fn get_or_create_stencil_scratch(
+        &self,
+        width: u32,
+        height: u32,
+        sample_count: u32,
+    ) -> Arc<StencilScratchTarget> {
+        let w = width.max(1);
+        let h = height.max(1);
+        let samples = normalize_sample_count(sample_count);
+        if let Ok(guard) = self.stencil_scratch.lock() {
+            if let Some(existing) = guard.as_ref() {
+                if existing.width == w && existing.height == h && existing.sample_count == samples {
+                    return Arc::clone(existing);
+                }
+            }
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Impeller Depth24PlusStencil8 Scratch Texture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: STENCIL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let created = Arc::new(StencilScratchTarget {
+            width: w,
+            height: h,
+            sample_count: samples,
+            _texture: texture,
+            view,
+        });
+
+        if let Ok(mut guard) = self.stencil_scratch.lock() {
+            *guard = Some(Arc::clone(&created));
+        }
+        created
     }
 
     fn compute_scissor_rect(
@@ -3041,6 +3508,55 @@ impl WgpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn push_stencil_call(
+        &self,
+        arena: &mut FrameArena,
+        calls: &mut Vec<PendingArenaCall>,
+        kind: PipelineKind,
+        stencil_ref: u32,
+        scissor: [u32; 4],
+        frame_off: u32,
+        frag_off: u32,
+        vertex_bytes: &[u8],
+        vertex_count: u32,
+        indices: &[u32],
+        sample_count: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let pipeline =
+            self.get_or_create_pipeline_full(kind, BlendMode::SrcOver, sample_count, format, true);
+        FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+        FrameArena::align_cpu_4(&mut arena.index_cpu);
+        let vertex_offset = arena.vertex_cpu.len() as u64;
+        arena.vertex_cpu.extend_from_slice(vertex_bytes);
+        let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+
+        let index_offset = arena.index_cpu.len() as u64;
+        arena
+            .index_cpu
+            .extend_from_slice(bytemuck::cast_slice(indices));
+        let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+        calls.push(PendingArenaCall {
+            pipeline,
+            binding: DrawCallBinding::SolidFill,
+            glyph_alpha_opt: None,
+            glyph_color_opt: None,
+            dynamic_offsets: [frame_off, frag_off, 0],
+            dynamic_offset_count: 2,
+            vertex_offset,
+            vertex_byte_len,
+            vertex_count,
+            index_offset,
+            index_byte_len,
+            index_count: indices.len() as u32,
+            scissor,
+            stencil_ref,
+            coalesce_tag: CoalesceTag::None,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_pass_into_arena(
         &self,
         arena: &mut FrameArena,
@@ -3052,19 +3568,172 @@ impl WgpuRenderer {
         sample_count: u32,
         format: wgpu::TextureFormat,
         uniform_align: usize,
+        has_stencil: bool,
     ) -> Vec<PendingArenaCall> {
         let clustered = cluster_non_overlapping_commands(commands);
         let mut calls: Vec<PendingArenaCall> = Vec::with_capacity(clustered.len().min(256));
         let mut ortho_frame_offset: Option<u32> = None;
         let mut white_frag_offset: Option<u32> = None;
+        let mut stencil_depth: u32 = 0;
 
         for cmd in clustered {
-            let Some(scissor) = Self::compute_scissor_rect(
+            let scissor_opt = Self::compute_scissor_rect(
                 cmd.clip_rect(),
                 internal_width,
                 internal_height,
                 ssaa_scale,
-            ) else {
+            );
+
+            if let DrawCommand::PushClip {
+                mesh,
+                transform,
+                is_difference,
+                ..
+            } = cmd
+            {
+                if has_stencil && stencil_depth < 255 {
+                    let cur_depth = stencil_depth;
+                    if let Some(scissor) = scissor_opt {
+                        let frag_off = *white_frag_offset.get_or_insert_with(|| {
+                            let u = SolidFragUniform {
+                                color: [1.0, 1.0, 1.0, 1.0],
+                            };
+                            arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                        });
+                        if *is_difference {
+                            let s = ssaa_scale.max(1) as Scalar;
+                            let qx0 = (scissor[0] as Scalar) / s;
+                            let qy0 = (scissor[1] as Scalar) / s;
+                            let qx1 = ((scissor[0] + scissor[2]) as Scalar) / s;
+                            let qy1 = ((scissor[1] + scissor[3]) as Scalar) / s;
+                            let quad_verts = [
+                                SolidVertex::new(qx0, qy0),
+                                SolidVertex::new(qx1, qy0),
+                                SolidVertex::new(qx1, qy1),
+                                SolidVertex::new(qx0, qy1),
+                            ];
+                            let quad_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+                            let ortho_off = *ortho_frame_offset.get_or_insert_with(|| {
+                                let u = SolidFrameUniform { mvp: ortho.m };
+                                arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                            });
+                            self.push_stencil_call(
+                                arena,
+                                &mut calls,
+                                PipelineKind::StencilIncrement,
+                                cur_depth,
+                                scissor,
+                                ortho_off,
+                                frag_off,
+                                bytemuck::cast_slice(&quad_verts),
+                                4,
+                                &quad_indices,
+                                sample_count,
+                                format,
+                            );
+
+                            if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+                                let mvp = ortho * *transform;
+                                let frame_off = if *transform == Matrix::IDENTITY {
+                                    ortho_off
+                                } else {
+                                    let u = SolidFrameUniform { mvp: mvp.m };
+                                    arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                                };
+                                self.push_stencil_call(
+                                    arena,
+                                    &mut calls,
+                                    PipelineKind::StencilDecrement,
+                                    cur_depth + 1,
+                                    scissor,
+                                    frame_off,
+                                    frag_off,
+                                    bytemuck::cast_slice(&mesh.vertices),
+                                    mesh.vertices.len() as u32,
+                                    &mesh.indices,
+                                    sample_count,
+                                    format,
+                                );
+                            }
+                        } else if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+                            let frame_off = if *transform == Matrix::IDENTITY {
+                                *ortho_frame_offset.get_or_insert_with(|| {
+                                    let u = SolidFrameUniform { mvp: ortho.m };
+                                    arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                                })
+                            } else {
+                                let mvp = ortho * *transform;
+                                let u = SolidFrameUniform { mvp: mvp.m };
+                                arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                            };
+                            self.push_stencil_call(
+                                arena,
+                                &mut calls,
+                                PipelineKind::StencilIncrement,
+                                cur_depth,
+                                scissor,
+                                frame_off,
+                                frag_off,
+                                bytemuck::cast_slice(&mesh.vertices),
+                                mesh.vertices.len() as u32,
+                                &mesh.indices,
+                                sample_count,
+                                format,
+                            );
+                        }
+                    }
+                    stencil_depth = cur_depth + 1;
+                }
+                continue;
+            }
+
+            if let DrawCommand::PopClip { .. } = cmd {
+                if has_stencil && stencil_depth > 0 {
+                    let cur_depth = stencil_depth;
+                    if let Some(scissor) = scissor_opt {
+                        let s = ssaa_scale.max(1) as Scalar;
+                        let qx0 = (scissor[0] as Scalar) / s;
+                        let qy0 = (scissor[1] as Scalar) / s;
+                        let qx1 = ((scissor[0] + scissor[2]) as Scalar) / s;
+                        let qy1 = ((scissor[1] + scissor[3]) as Scalar) / s;
+                        let quad_verts = [
+                            SolidVertex::new(qx0, qy0),
+                            SolidVertex::new(qx1, qy0),
+                            SolidVertex::new(qx1, qy1),
+                            SolidVertex::new(qx0, qy1),
+                        ];
+                        let quad_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+                        let ortho_off = *ortho_frame_offset.get_or_insert_with(|| {
+                            let u = SolidFrameUniform { mvp: ortho.m };
+                            arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                        });
+                        let frag_off = *white_frag_offset.get_or_insert_with(|| {
+                            let u = SolidFragUniform {
+                                color: [1.0, 1.0, 1.0, 1.0],
+                            };
+                            arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                        });
+                        self.push_stencil_call(
+                            arena,
+                            &mut calls,
+                            PipelineKind::StencilDecrement,
+                            cur_depth,
+                            scissor,
+                            ortho_off,
+                            frag_off,
+                            bytemuck::cast_slice(&quad_verts),
+                            4,
+                            &quad_indices,
+                            sample_count,
+                            format,
+                        );
+                    }
+                    stencil_depth = cur_depth - 1;
+                }
+                continue;
+            }
+
+            let Some(scissor) = scissor_opt else {
                 continue;
             };
 
@@ -3087,11 +3756,14 @@ impl WgpuRenderer {
                             blend_mode: *blend_mode,
                         };
                         if let Some(last) = calls.last_mut() {
-                            if last.coalesce_tag == tag && last.scissor == scissor {
+                            if last.coalesce_tag == tag
+                                && last.scissor == scissor
+                                && last.stencil_ref == stencil_depth
+                            {
                                 let base_vertex = last.vertex_count;
-                                arena
-                                    .vertex_cpu
-                                    .reserve(mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>());
+                                arena.vertex_cpu.reserve(
+                                    mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>(),
+                                );
                                 for v in &mesh.vertices {
                                     let pos = if is_identity {
                                         v.position
@@ -3123,18 +3795,19 @@ impl WgpuRenderer {
                             }
                         }
 
-                        let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                        let pipeline = self.get_or_create_pipeline_full(
                             PipelineKind::SolidFill,
                             *blend_mode,
                             sample_count,
                             format,
+                            has_stencil,
                         );
                         FrameArena::align_cpu_4(&mut arena.vertex_cpu);
                         FrameArena::align_cpu_4(&mut arena.index_cpu);
                         let vertex_offset = arena.vertex_cpu.len() as u64;
-                        arena
-                            .vertex_cpu
-                            .reserve(mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>());
+                        arena.vertex_cpu.reserve(
+                            mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>(),
+                        );
                         for v in &mesh.vertices {
                             let pos = if is_identity {
                                 v.position
@@ -3177,21 +3850,23 @@ impl WgpuRenderer {
                             index_byte_len,
                             index_count: mesh.indices.len() as u32,
                             scissor,
+                            stencil_ref: stencil_depth,
                             coalesce_tag: tag,
                         });
                     } else {
-                        let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                        let pipeline = self.get_or_create_pipeline_full(
                             PipelineKind::SolidFill,
                             *blend_mode,
                             sample_count,
                             format,
+                            has_stencil,
                         );
                         FrameArena::align_cpu_4(&mut arena.vertex_cpu);
                         FrameArena::align_cpu_4(&mut arena.index_cpu);
                         let vertex_offset = arena.vertex_cpu.len() as u64;
-                        arena
-                            .vertex_cpu
-                            .reserve(mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>());
+                        arena.vertex_cpu.reserve(
+                            mesh.vertices.len() * std::mem::size_of::<ColoredSolidVertex>(),
+                        );
                         for v in &mesh.vertices {
                             let cv = ColoredSolidVertex::new(v.position, pm_color);
                             arena.vertex_cpu.extend_from_slice(bytemuck::bytes_of(&cv));
@@ -3229,6 +3904,7 @@ impl WgpuRenderer {
                             index_byte_len,
                             index_count: mesh.indices.len() as u32,
                             scissor,
+                            stencil_ref: stencil_depth,
                             coalesce_tag: CoalesceTag::None,
                         });
                     }
@@ -3243,11 +3919,12 @@ impl WgpuRenderer {
                     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                         continue;
                     }
-                    let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                    let pipeline = self.get_or_create_pipeline_full(
                         PipelineKind::LinearGradientFill,
                         *blend_mode,
                         sample_count,
                         format,
+                        has_stencil,
                     );
                     let mvp = ortho * *transform;
                     let frame_uniform = GradientFrameUniform {
@@ -3311,6 +3988,7 @@ impl WgpuRenderer {
                         index_byte_len,
                         index_count: mesh.indices.len() as u32,
                         scissor,
+                        stencil_ref: stencil_depth,
                         coalesce_tag: CoalesceTag::None,
                     });
                 }
@@ -3324,11 +4002,12 @@ impl WgpuRenderer {
                     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                         continue;
                     }
-                    let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                    let pipeline = self.get_or_create_pipeline_full(
                         PipelineKind::RadialGradientFill,
                         *blend_mode,
                         sample_count,
                         format,
+                        has_stencil,
                     );
                     let mvp = ortho * *transform;
                     let frame_uniform = GradientFrameUniform {
@@ -3387,6 +4066,187 @@ impl WgpuRenderer {
                         index_byte_len,
                         index_count: mesh.indices.len() as u32,
                         scissor,
+                        stencil_ref: stencil_depth,
+                        coalesce_tag: CoalesceTag::None,
+                    });
+                }
+                DrawCommand::SweepGradientFill {
+                    mesh,
+                    transform,
+                    gradient,
+                    blend_mode,
+                    ..
+                } => {
+                    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                        continue;
+                    }
+                    let pipeline = self.get_or_create_pipeline_full(
+                        PipelineKind::SweepGradientFill,
+                        *blend_mode,
+                        sample_count,
+                        format,
+                        has_stencil,
+                    );
+                    let mvp = ortho * *transform;
+                    let frame_uniform = GradientFrameUniform {
+                        mvp: mvp.m,
+                        matrix: Matrix::IDENTITY.m,
+                    };
+
+                    let t0 = gradient.start_angle_deg / 360.0;
+                    let t1 = gradient.end_angle_deg / 360.0;
+                    let span = t1 - t0;
+                    let bias = -t0;
+                    let scale = if span.abs() <= 1.0e-6 {
+                        0.0
+                    } else {
+                        1.0 / span
+                    };
+                    let (gpu_stops, colors_length, is_fast_two_stop, fast_color_0, fast_color_1) =
+                        build_gpu_color_points(&gradient.stops);
+
+                    let frag_uniform = SweepGradientFragUniform {
+                        center: [gradient.center.x, gradient.center.y],
+                        bias,
+                        scale,
+                        decal_border_color: [0.0; 4],
+                        fast_color_0,
+                        fast_color_1,
+                        tile_mode: gradient.tile_mode as u32,
+                        colors_length,
+                        is_fast_two_stop: u32::from(is_fast_two_stop),
+                        alpha: gradient.alpha.clamp(0.0, 1.0),
+                    };
+
+                    let frame_off =
+                        arena.push_uniform(bytemuck::bytes_of(&frame_uniform), uniform_align);
+                    let frag_off =
+                        arena.push_uniform(bytemuck::bytes_of(&frag_uniform), uniform_align);
+                    let stops_off =
+                        arena.push_uniform(bytemuck::cast_slice(&gpu_stops), uniform_align);
+
+                    FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+                    FrameArena::align_cpu_4(&mut arena.index_cpu);
+                    let vertex_offset = arena.vertex_cpu.len() as u64;
+                    arena
+                        .vertex_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+                    let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+
+                    let index_offset = arena.index_cpu.len() as u64;
+                    arena
+                        .index_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&mesh.indices));
+                    let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+                    calls.push(PendingArenaCall {
+                        pipeline,
+                        binding: DrawCallBinding::SweepGradient,
+                        glyph_alpha_opt: None,
+                        glyph_color_opt: None,
+                        dynamic_offsets: [frame_off, frag_off, stops_off],
+                        dynamic_offset_count: 3,
+                        vertex_offset,
+                        vertex_byte_len,
+                        vertex_count: mesh.vertices.len() as u32,
+                        index_offset,
+                        index_byte_len,
+                        index_count: mesh.indices.len() as u32,
+                        scissor,
+                        stencil_ref: stencil_depth,
+                        coalesce_tag: CoalesceTag::None,
+                    });
+                }
+                DrawCommand::ConicalGradientFill {
+                    mesh,
+                    transform,
+                    gradient,
+                    blend_mode,
+                    ..
+                } => {
+                    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                        continue;
+                    }
+                    let pipeline = self.get_or_create_pipeline_full(
+                        PipelineKind::ConicalGradientFill,
+                        *blend_mode,
+                        sample_count,
+                        format,
+                        has_stencil,
+                    );
+                    let mvp = ortho * *transform;
+                    let frame_uniform = GradientFrameUniform {
+                        mvp: mvp.m,
+                        matrix: Matrix::IDENTITY.m,
+                    };
+
+                    let start_r = gradient.start_radius.max(0.0);
+                    let end_r = gradient.end_radius.max(0.0);
+                    let same_center =
+                        gradient.start_center.get_distance(gradient.end_center) < K_EH_CLOSE_ENOUGH;
+                    let same_radius = (start_r - end_r).abs() < K_EH_CLOSE_ENOUGH;
+                    let kind = match (same_center, same_radius) {
+                        (true, true) => 0u32,
+                        (true, false) => 1u32,
+                        (false, true) => 2u32,
+                        (false, false) => 3u32,
+                    };
+
+                    let (gpu_stops, colors_length, is_fast_two_stop, fast_color_0, fast_color_1) =
+                        build_gpu_color_points(&gradient.stops);
+
+                    let frag_uniform = ConicalGradientFragUniform {
+                        start_center: [gradient.start_center.x, gradient.start_center.y],
+                        start_radius: start_r,
+                        end_radius: end_r,
+                        end_center: [gradient.end_center.x, gradient.end_center.y],
+                        alpha: gradient.alpha.clamp(0.0, 1.0),
+                        kind,
+                        decal_border_color: [0.0; 4],
+                        fast_color_0,
+                        fast_color_1,
+                        tile_mode: gradient.tile_mode as u32,
+                        colors_length,
+                        is_fast_two_stop: u32::from(is_fast_two_stop),
+                        _pad: 0,
+                    };
+
+                    let frame_off =
+                        arena.push_uniform(bytemuck::bytes_of(&frame_uniform), uniform_align);
+                    let frag_off =
+                        arena.push_uniform(bytemuck::bytes_of(&frag_uniform), uniform_align);
+                    let stops_off =
+                        arena.push_uniform(bytemuck::cast_slice(&gpu_stops), uniform_align);
+
+                    FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+                    FrameArena::align_cpu_4(&mut arena.index_cpu);
+                    let vertex_offset = arena.vertex_cpu.len() as u64;
+                    arena
+                        .vertex_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+                    let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+
+                    let index_offset = arena.index_cpu.len() as u64;
+                    arena
+                        .index_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&mesh.indices));
+                    let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+                    calls.push(PendingArenaCall {
+                        pipeline,
+                        binding: DrawCallBinding::ConicalGradient,
+                        glyph_alpha_opt: None,
+                        glyph_color_opt: None,
+                        dynamic_offsets: [frame_off, frag_off, stops_off],
+                        dynamic_offset_count: 3,
+                        vertex_offset,
+                        vertex_byte_len,
+                        vertex_count: mesh.vertices.len() as u32,
+                        index_offset,
+                        index_byte_len,
+                        index_count: mesh.indices.len() as u32,
+                        scissor,
+                        stencil_ref: stencil_depth,
                         coalesce_tag: CoalesceTag::None,
                     });
                 }
@@ -3399,11 +4259,12 @@ impl WgpuRenderer {
                     if params.rect.is_empty() {
                         continue;
                     }
-                    let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                    let pipeline = self.get_or_create_pipeline_full(
                         PipelineKind::RRectBlur,
                         *blend_mode,
                         sample_count,
                         format,
+                        has_stencil,
                     );
 
                     let pos_left = params.rect.get_left();
@@ -3464,6 +4325,7 @@ impl WgpuRenderer {
                         index_byte_len,
                         index_count: 6,
                         scissor,
+                        stencil_ref: stencil_depth,
                         coalesce_tag: CoalesceTag::None,
                     });
                 }
@@ -3600,6 +4462,7 @@ impl WgpuRenderer {
                             };
                             if last.coalesce_tag == tag
                                 && last.scissor == scissor
+                                && last.stencil_ref == stencil_depth
                                 && alpha_compat
                                 && color_compat
                             {
@@ -3609,27 +4472,25 @@ impl WgpuRenderer {
                                 if last.glyph_color_opt.is_none() {
                                     last.glyph_color_opt = color_opt.clone();
                                 }
-                                last.binding = DrawCallBinding::GlyphAtlas {
-                                    alpha_gpu: last
-                                        .glyph_alpha_opt
-                                        .clone()
-                                        .unwrap_or_else(|| Arc::clone(&self.fallback_alpha_atlas)),
-                                    color_gpu: last
-                                        .glyph_color_opt
-                                        .clone()
-                                        .unwrap_or_else(|| Arc::clone(&self.fallback_color_atlas)),
-                                    use_linear,
-                                };
+                                last.binding =
+                                    DrawCallBinding::GlyphAtlas {
+                                        alpha_gpu: last.glyph_alpha_opt.clone().unwrap_or_else(
+                                            || Arc::clone(&self.fallback_alpha_atlas),
+                                        ),
+                                        color_gpu: last.glyph_color_opt.clone().unwrap_or_else(
+                                            || Arc::clone(&self.fallback_color_atlas),
+                                        ),
+                                        use_linear,
+                                    };
                                 append_glyph_quads(
                                     &mut arena.vertex_cpu,
                                     &mut arena.index_cpu,
                                     last.vertex_count,
                                     true,
                                 );
-                                let v_added = (valid_quad_count
-                                    * 4
-                                    * std::mem::size_of::<GlyphVertex>())
-                                    as u64;
+                                let v_added =
+                                    (valid_quad_count * 4 * std::mem::size_of::<GlyphVertex>())
+                                        as u64;
                                 let i_added =
                                     (valid_quad_count * 6 * std::mem::size_of::<u32>()) as u64;
                                 last.vertex_count += (valid_quad_count * 4) as u32;
@@ -3640,11 +4501,12 @@ impl WgpuRenderer {
                             }
                         }
 
-                        let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                        let pipeline = self.get_or_create_pipeline_full(
                             PipelineKind::GlyphAtlas,
                             batch.blend_mode,
                             sample_count,
                             format,
+                            has_stencil,
                         );
                         FrameArena::align_cpu_4(&mut arena.vertex_cpu);
                         FrameArena::align_cpu_4(&mut arena.index_cpu);
@@ -3689,14 +4551,16 @@ impl WgpuRenderer {
                             index_byte_len,
                             index_count: (valid_quad_count * 6) as u32,
                             scissor,
+                            stencil_ref: stencil_depth,
                             coalesce_tag: tag,
                         });
                     } else {
-                        let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                        let pipeline = self.get_or_create_pipeline_full(
                             PipelineKind::GlyphAtlas,
                             batch.blend_mode,
                             sample_count,
                             format,
+                            has_stencil,
                         );
                         FrameArena::align_cpu_4(&mut arena.vertex_cpu);
                         FrameArena::align_cpu_4(&mut arena.index_cpu);
@@ -3741,6 +4605,7 @@ impl WgpuRenderer {
                             index_byte_len,
                             index_count: (valid_quad_count * 6) as u32,
                             scissor,
+                            stencil_ref: stencil_depth,
                             coalesce_tag: CoalesceTag::None,
                         });
                     }
@@ -3753,11 +4618,12 @@ impl WgpuRenderer {
                     {
                         continue;
                     }
-                    let pipeline = self.get_or_create_pipeline_with_samples_and_format(
+                    let pipeline = self.get_or_create_pipeline_full(
                         PipelineKind::TextureFill,
                         batch.blend_mode,
                         sample_count,
                         format,
+                        has_stencil,
                     );
                     let gpu_tex = self.get_or_upload_image_texture(&batch.texture);
                     let mvp = ortho * batch.transform;
@@ -3805,9 +4671,11 @@ impl WgpuRenderer {
                         index_byte_len,
                         index_count: batch.indices.len() as u32,
                         scissor,
+                        stencil_ref: stencil_depth,
                         coalesce_tag: CoalesceTag::None,
                     });
                 }
+                DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => {}
             }
         }
         calls
@@ -3944,6 +4812,76 @@ impl WgpuRenderer {
                 }));
                 arena.last_frame_bind_groups_created += 1;
                 arena.radial_gradient_bg = Some(Arc::clone(&created));
+                created
+            }
+            DrawCallBinding::SweepGradient => {
+                if let Some(bg) = arena.sweep_gradient_bg.as_ref() {
+                    return Arc::clone(bg);
+                }
+                let created = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SweepGradient Arena BindGroup"),
+                    layout: &self.sweep_gradient_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<GradientFrameUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<SweepGradientFragUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<[GpuColorPoint; MAX_GRADIENT_STOPS]>(),
+                            ),
+                        },
+                    ],
+                }));
+                arena.last_frame_bind_groups_created += 1;
+                arena.sweep_gradient_bg = Some(Arc::clone(&created));
+                created
+            }
+            DrawCallBinding::ConicalGradient => {
+                if let Some(bg) = arena.conical_gradient_bg.as_ref() {
+                    return Arc::clone(bg);
+                }
+                let created = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ConicalGradient Arena BindGroup"),
+                    layout: &self.conical_gradient_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<GradientFrameUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<ConicalGradientFragUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<[GpuColorPoint; MAX_GRADIENT_STOPS]>(),
+                            ),
+                        },
+                    ],
+                }));
+                arena.last_frame_bind_groups_created += 1;
+                arena.conical_gradient_bg = Some(Arc::clone(&created));
                 created
             }
             DrawCallBinding::GlyphAtlas {
@@ -4114,15 +5052,21 @@ impl WgpuRenderer {
         resolved_bgs: &'a [Arc<wgpu::BindGroup>],
         vertex_gpu: &'a wgpu::Buffer,
         index_gpu: &'a wgpu::Buffer,
+        has_stencil: bool,
     ) {
         let mut last_pipeline_id: Option<usize> = None;
         let mut last_scissor: Option<[u32; 4]> = None;
+        let mut last_stencil_ref: Option<u32> = None;
 
         for (call, bg) in calls.iter().zip(resolved_bgs.iter()) {
             let p_id = Arc::as_ptr(&call.pipeline) as usize;
             if last_pipeline_id != Some(p_id) {
                 render_pass.set_pipeline(&call.pipeline);
                 last_pipeline_id = Some(p_id);
+            }
+            if has_stencil && last_stencil_ref != Some(call.stencil_ref) {
+                render_pass.set_stencil_reference(call.stencil_ref);
+                last_stencil_ref = Some(call.stencil_ref);
             }
             render_pass.set_bind_group(
                 0,
@@ -4162,6 +5106,9 @@ impl WgpuRenderer {
             target.internal_width as Scalar,
             target.internal_height as Scalar,
         )) * Matrix::make_scale(ssaa, ssaa, 1.0);
+        let has_stencil = commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
         let (calls, resolved_bgs, vertex_gpu, index_gpu) = {
             let mut arena = self
@@ -4179,6 +5126,7 @@ impl WgpuRenderer {
                 target.sample_count,
                 TARGET_FORMAT,
                 uniform_align,
+                has_stencil,
             );
             arena.last_frame_draw_call_count = calls.len();
             arena.upload_cpu_buffers(&self.device, &self.queue, uniform_align);
@@ -4199,6 +5147,14 @@ impl WgpuRenderer {
                 arena.index_gpu.clone(),
             )
         };
+
+        let stencil_scratch = has_stencil.then(|| {
+            self.get_or_create_stencil_scratch(
+                target.internal_width,
+                target.internal_height,
+                target.sample_count,
+            )
+        });
 
         let mut encoder = self
             .device
@@ -4227,14 +5183,33 @@ impl WgpuRenderer {
                         store: store_op,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: stencil_scratch.as_ref().map(|s| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &s.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                    }
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
 
             if !calls.is_empty() {
                 if let (Some(vb), Some(ib)) = (vertex_gpu.as_ref(), index_gpu.as_ref()) {
-                    Self::record_arena_calls(&mut render_pass, &calls, &resolved_bgs, vb, ib);
+                    Self::record_arena_calls(
+                        &mut render_pass,
+                        &calls,
+                        &resolved_bgs,
+                        vb,
+                        ib,
+                        has_stencil,
+                    );
                 }
             }
         }
@@ -4338,6 +5313,9 @@ impl WgpuRenderer {
             UvVertex::new(0.0, h as Scalar, 0.0, 1.0),
         ];
         let resolve_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        let has_stencil = commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
         let (
             calls,
@@ -4364,6 +5342,7 @@ impl WgpuRenderer {
                 1,
                 TARGET_FORMAT,
                 uniform_align,
+                has_stencil,
             );
             arena.last_frame_draw_call_count = calls.len() + 1;
 
@@ -4407,6 +5386,9 @@ impl WgpuRenderer {
             )
         };
 
+        let stencil_scratch =
+            has_stencil.then(|| self.get_or_create_stencil_scratch(ssaa_w, ssaa_h, 1));
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4430,13 +5412,32 @@ impl WgpuRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: stencil_scratch.as_ref().map(|s| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &s.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                    }
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
 
             if !calls.is_empty() {
-                Self::record_arena_calls(&mut pass1, &calls, &resolved_bgs, &vertex_gpu, &index_gpu);
+                Self::record_arena_calls(
+                    &mut pass1,
+                    &calls,
+                    &resolved_bgs,
+                    &vertex_gpu,
+                    &index_gpu,
+                    has_stencil,
+                );
             }
         }
 
@@ -4500,6 +5501,9 @@ impl WgpuRenderer {
             1
         };
         let ortho = Matrix::make_orthographic(Size::new(w as Scalar, h as Scalar));
+        let has_stencil = commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
         let (calls, resolved_bgs, vertex_gpu, index_gpu) = {
             let mut arena = self
@@ -4517,6 +5521,7 @@ impl WgpuRenderer {
                 effective_samples,
                 format,
                 uniform_align,
+                has_stencil,
             );
             arena.last_frame_draw_call_count = calls.len();
             arena.upload_cpu_buffers(&self.device, &self.queue, uniform_align);
@@ -4537,6 +5542,9 @@ impl WgpuRenderer {
                 arena.index_gpu.clone(),
             )
         };
+
+        let stencil_scratch =
+            has_stencil.then(|| self.get_or_create_stencil_scratch(w, h, effective_samples));
 
         let mut encoder = self
             .device
@@ -4565,14 +5573,33 @@ impl WgpuRenderer {
                         store: store_op,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: stencil_scratch.as_ref().map(|s| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &s.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                    }
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
 
             if !calls.is_empty() {
                 if let (Some(vb), Some(ib)) = (vertex_gpu.as_ref(), index_gpu.as_ref()) {
-                    Self::record_arena_calls(&mut render_pass, &calls, &resolved_bgs, vb, ib);
+                    Self::record_arena_calls(
+                        &mut render_pass,
+                        &calls,
+                        &resolved_bgs,
+                        vb,
+                        ib,
+                        has_stencil,
+                    );
                 }
             }
         }
@@ -4716,7 +5743,11 @@ impl WgpuRenderer {
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        (readback_buffer, unpadded_bytes_per_row, padded_bytes_per_row)
+        (
+            readback_buffer,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+        )
     }
 
     fn extract_unpadded_rows(
@@ -6166,7 +7197,10 @@ mod tests {
         gen1.generation = 1;
         gen1.pixels.fill(80);
         let key1 = AtlasCacheKey::from_atlas(&gen1);
-        assert_eq!(key1.pixel_hash, 0, "generation > 0 must use O(1) zero pixel_hash");
+        assert_eq!(
+            key1.pixel_hash, 0,
+            "generation > 0 must use O(1) zero pixel_hash"
+        );
 
         let mut gen2 = gen1.clone();
         gen2.grow(32, 32);
@@ -6850,5 +7884,319 @@ mod tests {
         assert_eq!(ctx.last_frame_draw_call_count(), 66);
         assert_pixel_approx(pixel_at(&rgba, 256, 6, 6), [255, 0, 0, 255], 1);
         assert_pixel_approx(pixel_at(&rgba, 256, 16, 6), [0, 255, 0, 255], 1);
+    }
+
+    /// C++ source: entity_unittests.cc:ClipPathIntersect
+    #[test]
+    fn test_stencil_clip_intersect_triangle_and_msaa() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let tri_mesh = TessellatedMesh {
+            vertices: vec![
+                Vertex2D::new(32.0, 4.0),
+                Vertex2D::new(60.0, 60.0),
+                Vertex2D::new(4.0, 60.0),
+            ],
+            indices: vec![0, 1, 2],
+        };
+
+        let commands = vec![
+            DrawCommand::PushClip {
+                mesh: tri_mesh,
+                transform: Matrix::IDENTITY,
+                is_difference: false,
+                clip_rect: None,
+            },
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::RED,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+            DrawCommand::PopClip { clip_rect: None },
+            // After PopClip, drawing outside the triangle must succeed.
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(2.0, 2.0, 10.0, 10.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::GREEN,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+        ];
+
+        // 1x sample count target
+        let target_1x = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+        let rgba_1x = target_1x
+            .render_and_readback(&ctx, Color::BLACK, &commands)
+            .expect("stencil clip 1x render");
+        // Inside triangle (32, 48) -> RED
+        assert_pixel_approx(pixel_at(&rgba_1x, 64, 32, 48), [255, 0, 0, 255], 1);
+        // Outside triangle top-right (56, 8) -> clipped during RED draw, stays BLACK
+        assert_pixel_approx(pixel_at(&rgba_1x, 64, 56, 8), [0, 0, 0, 255], 1);
+        // Outside triangle top-left (6, 6) -> GREEN drawn after PopClip
+        assert_pixel_approx(pixel_at(&rgba_1x, 64, 6, 6), [0, 255, 0, 255], 1);
+
+        // 4x MSAA target (default)
+        let rgba_msaa = ctx
+            .render_to_rgba(64, 64, Color::BLACK, &commands)
+            .expect("stencil clip 4x msaa render");
+        assert_pixel_approx(pixel_at(&rgba_msaa, 64, 32, 48), [255, 0, 0, 255], 1);
+        assert_pixel_approx(pixel_at(&rgba_msaa, 64, 56, 8), [0, 0, 0, 255], 1);
+        assert_pixel_approx(pixel_at(&rgba_msaa, 64, 6, 6), [0, 255, 0, 255], 1);
+    }
+
+    /// C++ source: entity_unittests.cc:NestedClipPathIntersect
+    #[test]
+    fn test_stencil_clip_nested_intersect_and_pop() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let outer_mesh = make_rect_mesh(Rect::from_xywh(8.0, 8.0, 36.0, 48.0)); // x: 8..44, y: 8..56
+        let inner_mesh = make_rect_mesh(Rect::from_xywh(20.0, 8.0, 36.0, 24.0)); // x: 20..56, y: 8..32
+
+        let commands = vec![
+            DrawCommand::PushClip {
+                mesh: outer_mesh,
+                transform: Matrix::IDENTITY,
+                is_difference: false,
+                clip_rect: None,
+            },
+            DrawCommand::PushClip {
+                mesh: inner_mesh,
+                transform: Matrix::IDENTITY,
+                is_difference: false,
+                clip_rect: None,
+            },
+            // Only intersection (x: 20..44, y: 8..32) should receive RED (stencil == 2).
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::RED,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+            DrawCommand::PopClip { clip_rect: None },
+            // After popping inner clip, outer clip (x: 8..44, y: 8..56) is active (stencil == 1).
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(0.0, 40.0, 64.0, 12.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::BLUE,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+            DrawCommand::PopClip { clip_rect: None },
+        ];
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::BLACK, &commands)
+            .expect("nested stencil clip render");
+        // Inside both clips (30, 20) -> RED
+        assert_pixel_approx(pixel_at(&rgba, 64, 30, 20), [255, 0, 0, 255], 1);
+        // Inside outer only, top-left (14, 20) -> excluded by inner clip -> BLACK
+        assert_pixel_approx(pixel_at(&rgba, 64, 14, 20), [0, 0, 0, 255], 1);
+        // Inside inner only, top-right (50, 20) -> excluded by outer clip -> BLACK
+        assert_pixel_approx(pixel_at(&rgba, 64, 50, 20), [0, 0, 0, 255], 1);
+        // Inside outer clip after inner PopClip (16, 46) -> BLUE
+        assert_pixel_approx(pixel_at(&rgba, 64, 16, 46), [0, 0, 255, 255], 1);
+        // Outside outer clip after inner PopClip (52, 46) -> BLACK
+        assert_pixel_approx(pixel_at(&rgba, 64, 52, 46), [0, 0, 0, 255], 1);
+    }
+
+    /// C++ source: entity_unittests.cc:ClipPathDifference
+    #[test]
+    fn test_stencil_clip_difference_punches_hole() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let hole_mesh = make_rect_mesh(Rect::from_xywh(20.0, 20.0, 24.0, 24.0));
+        let commands = vec![
+            DrawCommand::PushClip {
+                mesh: hole_mesh,
+                transform: Matrix::IDENTITY,
+                is_difference: true,
+                clip_rect: None,
+            },
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(4.0, 4.0, 56.0, 56.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::GREEN,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+            DrawCommand::PopClip { clip_rect: None },
+            // Verify stencil depth returns to 0 after popping a Difference clip.
+            DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(28.0, 28.0, 8.0, 8.0)),
+                transform: Matrix::IDENTITY,
+                color: Color::RED,
+                blend_mode: BlendMode::SrcOver,
+                clip_rect: None,
+            },
+        ];
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::BLACK, &commands)
+            .expect("stencil difference clip render");
+        // Outer region (10, 10) -> GREEN
+        assert_pixel_approx(pixel_at(&rgba, 64, 10, 10), [0, 255, 0, 255], 1);
+        // Inside difference hole but outside post-pop RED square (22, 22) -> BLACK
+        assert_pixel_approx(pixel_at(&rgba, 64, 22, 22), [0, 0, 0, 255], 1);
+        // Inside post-pop RED square (32, 32) -> RED
+        assert_pixel_approx(pixel_at(&rgba, 64, 32, 32), [255, 0, 0, 255], 1);
+    }
+
+    /// C++ source: entity_unittests.cc:SweepGradientContents
+    #[test]
+    fn test_sweep_gradient_fill_full_and_sector_decal() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let params = SweepGradientParams::new(
+            Point::new(32.0, 32.0),
+            0.0,
+            360.0,
+            vec![
+                GradientStop::new(0.0, Color::RED),
+                GradientStop::new(0.25, Color::GREEN),
+                GradientStop::new(0.5, Color::BLUE),
+                GradientStop::new(0.75, Color::new(1.0, 1.0, 0.0, 1.0)),
+                GradientStop::new(1.0, Color::RED),
+            ],
+            TileMode::Clamp,
+            1.0,
+        );
+        let cmd = DrawCommand::from(SweepGradientBatch {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            gradient: params,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        });
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::BLACK, &[cmd])
+            .expect("sweep gradient full render");
+        // 90 deg (+Y down from center): (32, 52) -> t = 0.25 -> GREEN
+        assert_pixel_approx(pixel_at(&rgba, 64, 32, 52), [0, 255, 0, 255], 6);
+        // 180 deg (-X left from center): (12, 32) -> t = 0.50 -> BLUE
+        assert_pixel_approx(pixel_at(&rgba, 64, 12, 32), [0, 0, 255, 255], 6);
+        // 270 deg (-Y up from center): (32, 12) -> t = 0.75 -> YELLOW
+        assert_pixel_approx(pixel_at(&rgba, 64, 32, 12), [255, 255, 0, 255], 6);
+
+        // Sector sweep [90..270] with TileMode::Decal
+        let decal_params = SweepGradientParams::two_stop(
+            Point::new(32.0, 32.0),
+            90.0,
+            270.0,
+            Color::RED,
+            Color::BLUE,
+            TileMode::Decal,
+        );
+        let decal_cmd = DrawCommand::SweepGradientFill {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            gradient: decal_params,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let rgba_decal = target
+            .render_and_readback(&ctx, Color::BLACK, &[decal_cmd])
+            .expect("sweep gradient decal render");
+        // 180 deg (-X left, (12, 32)) is midpoint of [90..270] -> t = 0.5 -> purple [128, 0, 128, 255]
+        assert_pixel_approx(pixel_at(&rgba_decal, 64, 12, 32), [128, 0, 128, 255], 6);
+        // ~14 deg (+X right-down, (52, 37)) is outside [90..270] -> Decal transparent -> BLACK
+        assert_pixel_approx(pixel_at(&rgba_decal, 64, 52, 37), [0, 0, 0, 255], 1);
+    }
+
+    /// C++ source: entity_unittests.cc:ConicalGradientContents
+    #[test]
+    fn test_conical_gradient_fill_radial_strip_and_conical() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        // 1. Concentric two-radius (kind = 1: Radial ring from r0=8 to r1=28)
+        let radial_params = ConicalGradientParams::two_stop(
+            Point::new(32.0, 32.0),
+            8.0,
+            Point::new(32.0, 32.0),
+            28.0,
+            Color::RED,
+            Color::BLUE,
+            TileMode::Clamp,
+        );
+        let radial_cmd = DrawCommand::from(ConicalGradientBatch {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            gradient: radial_params,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        });
+        let rgba_radial = target
+            .render_and_readback(&ctx, Color::BLACK, &[radial_cmd])
+            .expect("conical concentric radial render");
+        // Center (d = 0 <= 8) -> clamped t = 0 -> RED
+        assert_pixel_approx(pixel_at(&rgba_radial, 64, 32, 32), [255, 0, 0, 255], 2);
+        // Midpoint of ring (d = 18 -> (50, 32)) -> t = 0.5 -> purple [128, 0, 128, 255]
+        assert_pixel_approx(pixel_at(&rgba_radial, 64, 50, 32), [128, 0, 128, 255], 8);
+        // Outside outer radius (d = 30 -> (62, 32)) -> clamped t = 1 -> BLUE
+        assert_pixel_approx(pixel_at(&rgba_radial, 64, 62, 32), [0, 0, 255, 255], 2);
+
+        // 2. Equal-radius strip (kind = 2: Strip between (16, 32) and (48, 32) with r = 16, Decal)
+        let strip_params = ConicalGradientParams::two_stop(
+            Point::new(16.0, 32.0),
+            16.0,
+            Point::new(48.0, 32.0),
+            16.0,
+            Color::RED,
+            Color::GREEN,
+            TileMode::Decal,
+        );
+        let strip_cmd = DrawCommand::ConicalGradientFill {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            gradient: strip_params,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let rgba_strip = target
+            .render_and_readback(&ctx, Color::BLACK, &[strip_cmd])
+            .expect("conical strip render");
+        // Outside strip cylinder (|y - 32| = 24 > 16 at (32, 8)) -> invalid t -> BLACK
+        assert_pixel_approx(pixel_at(&rgba_strip, 64, 32, 8), [0, 0, 0, 255], 1);
+        // Inside strip at start_center (16, 32) -> pt = (0, 0), t = 0 + sqrt(0.25) = 0.5 -> [128, 128, 0, 255]
+        assert_pixel_approx(pixel_at(&rgba_strip, 64, 16, 32), [128, 128, 0, 255], 8);
+
+        // 3. Eccentric two-point conical (kind = 3: focal (20, 32) r0=0 -> center (36, 32) r1=24)
+        let conical_params = ConicalGradientParams::new(
+            Point::new(20.0, 32.0),
+            0.0,
+            Point::new(36.0, 32.0),
+            24.0,
+            vec![
+                GradientStop::new(0.0, Color::RED),
+                GradientStop::new(0.5, Color::GREEN),
+                GradientStop::new(1.0, Color::BLUE),
+            ],
+            TileMode::Clamp,
+            1.0,
+        );
+        let conical_cmd = DrawCommand::ConicalGradientFill {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 64.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            gradient: conical_params,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let rgba_conical = target
+            .render_and_readback(&ctx, Color::BLACK, &[conical_cmd])
+            .expect("conical two-point render");
+        // Near focal point (20, 32) -> t ~ 0.0 -> RED-dominant
+        let focal_px = pixel_at(&rgba_conical, 64, 20, 32);
+        assert!(
+            focal_px[0] > 230 && focal_px[2] < 20,
+            "focal pixel should be near RED, got {focal_px:?}"
+        );
+        // At outer edge +X (36 + 24 = 60, 32) -> t = 1.0 -> BLUE
+        assert_pixel_approx(pixel_at(&rgba_conical, 64, 60, 32), [0, 0, 255, 255], 8);
     }
 }

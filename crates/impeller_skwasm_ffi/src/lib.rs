@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use impeller_canvas::{
-    BlendMode, Canvas, Cap, ClipOperation, ColorFilter, ColorSource, DisplayList,
-    DisplayListBuilder, DrawStyle, GradientStop, ImageFilter, ImageTexture, Join,
-    LinearGradientParams, Paint, RadialGradientParams, RoundingRadii, TileMode, VertexMode,
+    BlendMode, Canvas, Cap, ClipOperation, ColorFilter, ColorSource, ConicalGradientParams,
+    DisplayList, DisplayListBuilder, DrawStyle, GradientStop, ImageFilter, ImageTexture, Join,
+    LinearGradientParams, Paint, RadialGradientParams, RoundingRadii, SweepGradientParams,
+    TileMode, VertexMode,
 };
 use impeller_geometry::{Color, Matrix, Point, Radians, Rect, Scalar, Size};
 use impeller_path::{FillType, Path, PathBuilder};
@@ -1892,10 +1893,32 @@ pub unsafe extern "C" fn path_getBounds(handle: u32, out_rect_ptr: *mut f32) {
 
 #[no_mangle]
 pub unsafe extern "C" fn path_combine(op: i32, path1: u32, path2: u32) -> u32 {
-    let _ = op;
-    let copy_id = path_copy(path1);
-    path_addPath(copy_id, path2, std::ptr::null(), 0);
-    copy_id
+    with_state(|st| {
+        let Some(p1) = st.paths.get(&path1) else {
+            return 0;
+        };
+        let Some(p2) = st.paths.get(&path2) else {
+            return 0;
+        };
+        let path_a = p1.build_path();
+        let path_b = p2.build_path();
+        let path_op = impeller_tessellator::PathOp::from_i32(op)
+            .unwrap_or(impeller_tessellator::PathOp::Union);
+        let combined = impeller_tessellator::combine_paths(&path_a, &path_b, path_op, 1.0);
+        let mut builder = PathBuilder::default();
+        builder.add_path(&combined);
+        let cur_pt = builder.current_point();
+        let fill_type = combined.get_fill_type();
+        let entry = PathEntry {
+            builder,
+            fill_type,
+            current_point: cur_pt,
+            cached_path: RefCell::new(Some(combined)),
+        };
+        let id = st.alloc_handle();
+        st.paths.insert(id, entry);
+        id
+    })
 }
 
 #[no_mangle]
@@ -2088,7 +2111,7 @@ pub unsafe extern "C" fn shader_createRadialGradient(
 #[no_mangle]
 pub unsafe extern "C" fn shader_createConicalGradient(
     end_points_ptr: *const f32,
-    _start_radius: f32,
+    start_radius: f32,
     end_radius: f32,
     colors_ptr: *const u32,
     stops_ptr: *const f32,
@@ -2096,22 +2119,31 @@ pub unsafe extern "C" fn shader_createConicalGradient(
     tile_mode: i32,
     matrix33_ptr: *const f32,
 ) -> u32 {
-    let (cx, cy) = if end_points_ptr.is_null() {
-        (0.0, 0.0)
+    let (s_pt, e_pt) = if end_points_ptr.is_null() {
+        (Point::ZERO, Point::ZERO)
     } else {
         let pts = std::slice::from_raw_parts(end_points_ptr, 4);
-        (pts[2], pts[3])
+        (Point::new(pts[0], pts[1]), Point::new(pts[2], pts[3]))
     };
-    shader_createRadialGradient(
-        cx,
-        cy,
-        end_radius.max(1.0),
-        colors_ptr,
-        stops_ptr,
-        count,
-        tile_mode,
-        matrix33_ptr,
-    )
+    let local_mat = read_matrix33_ptr(matrix33_ptr);
+    let start_center = local_mat.transform_point(s_pt);
+    let end_center = local_mat.transform_point(e_pt);
+    let scale = local_mat.get_max_basis_length_xy().max(1e-4);
+    let stops = parse_gradient_stops(colors_ptr, stops_ptr, count);
+    let src = ColorSource::ConicalGradient(ConicalGradientParams::new(
+        start_center,
+        (start_radius * scale).max(0.0),
+        end_center,
+        (end_radius * scale).max(0.0),
+        stops,
+        decode_tile_mode(tile_mode),
+        1.0,
+    ));
+    with_state(|st| {
+        let id = st.alloc_handle();
+        st.shaders.insert(id, src);
+        id
+    })
 }
 
 #[no_mangle]
@@ -2122,20 +2154,26 @@ pub unsafe extern "C" fn shader_createSweepGradient(
     stops_ptr: *const f32,
     count: i32,
     tile_mode: i32,
-    _start_angle: f32,
-    _end_angle: f32,
+    start_angle: f32,
+    end_angle: f32,
     matrix33_ptr: *const f32,
 ) -> u32 {
-    shader_createRadialGradient(
-        center_x,
-        center_y,
-        128.0,
-        colors_ptr,
-        stops_ptr,
-        count,
-        tile_mode,
-        matrix33_ptr,
-    )
+    let local_mat = read_matrix33_ptr(matrix33_ptr);
+    let center = local_mat.transform_point(Point::new(center_x, center_y));
+    let stops = parse_gradient_stops(colors_ptr, stops_ptr, count);
+    let src = ColorSource::SweepGradient(SweepGradientParams::new(
+        center,
+        start_angle,
+        end_angle,
+        stops,
+        decode_tile_mode(tile_mode),
+        1.0,
+    ));
+    with_state(|st| {
+        let id = st.alloc_handle();
+        st.shaders.insert(id, src);
+        id
+    })
 }
 
 #[no_mangle]
@@ -3000,14 +3038,14 @@ pub unsafe extern "C" fn canvas_clipRRect(
     rrect_ptr: *const f32,
     _antialias: i32,
 ) {
-    let Some((rect, _radii)) = read_rrect_ptr(rrect_ptr) else {
+    let Some((rect, radii)) = read_rrect_ptr(rrect_ptr) else {
         return;
     };
     with_state(|st| {
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.canvas.clip_rect_with_op(rect, ClipOperation::Intersect);
+            c.canvas.clip_rrect(rect, radii, ClipOperation::Intersect);
             c.dl_builder
-                .clip_rect_with_op(rect, ClipOperation::Intersect);
+                .clip_rrect(rect, radii, ClipOperation::Intersect);
         }
     });
 }
@@ -3307,7 +3345,7 @@ pub unsafe extern "C" fn canvas_drawImageRect(
 pub unsafe extern "C" fn canvas_drawImageNine(
     canvas_handle: u32,
     image_handle: u32,
-    _center_irect_ptr: *const i32,
+    center_irect_ptr: *const i32,
     dst_rect_ptr: *const f32,
     paint_handle: u32,
     filter_quality: i32,
@@ -3315,15 +3353,20 @@ pub unsafe extern "C" fn canvas_drawImageNine(
     let Some(dst) = read_rect_ptr(dst_rect_ptr) else {
         return;
     };
+    if center_irect_ptr.is_null() {
+        return;
+    }
+    let ir = std::slice::from_raw_parts(center_irect_ptr, 4);
+    let center = Rect::from_ltrb(ir[0] as f32, ir[1] as f32, ir[2] as f32, ir[3] as f32);
     with_state(|st| {
         let Some(img) = st.images.get(&image_handle).cloned() else {
             return;
         };
-        let src = Rect::from_xywh(0.0, 0.0, img.width as f32, img.height as f32);
         let paint = st.paints.get(&paint_handle).cloned().unwrap_or_default();
         let linear = filter_quality != 0;
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.dl_builder.draw_image_rect(img, src, dst, paint, linear);
+            c.dl_builder
+                .draw_image_nine(img, center, dst, paint, linear);
         }
     });
 }
@@ -5485,6 +5528,152 @@ mod tests {
 
             path_dispose(svg_path);
             path_dispose(pill);
+        }
+    }
+
+    /// C++ source: impeller/renderer/wasm/skwasm_ffi_unittests.cc:PathCombineStencilClipSweepConicalAndImageNine
+    #[test]
+    fn test_phase12a_path_combine_stencil_clip_sweep_conical_and_image_nine() {
+        unsafe {
+            // 1. Boolean path_combine (op=0 Difference vs op=1 Intersect):
+            let p_a = path_create();
+            let rect_a = [0.0f32, 0.0, 100.0, 100.0];
+            path_addRect(p_a, rect_a.as_ptr());
+
+            let p_b = path_create();
+            let rect_b = [40.0f32, 40.0, 140.0, 140.0];
+            path_addRect(p_b, rect_b.as_ptr());
+
+            let p_diff = path_combine(0, p_a, p_b);
+            let p_inter = path_combine(1, p_a, p_b);
+
+            let mut diff_bounds = [0.0f32; 4];
+            let mut inter_bounds = [0.0f32; 4];
+            path_getBounds(p_diff, diff_bounds.as_mut_ptr());
+            path_getBounds(p_inter, inter_bounds.as_mut_ptr());
+
+            // Difference of [0..100] \ [40..140] keeps [0..100] outer L-shape;
+            // Intersect yields [40..100, 40..100].
+            assert!(
+                (diff_bounds[0] - 0.0).abs() <= 1e-3 && (diff_bounds[2] - 100.0).abs() <= 1e-3,
+                "Difference bounds must span [0..100]: {:?}",
+                diff_bounds
+            );
+            assert!(
+                (inter_bounds[0] - 40.0).abs() <= 1e-3
+                    && (inter_bounds[1] - 40.0).abs() <= 1e-3
+                    && (inter_bounds[2] - 100.0).abs() <= 1e-3
+                    && (inter_bounds[3] - 100.0).abs() <= 1e-3,
+                "Intersect bounds must be [40, 40, 100, 100]: {:?}",
+                inter_bounds
+            );
+            assert_eq!(path_contains(p_diff, 20.0, 20.0), 1);
+            assert_eq!(path_contains(p_diff, 60.0, 60.0), 0);
+            assert_eq!(path_contains(p_inter, 60.0, 60.0), 1);
+            assert_eq!(path_contains(p_inter, 20.0, 20.0), 0);
+
+            // 2. Stencil clipRRect + SweepGradient + ConicalGradient + drawImageNine:
+            let rec = pictureRecorder_create();
+            let cull = [0.0f32, 0.0, 200.0, 200.0];
+            let canvas = pictureRecorder_beginRecording(rec, cull.as_ptr());
+
+            canvas_save(canvas);
+            let rounded_rrect = [
+                10.0f32, 10.0, 190.0, 190.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+            ];
+            canvas_clipRRect(canvas, rounded_rrect.as_ptr(), 1);
+
+            let colors = [0xFFFF0000u32, 0xFF0000FFu32];
+            let stops = [0.0f32, 1.0f32];
+            let sweep_sh = shader_createSweepGradient(
+                100.0,
+                100.0,
+                colors.as_ptr(),
+                stops.as_ptr(),
+                2,
+                0,
+                0.0,
+                360.0,
+                std::ptr::null(),
+            );
+            let sweep_paint = paint_create(1, 3, 0xFFFFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            paint_setShader(sweep_paint, sweep_sh);
+            let draw_r = [20.0f32, 20.0, 80.0, 80.0];
+            canvas_drawRect(canvas, draw_r.as_ptr(), sweep_paint);
+
+            let conical_pts = [80.0f32, 80.0, 120.0, 120.0];
+            let conical_sh = shader_createConicalGradient(
+                conical_pts.as_ptr(),
+                4.0,
+                40.0,
+                colors.as_ptr(),
+                stops.as_ptr(),
+                2,
+                0,
+                std::ptr::null(),
+            );
+            let conical_paint = paint_create(1, 3, 0xFFFFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            paint_setShader(conical_paint, conical_sh);
+            canvas_drawRect(canvas, draw_r.as_ptr(), conical_paint);
+
+            let img_bytes = 30 * 30 * 4;
+            let data = skData_create(img_bytes);
+            std::slice::from_raw_parts_mut(skData_getPointer(data), img_bytes).fill(255);
+            let img = image_createFromPixels(data, 30, 30, 0, 30 * 4);
+            let center_ir = [10i32, 10, 20, 20];
+            let dst_nine = [20.0f32, 90.0, 120.0, 170.0];
+            let img_paint = paint_create(1, 3, 0xFFFFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            canvas_drawImageNine(
+                canvas,
+                img,
+                center_ir.as_ptr(),
+                dst_nine.as_ptr(),
+                img_paint,
+                1,
+            );
+            canvas_restore(canvas);
+
+            let pic = pictureRecorder_endRecording(rec);
+            let (push_clips, pop_clips, sweeps, conicals, tex_fills) = with_state(|st| {
+                let dl = &st.pictures.get(&pic).unwrap().display_list;
+                let mut target = Canvas::new(200, 200, Color::TRANSPARENT);
+                target.draw_display_list(dl);
+                let mut push_c = 0;
+                let mut pop_c = 0;
+                let mut sw = 0;
+                let mut cn = 0;
+                let mut tf = 0;
+                for cmd in target.commands() {
+                    match cmd {
+                        impeller_wgpu::DrawCommand::PushClip { .. } => push_c += 1,
+                        impeller_wgpu::DrawCommand::PopClip { .. } => pop_c += 1,
+                        impeller_wgpu::DrawCommand::SweepGradientFill { .. } => sw += 1,
+                        impeller_wgpu::DrawCommand::ConicalGradientFill { .. } => cn += 1,
+                        impeller_wgpu::DrawCommand::TextureFill(_) => tf += 1,
+                        _ => {}
+                    }
+                }
+                (push_c, pop_c, sw, cn, tf)
+            });
+            assert_eq!(push_clips, 1);
+            assert_eq!(pop_clips, 1);
+            assert_eq!(sweeps, 1);
+            assert_eq!(conicals, 1);
+            assert_eq!(tex_fills, 9);
+
+            image_dispose(img);
+            skData_dispose(data);
+            paint_dispose(img_paint);
+            paint_dispose(conical_paint);
+            paint_dispose(sweep_paint);
+            shader_dispose(conical_sh);
+            shader_dispose(sweep_sh);
+            picture_dispose(pic);
+            pictureRecorder_dispose(rec);
+            path_dispose(p_inter);
+            path_dispose(p_diff);
+            path_dispose(p_b);
+            path_dispose(p_a);
         }
     }
 }

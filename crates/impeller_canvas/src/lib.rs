@@ -17,9 +17,10 @@ pub use impeller_typographer::{
     TextDirection, TextFrame, TextShadow, TextStyle, TypographerContext,
 };
 pub use impeller_wgpu::{
-    compare_golden_rgba, save_rgba_png, DrawCommand, GlyphAtlasBatch, GoldenDiffMetrics,
-    GradientStop, ImageTexture, LinearGradientParams, RRectBlurParams, RadialGradientParams,
-    TextureFillBatch, UvVertex, WgpuRenderer, DEFAULT_TEXT_CONTRAST,
+    compare_golden_rgba, save_rgba_png, ConicalGradientParams, DrawCommand, GlyphAtlasBatch,
+    GoldenDiffMetrics, GradientStop, ImageTexture, LinearGradientParams, RRectBlurParams,
+    RadialGradientParams, SweepGradientParams, TextureFillBatch, UvVertex, WgpuRenderer,
+    DEFAULT_TEXT_CONTRAST,
 };
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -144,6 +145,8 @@ pub enum PaintShader {
     Solid(Color),
     LinearGradient(LinearGradientParams),
     RadialGradient(RadialGradientParams),
+    SweepGradient(SweepGradientParams),
+    ConicalGradient(ConicalGradientParams),
     Image {
         texture: ImageTexture,
         tile_mode_x: TileMode,
@@ -340,6 +343,8 @@ impl Paint {
             Some(
                 ColorSource::LinearGradient(_)
                     | ColorSource::RadialGradient(_)
+                    | ColorSource::SweepGradient(_)
+                    | ColorSource::ConicalGradient(_)
                     | ColorSource::Image { .. }
             )
         ) {
@@ -410,6 +415,7 @@ pub enum DisplayListOp {
     Transform(Matrix),
     ResetTransform,
     ClipRect(Rect, ClipOperation),
+    ClipRRect(Rect, RoundingRadii, ClipOperation),
     ClipPath(Path, ClipOperation),
     DrawPaint(Paint),
     DrawColor(Color, BlendMode),
@@ -439,6 +445,13 @@ pub enum DisplayListOp {
     DrawPolymorphicCard(usize, Scalar, Rect),
     DrawImage(ImageTexture, Point, Paint, bool),
     DrawImageRect(ImageTexture, Rect, Rect, Paint, bool),
+    DrawImageNine {
+        image: ImageTexture,
+        center: Rect,
+        dst: Rect,
+        paint: Paint,
+        linear_filter: bool,
+    },
     DrawAtlas {
         atlas: ImageTexture,
         rst_transforms: Vec<[Scalar; 4]>,
@@ -518,6 +531,7 @@ impl DisplayList {
                 DisplayListOp::Transform(m) => canvas.transform(*m),
                 DisplayListOp::ResetTransform => canvas.reset_transform(),
                 DisplayListOp::ClipRect(rect, op) => canvas.clip_rect_with_op(*rect, *op),
+                DisplayListOp::ClipRRect(rect, radii, op) => canvas.clip_rrect(*rect, *radii, *op),
                 DisplayListOp::ClipPath(path, op) => canvas.clip_path(path, *op),
                 DisplayListOp::DrawPaint(paint) => canvas.draw_paint(paint),
                 DisplayListOp::DrawColor(color, mode) => canvas.draw_color(*color, *mode),
@@ -591,6 +605,13 @@ impl DisplayList {
                 DisplayListOp::DrawImageRect(image, src, dst, paint, linear) => {
                     canvas.draw_image_rect(image, *src, *dst, paint, *linear)
                 }
+                DisplayListOp::DrawImageNine {
+                    image,
+                    center,
+                    dst,
+                    paint,
+                    linear_filter,
+                } => canvas.draw_image_nine(image, *center, *dst, paint, *linear_filter),
                 DisplayListOp::DrawAtlas {
                     atlas,
                     rst_transforms,
@@ -706,6 +727,11 @@ impl DisplayListBuilder {
 
     pub fn clip_rect_with_op(&mut self, rect: Rect, op: ClipOperation) -> &mut Self {
         self.ops.push(DisplayListOp::ClipRect(rect, op));
+        self
+    }
+
+    pub fn clip_rrect(&mut self, rect: Rect, radii: RoundingRadii, op: ClipOperation) -> &mut Self {
+        self.ops.push(DisplayListOp::ClipRRect(rect, radii, op));
         self
     }
 
@@ -940,6 +966,24 @@ impl DisplayListBuilder {
             paint,
             linear_filter,
         ));
+        self
+    }
+
+    pub fn draw_image_nine(
+        &mut self,
+        image: ImageTexture,
+        center: Rect,
+        dst: Rect,
+        paint: Paint,
+        linear_filter: bool,
+    ) -> &mut Self {
+        self.ops.push(DisplayListOp::DrawImageNine {
+            image,
+            center,
+            dst,
+            paint,
+            linear_filter,
+        });
         self
     }
 
@@ -1319,6 +1363,8 @@ fn paint_uses_local_coords_for_shader(paint: &Paint) -> bool {
         Some(
             ColorSource::LinearGradient(_)
                 | ColorSource::RadialGradient(_)
+                | ColorSource::SweepGradient(_)
+                | ColorSource::ConicalGradient(_)
                 | ColorSource::Image { .. }
         )
     )
@@ -1594,6 +1640,7 @@ struct CanvasState {
     has_explicit_clip: bool,
     layer_start_cmd_index: Option<usize>,
     layer_paint: Option<Paint>,
+    stencil_clips: Vec<Option<Rect>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1642,6 +1689,7 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                stencil_clips: Vec::new(),
             }],
             commands: Vec::new(),
             typographer: None,
@@ -1685,6 +1733,7 @@ impl Canvas {
             root.has_explicit_clip = false;
             root.layer_start_cmd_index = None;
             root.layer_paint = None;
+            root.stencil_clips.clear();
         } else {
             let initial_clip = intersect_rects(canvas_bounds, canvas_bounds)
                 .into_iter()
@@ -1695,6 +1744,7 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                stencil_clips: Vec::new(),
             });
         }
     }
@@ -2127,6 +2177,7 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                stencil_clips: Vec::new(),
             });
         }
     }
@@ -2140,6 +2191,7 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: Some(start_idx),
                 layer_paint: paint.cloned(),
+                stencil_clips: Vec::new(),
             });
         }
         if let Some(b) = bounds {
@@ -2203,6 +2255,36 @@ impl Canvas {
                                     *blend_mode = bm;
                                 }
                             }
+                            DrawCommand::SweepGradientFill {
+                                gradient,
+                                blend_mode,
+                                ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    for stop in &mut gradient.stops {
+                                        stop.color = cf.apply(stop.color);
+                                    }
+                                }
+                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
+                            DrawCommand::ConicalGradientFill {
+                                gradient,
+                                blend_mode,
+                                ..
+                            } => {
+                                if let Some(cf) = layer_cf {
+                                    for stop in &mut gradient.stops {
+                                        stop.color = cf.apply(stop.color);
+                                    }
+                                }
+                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                if let Some(bm) = override_blend {
+                                    *blend_mode = bm;
+                                }
+                            }
                             DrawCommand::RRectBlur {
                                 params, blend_mode, ..
                             } => {
@@ -2232,8 +2314,13 @@ impl Canvas {
                                     batch.blend_mode = bm;
                                 }
                             }
+                            DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => {}
                         }
                     }
+                }
+
+                for sc in popped.stencil_clips.into_iter().rev() {
+                    self.commands.push(DrawCommand::PopClip { clip_rect: sc });
                 }
             }
             true
@@ -2293,6 +2380,15 @@ impl Canvas {
         self.transform(make_skew_matrix(sx, sy));
     }
 
+    fn current_scissor_rect(&self) -> Option<Rect> {
+        let top = self.stack.last()?;
+        if !top.has_explicit_clip {
+            None
+        } else {
+            self.get_local_coverage_limit()
+        }
+    }
+
     pub fn clip_rect(&mut self, rect: Rect) {
         self.clip_rect_with_op(rect, ClipOperation::Intersect);
     }
@@ -2303,10 +2399,76 @@ impl Canvas {
         self.apply_device_clip_rect(transformed, op);
     }
 
-    pub fn clip_path(&mut self, path: &Path, op: ClipOperation) {
+    pub fn clip_rrect(&mut self, rect: Rect, radii: RoundingRadii, op: ClipOperation) {
+        if radii.are_all_corners_zero() || rect.is_empty() {
+            self.clip_rect_with_op(rect, op);
+            return;
+        }
+        if self.stack.last().is_none_or(|s| s.clip_rects.is_empty()) {
+            return;
+        }
+        let pre_clip_scissor = self.current_scissor_rect();
         let tx = self.get_current_transform();
-        let transformed = path.get_transformed_bounding_box(&tx).unwrap_or(Rect::ZERO);
-        self.apply_device_clip_rect(transformed, op);
+        let scale = tx.get_max_basis_length_xy().max(1.0);
+        if op == ClipOperation::Intersect {
+            let transformed = transform_rect(&tx, rect);
+            self.apply_device_clip_rect(transformed, ClipOperation::Intersect);
+            if self.stack.last().is_none_or(|s| s.clip_rects.is_empty()) {
+                return;
+            }
+        }
+        let mesh = RoundRectGeometry::new(rect, radii).get_mesh(scale);
+        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+            self.commands.push(DrawCommand::PushClip {
+                mesh,
+                transform: tx,
+                is_difference: op == ClipOperation::Difference,
+                clip_rect: pre_clip_scissor,
+            });
+            if let Some(top) = self.stack.last_mut() {
+                top.stencil_clips.push(pre_clip_scissor);
+            }
+        }
+    }
+
+    pub fn clip_path(&mut self, path: &Path, op: ClipOperation) {
+        let Some(raw_bbox) = path.get_bounding_box() else {
+            if op == ClipOperation::Intersect {
+                self.apply_device_clip_rect(Rect::ZERO, ClipOperation::Intersect);
+            }
+            return;
+        };
+        if raw_bbox.is_empty() {
+            if op == ClipOperation::Intersect {
+                self.apply_device_clip_rect(Rect::ZERO, ClipOperation::Intersect);
+            }
+            return;
+        }
+        if self.stack.last().is_none_or(|s| s.clip_rects.is_empty()) {
+            return;
+        }
+        let pre_clip_scissor = self.current_scissor_rect();
+        let tx = self.get_current_transform();
+        let scale = tx.get_max_basis_length_xy().max(1.0);
+        if op == ClipOperation::Intersect {
+            let transformed = path.get_transformed_bounding_box(&tx).unwrap_or(Rect::ZERO);
+            self.apply_device_clip_rect(transformed, ClipOperation::Intersect);
+            if self.stack.last().is_none_or(|s| s.clip_rects.is_empty()) {
+                return;
+            }
+        }
+        let (mesh, _) = cached_path_fill_mesh(path, scale);
+        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+            self.commands.push(DrawCommand::PushClip {
+                mesh,
+                transform: tx,
+                is_difference: op == ClipOperation::Difference,
+                clip_rect: pre_clip_scissor,
+            });
+            if let Some(top) = self.stack.last_mut() {
+                top.stencil_clips.push(pre_clip_scissor);
+            }
+        }
     }
 
     fn apply_device_clip_rect(&mut self, device_rect: Rect, op: ClipOperation) {
@@ -2402,6 +2564,40 @@ impl Canvas {
                     normalized.stops = Paint::convert_stops(&grad.stops);
                     normalized.alpha = (normalized.alpha * cov).clamp(0.0, 1.0);
                     self.commands.push(DrawCommand::RadialGradientFill {
+                        mesh: cur_mesh,
+                        transform,
+                        gradient: normalized,
+                        blend_mode: paint.blend_mode,
+                        clip_rect,
+                    });
+                }
+                Some(ColorSource::SweepGradient(grad)) => {
+                    let mut normalized = grad.clone();
+                    normalized.stops = Paint::convert_stops(&grad.stops);
+                    if let Some(cf) = &paint.color_filter {
+                        for stop in &mut normalized.stops {
+                            stop.color = cf.apply(stop.color);
+                        }
+                    }
+                    normalized.alpha = (normalized.alpha * paint.color.alpha * cov).clamp(0.0, 1.0);
+                    self.commands.push(DrawCommand::SweepGradientFill {
+                        mesh: cur_mesh,
+                        transform,
+                        gradient: normalized,
+                        blend_mode: paint.blend_mode,
+                        clip_rect,
+                    });
+                }
+                Some(ColorSource::ConicalGradient(grad)) => {
+                    let mut normalized = grad.clone();
+                    normalized.stops = Paint::convert_stops(&grad.stops);
+                    if let Some(cf) = &paint.color_filter {
+                        for stop in &mut normalized.stops {
+                            stop.color = cf.apply(stop.color);
+                        }
+                    }
+                    normalized.alpha = (normalized.alpha * paint.color.alpha * cov).clamp(0.0, 1.0);
+                    self.commands.push(DrawCommand::ConicalGradientFill {
                         mesh: cur_mesh,
                         transform,
                         gradient: normalized,
@@ -3471,6 +3667,76 @@ impl Canvas {
                     paint.blend_mode,
                     clip_rect,
                 )));
+        }
+    }
+
+    pub fn draw_image_nine(
+        &mut self,
+        image: &ImageTexture,
+        center: Rect,
+        dst: Rect,
+        paint: &Paint,
+        linear_filter: bool,
+    ) {
+        if dst.is_empty() || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let img_w = image.width as Scalar;
+        let img_h = image.height as Scalar;
+        let c_left = center.get_left().clamp(0.0, img_w);
+        let c_top = center.get_top().clamp(0.0, img_h);
+        let c_right = center.get_right().clamp(c_left, img_w);
+        let c_bottom = center.get_bottom().clamp(c_top, img_h);
+
+        let left_w = c_left;
+        let right_w = img_w - c_right;
+        let top_h = c_top;
+        let bottom_h = img_h - c_bottom;
+
+        let dst_w = dst.get_width();
+        let dst_h = dst.get_height();
+        let fixed_w = left_w + right_w;
+        let (d_left_w, d_right_w) = if fixed_w > dst_w && fixed_w > 0.0 {
+            let scale_x = dst_w / fixed_w;
+            (left_w * scale_x, right_w * scale_x)
+        } else {
+            (left_w, right_w)
+        };
+        let fixed_h = top_h + bottom_h;
+        let (d_top_h, d_bottom_h) = if fixed_h > dst_h && fixed_h > 0.0 {
+            let scale_y = dst_h / fixed_h;
+            (top_h * scale_y, bottom_h * scale_y)
+        } else {
+            (top_h, bottom_h)
+        };
+
+        let sx = [0.0, c_left, c_right, img_w];
+        let sy = [0.0, c_top, c_bottom, img_h];
+        let dx = [
+            dst.get_left(),
+            dst.get_left() + d_left_w,
+            dst.get_right() - d_right_w,
+            dst.get_right(),
+        ];
+        let dy = [
+            dst.get_top(),
+            dst.get_top() + d_top_h,
+            dst.get_bottom() - d_bottom_h,
+            dst.get_bottom(),
+        ];
+
+        for row in 0..3 {
+            for col in 0..3 {
+                let src_patch = Rect::from_ltrb(sx[col], sy[row], sx[col + 1], sy[row + 1]);
+                let dst_patch = Rect::from_ltrb(dx[col], dy[row], dx[col + 1], dy[row + 1]);
+                if src_patch.get_width() > 0.0
+                    && src_patch.get_height() > 0.0
+                    && dst_patch.get_width() > 0.0
+                    && dst_patch.get_height() > 0.0
+                {
+                    self.draw_image_rect(image, src_patch, dst_patch, paint, linear_filter);
+                }
+            }
         }
     }
 
@@ -7360,5 +7626,117 @@ mod tests {
         assert_eq!(stats.path_pslg_count, 1);
         assert_eq!(stats.path_stroke_count, 1);
         assert_eq!(stats.culled_count, 2);
+    }
+
+    /// C++ source: aiks_unittests.cc:StencilClippingSweepConicalAndNineSliceImage
+    #[test]
+    fn test_phase12a_stencil_clipping_sweep_conical_and_draw_image_nine() {
+        let mut canvas = Canvas::new(200, 200, Color::BLACK);
+
+        // 1. Zero-radius clip_rrect must use scissor fast-path (0 stencil commands):
+        canvas.save();
+        canvas.clip_rrect(
+            Rect::from_xywh(10.0, 10.0, 180.0, 180.0),
+            RoundingRadii::ZERO,
+            ClipOperation::Intersect,
+        );
+        assert!(
+            canvas.commands().is_empty(),
+            "zero-radius clip_rrect must emit 0 stencil commands"
+        );
+        canvas.restore();
+        assert!(canvas.commands().is_empty());
+
+        // 2. Rounded clip_rrect + clip_path must emit PushClip and LIFO PopClip on restore:
+        canvas.save();
+        canvas.clip_rrect(
+            Rect::from_xywh(20.0, 20.0, 140.0, 140.0),
+            RoundingRadii::from_single_radius(16.0),
+            ClipOperation::Intersect,
+        );
+        let mut pb = PathBuilder::new();
+        pb.move_to(Point::new(30.0, 30.0));
+        pb.line_to(Point::new(150.0, 30.0));
+        pb.line_to(Point::new(90.0, 150.0));
+        pb.close();
+        canvas.clip_path(&pb.build(FillType::NonZero), ClipOperation::Difference);
+
+        let sweep = SweepGradientParams::two_stop(
+            Point::new(90.0, 90.0),
+            0.0,
+            360.0,
+            Color::RED,
+            Color::BLUE,
+            TileMode::Clamp,
+        );
+        canvas.draw_rect(
+            Rect::from_xywh(20.0, 20.0, 140.0, 140.0),
+            &Paint::fill(Color::WHITE).with_color_source(ColorSource::SweepGradient(sweep)),
+        );
+        let conical = ConicalGradientParams::two_stop(
+            Point::new(60.0, 60.0),
+            4.0,
+            Point::new(110.0, 110.0),
+            40.0,
+            Color::GREEN,
+            Color::WHITE,
+            TileMode::Clamp,
+        );
+        canvas.draw_rect(
+            Rect::from_xywh(40.0, 40.0, 80.0, 80.0),
+            &Paint::fill(Color::WHITE).with_color_source(ColorSource::ConicalGradient(conical)),
+        );
+        canvas.restore();
+
+        let cmds = canvas.commands();
+        assert_eq!(cmds.len(), 6);
+        assert!(matches!(
+            cmds[0],
+            DrawCommand::PushClip {
+                is_difference: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cmds[1],
+            DrawCommand::PushClip {
+                is_difference: true,
+                ..
+            }
+        ));
+        assert!(matches!(cmds[2], DrawCommand::SweepGradientFill { .. }));
+        assert!(matches!(cmds[3], DrawCommand::ConicalGradientFill { .. }));
+        assert!(matches!(cmds[4], DrawCommand::PopClip { .. }));
+        assert!(matches!(cmds[5], DrawCommand::PopClip { .. }));
+
+        // 3. 9-slice draw_image_nine splits 30x30 image with [10,10,20,20] center into 9 quads:
+        canvas.reset(200, 200, Color::BLACK);
+        let img = ImageTexture::new(1, 30, 30, vec![255u8; 30 * 30 * 4]);
+        canvas.draw_image_nine(
+            &img,
+            Rect::from_ltrb(10.0, 10.0, 20.0, 20.0),
+            Rect::from_xywh(10.0, 20.0, 100.0, 80.0),
+            &Paint::fill(Color::WHITE),
+            true,
+        );
+        assert_eq!(canvas.commands().len(), 9);
+        // Top-left corner (index 0) must remain unscaled 10x10 at (10, 20):
+        if let DrawCommand::TextureFill(batch) = &canvas.commands()[0] {
+            assert_relative_eq!(batch.vertices[0].position[0], 10.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[0].position[1], 20.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[2].position[0], 20.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[2].position[1], 30.0, epsilon = 1e-4);
+        } else {
+            panic!("expected TextureFill for 9-slice corner");
+        }
+        // Center patch (index 4) must stretch to [20..100, 30..90] (80x60):
+        if let DrawCommand::TextureFill(batch) = &canvas.commands()[4] {
+            assert_relative_eq!(batch.vertices[0].position[0], 20.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[0].position[1], 30.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[2].position[0], 100.0, epsilon = 1e-4);
+            assert_relative_eq!(batch.vertices[2].position[1], 90.0, epsilon = 1e-4);
+        } else {
+            panic!("expected TextureFill for 9-slice center");
+        }
     }
 }
