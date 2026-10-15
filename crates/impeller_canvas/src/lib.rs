@@ -18,9 +18,9 @@ pub use impeller_typographer::{
 };
 pub use impeller_wgpu::{
     compare_golden_rgba, save_rgba_png, ConicalGradientParams, DrawCommand, GlyphAtlasBatch,
-    GoldenDiffMetrics, GradientStop, ImageTexture, LinearGradientParams, RRectBlurParams,
-    RadialGradientParams, SweepGradientParams, TextureFillBatch, UvVertex, WgpuRenderer,
-    DEFAULT_TEXT_CONTRAST,
+    GoldenDiffMetrics, GradientStop, ImageTexture, LayerColorFilter, LayerImageFilter,
+    LinearGradientParams, RRectBlurParams, RadialGradientParams, SweepGradientParams,
+    TextureFillBatch, UvVertex, WgpuRenderer, DEFAULT_TEXT_CONTRAST,
 };
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -76,6 +76,19 @@ impl ColorFilter {
             Self::Compose(outer, inner) => outer.apply(inner.apply(color)),
         }
     }
+
+    pub fn to_layer_color_filter(&self) -> LayerColorFilter {
+        match self {
+            Self::Mode(color, blend_mode) => LayerColorFilter::Mode(*color, *blend_mode),
+            Self::Matrix(m) => LayerColorFilter::Matrix(*m),
+            Self::SrgbToLinear => LayerColorFilter::SrgbToLinear,
+            Self::LinearToSrgb => LayerColorFilter::LinearToSrgb,
+            Self::Compose(outer, inner) => LayerColorFilter::Compose(
+                Box::new(outer.to_layer_color_filter()),
+                Box::new(inner.to_layer_color_filter()),
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +112,34 @@ pub enum ImageFilter {
 }
 
 impl ImageFilter {
+    pub fn to_layer_image_filter(&self) -> LayerImageFilter {
+        match self {
+            Self::Blur {
+                sigma_x,
+                sigma_y,
+                tile_mode,
+            } => LayerImageFilter::Blur {
+                sigma_x: *sigma_x,
+                sigma_y: *sigma_y,
+                tile_mode: *tile_mode,
+            },
+            Self::Dilate { radius_x, radius_y } => LayerImageFilter::Dilate {
+                radius_x: *radius_x,
+                radius_y: *radius_y,
+            },
+            Self::Erode { radius_x, radius_y } => LayerImageFilter::Erode {
+                radius_x: *radius_x,
+                radius_y: *radius_y,
+            },
+            Self::Matrix(m) => LayerImageFilter::Matrix(*m),
+            Self::ColorFilter(cf) => LayerImageFilter::ColorFilter(cf.to_layer_color_filter()),
+            Self::Compose(outer, inner) => LayerImageFilter::Compose(
+                Box::new(outer.to_layer_image_filter()),
+                Box::new(inner.to_layer_image_filter()),
+            ),
+        }
+    }
+
     pub fn filter_bounds(&self, bounds: Rect) -> Rect {
         match self {
             Self::Blur {
@@ -335,7 +376,7 @@ impl Paint {
     }
 
     pub fn is_shadow_blur_draw_operation(&self) -> bool {
-        if self.style != DrawStyle::Fill {
+        if self.style != DrawStyle::Fill || self.image_filter.is_some() {
             return false;
         }
         if matches!(
@@ -1292,6 +1333,189 @@ fn expand_rect(rect: Rect, pad: Scalar) -> Rect {
     )
 }
 
+#[inline]
+fn union_two_rects(a: Rect, b: Rect) -> Rect {
+    if a.is_empty() {
+        return b;
+    }
+    if b.is_empty() {
+        return a;
+    }
+    Rect::from_ltrb(
+        a.get_left().min(b.get_left()),
+        a.get_top().min(b.get_top()),
+        a.get_right().max(b.get_right()),
+        a.get_bottom().max(b.get_bottom()),
+    )
+}
+
+fn mesh_device_bounds(mesh: &TessellatedMesh, transform: &Matrix) -> Option<Rect> {
+    let first = mesh.vertices.first()?;
+    let p0 = transform.transform_point(Point::new(first.position[0], first.position[1]));
+    let mut min_x = p0.x;
+    let mut min_y = p0.y;
+    let mut max_x = p0.x;
+    let mut max_y = p0.y;
+    for v in &mesh.vertices[1..] {
+        let pt = transform.transform_point(Point::new(v.position[0], v.position[1]));
+        min_x = min_x.min(pt.x);
+        min_y = min_y.min(pt.y);
+        max_x = max_x.max(pt.x);
+        max_y = max_y.max(pt.y);
+    }
+    let rect = Rect::from_ltrb(min_x, min_y, max_x, max_y);
+    if rect.is_empty() {
+        None
+    } else {
+        Some(rect)
+    }
+}
+
+fn uv_vertices_device_bounds(vertices: &[UvVertex], transform: &Matrix) -> Option<Rect> {
+    let first = vertices.first()?;
+    let p0 = transform.transform_point(Point::new(first.position[0], first.position[1]));
+    let mut min_x = p0.x;
+    let mut min_y = p0.y;
+    let mut max_x = p0.x;
+    let mut max_y = p0.y;
+    for v in &vertices[1..] {
+        let pt = transform.transform_point(Point::new(v.position[0], v.position[1]));
+        min_x = min_x.min(pt.x);
+        min_y = min_y.min(pt.y);
+        max_x = max_x.max(pt.x);
+        max_y = max_y.max(pt.y);
+    }
+    let rect = Rect::from_ltrb(min_x, min_y, max_x, max_y);
+    if rect.is_empty() {
+        None
+    } else {
+        Some(rect)
+    }
+}
+
+fn command_device_bounds(cmd: &DrawCommand) -> Option<Rect> {
+    let (raw, clip_rect) = match cmd {
+        DrawCommand::SolidFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        }
+        | DrawCommand::LinearGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        }
+        | DrawCommand::RadialGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        }
+        | DrawCommand::SweepGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        }
+        | DrawCommand::ConicalGradientFill {
+            mesh,
+            transform,
+            clip_rect,
+            ..
+        } => (mesh_device_bounds(mesh, transform)?, *clip_rect),
+        DrawCommand::RRectBlur {
+            transform,
+            params,
+            clip_rect,
+            ..
+        } => (
+            transform_rect(transform, params.coverage_rect()),
+            *clip_rect,
+        ),
+        DrawCommand::GlyphAtlas(batch) => {
+            let mut acc: Option<Rect> = None;
+            for q in &batch.quads {
+                let r = transform_rect(&batch.transform, q.dest_rect);
+                if !r.is_empty() {
+                    acc = Some(match acc {
+                        Some(prev) => union_two_rects(prev, r),
+                        None => r,
+                    });
+                }
+            }
+            (acc?, batch.clip_rect)
+        }
+        DrawCommand::TextureFill(batch) => (
+            uv_vertices_device_bounds(&batch.vertices, &batch.transform)?,
+            batch.clip_rect,
+        ),
+        DrawCommand::SaveLayer {
+            bounds,
+            image_filter,
+            clip_rect,
+            ..
+        } => {
+            let (hx, hy) = image_filter
+                .as_ref()
+                .map(|f| f.halo_padding())
+                .unwrap_or((0.0, 0.0));
+            let expanded = Rect::from_ltrb(
+                bounds.get_left() - hx,
+                bounds.get_top() - hy,
+                bounds.get_right() + hx,
+                bounds.get_bottom() + hy,
+            );
+            (expanded, *clip_rect)
+        }
+        DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => return None,
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    match clip_rect {
+        Some(cr) => intersect_rects(raw, cr),
+        None => Some(raw),
+    }
+}
+
+fn commands_device_bounds(commands: &[DrawCommand]) -> Option<Rect> {
+    let mut acc: Option<Rect> = None;
+    for cmd in commands {
+        if let Some(b) = command_device_bounds(cmd) {
+            acc = Some(match acc {
+                Some(prev) => union_two_rects(prev, b),
+                None => b,
+            });
+        }
+    }
+    acc
+}
+
+fn sync_glyph_atlases_in_slice(
+    commands: &mut [DrawCommand],
+    alpha_arc: &Arc<GlyphAtlas>,
+    color_arc: &Arc<GlyphAtlas>,
+) {
+    for cmd in commands {
+        match cmd {
+            DrawCommand::GlyphAtlas(batch) => {
+                if batch.alpha_atlas.is_none() && batch.quads.iter().any(|q| !q.is_color) {
+                    batch.alpha_atlas = Some(Arc::clone(alpha_arc));
+                }
+                if batch.color_atlas.is_none() && batch.quads.iter().any(|q| q.is_color) {
+                    batch.color_atlas = Some(Arc::clone(color_arc));
+                }
+            }
+            DrawCommand::SaveLayer { commands: sub, .. } => {
+                sync_glyph_atlases_in_slice(sub, alpha_arc, color_arc);
+            }
+            _ => {}
+        }
+    }
+}
+
 const MAX_GEOMETRY_MESH_CACHE_ENTRIES: usize = 512;
 const MAX_SEEN_PATH_IDS: usize = 1024;
 
@@ -1640,6 +1864,8 @@ struct CanvasState {
     has_explicit_clip: bool,
     layer_start_cmd_index: Option<usize>,
     layer_paint: Option<Paint>,
+    layer_bounds_device: Option<Rect>,
+    layer_clip_rect: Option<Rect>,
     stencil_clips: Vec<Option<Rect>>,
 }
 
@@ -1689,6 +1915,8 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_bounds_device: None,
+                layer_clip_rect: None,
                 stencil_clips: Vec::new(),
             }],
             commands: Vec::new(),
@@ -1733,6 +1961,8 @@ impl Canvas {
             root.has_explicit_clip = false;
             root.layer_start_cmd_index = None;
             root.layer_paint = None;
+            root.layer_bounds_device = None;
+            root.layer_clip_rect = None;
             root.stencil_clips.clear();
         } else {
             let initial_clip = intersect_rects(canvas_bounds, canvas_bounds)
@@ -1744,6 +1974,8 @@ impl Canvas {
                 has_explicit_clip: false,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_bounds_device: None,
+                layer_clip_rect: None,
                 stencil_clips: Vec::new(),
             });
         }
@@ -1800,16 +2032,7 @@ impl Canvas {
         alpha_arc: &Arc<GlyphAtlas>,
         color_arc: &Arc<GlyphAtlas>,
     ) {
-        for cmd in &mut self.commands {
-            if let DrawCommand::GlyphAtlas(batch) = cmd {
-                if batch.alpha_atlas.is_none() && batch.quads.iter().any(|q| !q.is_color) {
-                    batch.alpha_atlas = Some(Arc::clone(alpha_arc));
-                }
-                if batch.color_atlas.is_none() && batch.quads.iter().any(|q| q.is_color) {
-                    batch.color_atlas = Some(Arc::clone(color_arc));
-                }
-            }
-        }
+        sync_glyph_atlases_in_slice(&mut self.commands, alpha_arc, color_arc);
     }
 
     pub fn sync_glyph_atlases_with(&mut self, typographer: &TypographerContext) {
@@ -1841,6 +2064,15 @@ impl Canvas {
         local_bounds: Option<Rect>,
         transform: &Matrix,
     ) -> Vec<Option<Rect>> {
+        self.resolve_clip_targets_filtered(local_bounds, transform, None)
+    }
+
+    fn resolve_clip_targets_filtered(
+        &self,
+        local_bounds: Option<Rect>,
+        transform: &Matrix,
+        image_filter: Option<&ImageFilter>,
+    ) -> Vec<Option<Rect>> {
         let Some(top) = self.stack.last() else {
             return Vec::new();
         };
@@ -1863,8 +2095,12 @@ impl Canvas {
         if lb.is_empty() {
             return Vec::new();
         }
-        let dev_bounds = transform_rect(transform, lb);
-        if intersect_rects(dev_bounds, canvas_bounds).is_none() {
+        let raw_dev_bounds = transform_rect(transform, lb);
+        let dev_bounds = match image_filter {
+            Some(imf) => imf.filter_bounds(raw_dev_bounds),
+            None => raw_dev_bounds,
+        };
+        if dev_bounds.is_empty() || intersect_rects(dev_bounds, canvas_bounds).is_none() {
             return Vec::new();
         }
         if !top.has_explicit_clip {
@@ -2177,6 +2413,8 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: None,
                 layer_paint: None,
+                layer_bounds_device: None,
+                layer_clip_rect: None,
                 stencil_clips: Vec::new(),
             });
         }
@@ -2184,6 +2422,25 @@ impl Canvas {
 
     pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<&Paint>) {
         let start_idx = self.commands.len();
+        let tx = self.get_current_transform();
+        let layer_clip_rect = self.current_scissor_rect();
+        let layer_bounds_device = bounds.and_then(|b| {
+            if b.is_empty() {
+                None
+            } else {
+                let dev_b = transform_rect(&tx, b);
+                if dev_b.is_empty()
+                    || !dev_b.get_left().is_finite()
+                    || !dev_b.get_top().is_finite()
+                    || !dev_b.get_right().is_finite()
+                    || !dev_b.get_bottom().is_finite()
+                {
+                    None
+                } else {
+                    Some(dev_b)
+                }
+            }
+        });
         if let Some(top) = self.stack.last() {
             self.stack.push(CanvasState {
                 transform: top.transform,
@@ -2191,136 +2448,224 @@ impl Canvas {
                 has_explicit_clip: top.has_explicit_clip,
                 layer_start_cmd_index: Some(start_idx),
                 layer_paint: paint.cloned(),
+                layer_bounds_device,
+                layer_clip_rect,
                 stencil_clips: Vec::new(),
             });
         }
-        if let Some(b) = bounds {
-            if !b.is_empty() {
-                self.clip_rect(b);
-            }
+        if let Some(dev_b) = layer_bounds_device {
+            let (halo_x, halo_y) = paint
+                .and_then(|p| p.image_filter.as_ref())
+                .map(|f| f.to_layer_image_filter().halo_padding())
+                .unwrap_or((0.0, 0.0));
+            let child_clip = if halo_x > 0.0 || halo_y > 0.0 {
+                Rect::from_ltrb(
+                    dev_b.get_left() - halo_x,
+                    dev_b.get_top() - halo_y,
+                    dev_b.get_right() + halo_x,
+                    dev_b.get_bottom() + halo_y,
+                )
+            } else {
+                dev_b
+            };
+            self.apply_device_clip_rect(child_clip, ClipOperation::Intersect);
         }
     }
 
     pub fn restore(&mut self) -> bool {
         if self.stack.len() > 1 {
             if let Some(popped) = self.stack.pop() {
-                if let (Some(start_idx), Some(layer_paint)) =
-                    (popped.layer_start_cmd_index, popped.layer_paint)
-                {
-                    let layer_alpha = layer_paint.color.alpha.clamp(0.0, 1.0);
-                    let layer_cf = layer_paint.color_filter.as_ref();
-                    let override_blend = (layer_paint.blend_mode != BlendMode::SrcOver)
-                        .then_some(layer_paint.blend_mode);
-
-                    for cmd in self.commands.iter_mut().skip(start_idx) {
-                        match cmd {
-                            DrawCommand::SolidFill {
-                                color, blend_mode, ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    *color = cf.apply(*color);
-                                }
-                                color.alpha = (color.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::LinearGradientFill {
-                                gradient,
-                                blend_mode,
-                                ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    for stop in &mut gradient.stops {
-                                        stop.color = cf.apply(stop.color);
-                                    }
-                                }
-                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::RadialGradientFill {
-                                gradient,
-                                blend_mode,
-                                ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    for stop in &mut gradient.stops {
-                                        stop.color = cf.apply(stop.color);
-                                    }
-                                }
-                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::SweepGradientFill {
-                                gradient,
-                                blend_mode,
-                                ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    for stop in &mut gradient.stops {
-                                        stop.color = cf.apply(stop.color);
-                                    }
-                                }
-                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::ConicalGradientFill {
-                                gradient,
-                                blend_mode,
-                                ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    for stop in &mut gradient.stops {
-                                        stop.color = cf.apply(stop.color);
-                                    }
-                                }
-                                gradient.alpha = (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::RRectBlur {
-                                params, blend_mode, ..
-                            } => {
-                                if let Some(cf) = layer_cf {
-                                    params.color = cf.apply(params.color);
-                                }
-                                params.color.alpha =
-                                    (params.color.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    *blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::GlyphAtlas(batch) => {
-                                if let Some(cf) = layer_cf {
-                                    for q in &mut batch.quads {
-                                        q.color = cf.apply(q.color);
-                                    }
-                                }
-                                batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    batch.blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::TextureFill(batch) => {
-                                batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
-                                if let Some(bm) = override_blend {
-                                    batch.blend_mode = bm;
-                                }
-                            }
-                            DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => {}
-                        }
-                    }
-                }
-
                 for sc in popped.stencil_clips.into_iter().rev() {
                     self.commands.push(DrawCommand::PopClip { clip_rect: sc });
+                }
+
+                if let Some(start_idx) = popped.layer_start_cmd_index {
+                    let layer_paint = popped
+                        .layer_paint
+                        .unwrap_or_else(|| Paint::fill(Color::WHITE));
+                    let layer_alpha = layer_paint.color.alpha.clamp(0.0, 1.0);
+                    let layer_blend = layer_paint.blend_mode;
+                    let is_identity_layer = layer_paint.image_filter.is_none()
+                        && layer_paint.color_filter.is_none()
+                        && layer_blend == BlendMode::SrcOver
+                        && layer_alpha >= 1.0 - 1e-4;
+
+                    if !is_identity_layer {
+                        let mut visual_draw_count = 0usize;
+                        let mut has_child_save_layer = false;
+                        let mut has_texture_fill = false;
+                        for cmd in &self.commands[start_idx..] {
+                            match cmd {
+                                DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => {}
+                                DrawCommand::SaveLayer { .. } => {
+                                    visual_draw_count += 1;
+                                    has_child_save_layer = true;
+                                }
+                                DrawCommand::TextureFill(_) => {
+                                    visual_draw_count += 1;
+                                    has_texture_fill = true;
+                                }
+                                _ => {
+                                    visual_draw_count += 1;
+                                }
+                            }
+                        }
+
+                        let can_collapse = layer_paint.image_filter.is_none()
+                            && !has_child_save_layer
+                            && (visual_draw_count == 0
+                                || (visual_draw_count == 1
+                                    && (layer_paint.color_filter.is_none() || !has_texture_fill)));
+
+                        if can_collapse {
+                            let layer_cf = layer_paint.color_filter.as_ref();
+                            let override_blend =
+                                (layer_blend != BlendMode::SrcOver).then_some(layer_blend);
+
+                            for cmd in self.commands.iter_mut().skip(start_idx) {
+                                match cmd {
+                                    DrawCommand::SolidFill {
+                                        color, blend_mode, ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            *color = cf.apply(*color);
+                                        }
+                                        color.alpha = (color.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::LinearGradientFill {
+                                        gradient,
+                                        blend_mode,
+                                        ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            for stop in &mut gradient.stops {
+                                                stop.color = cf.apply(stop.color);
+                                            }
+                                        }
+                                        gradient.alpha =
+                                            (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::RadialGradientFill {
+                                        gradient,
+                                        blend_mode,
+                                        ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            for stop in &mut gradient.stops {
+                                                stop.color = cf.apply(stop.color);
+                                            }
+                                        }
+                                        gradient.alpha =
+                                            (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::SweepGradientFill {
+                                        gradient,
+                                        blend_mode,
+                                        ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            for stop in &mut gradient.stops {
+                                                stop.color = cf.apply(stop.color);
+                                            }
+                                        }
+                                        gradient.alpha =
+                                            (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::ConicalGradientFill {
+                                        gradient,
+                                        blend_mode,
+                                        ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            for stop in &mut gradient.stops {
+                                                stop.color = cf.apply(stop.color);
+                                            }
+                                        }
+                                        gradient.alpha =
+                                            (gradient.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::RRectBlur {
+                                        params, blend_mode, ..
+                                    } => {
+                                        if let Some(cf) = layer_cf {
+                                            params.color = cf.apply(params.color);
+                                        }
+                                        params.color.alpha =
+                                            (params.color.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            *blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::GlyphAtlas(batch) => {
+                                        if let Some(cf) = layer_cf {
+                                            for q in &mut batch.quads {
+                                                q.color = cf.apply(q.color);
+                                            }
+                                        }
+                                        batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            batch.blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::TextureFill(batch) => {
+                                        batch.alpha = (batch.alpha * layer_alpha).clamp(0.0, 1.0);
+                                        if let Some(bm) = override_blend {
+                                            batch.blend_mode = bm;
+                                        }
+                                    }
+                                    DrawCommand::PushClip { .. }
+                                    | DrawCommand::PopClip { .. }
+                                    | DrawCommand::SaveLayer { .. } => {}
+                                }
+                            }
+                        } else {
+                            let sub_commands: Vec<DrawCommand> =
+                                self.commands.drain(start_idx..).collect();
+                            let bounds = popped
+                                .layer_bounds_device
+                                .filter(|b| !b.is_empty())
+                                .or_else(|| commands_device_bounds(&sub_commands))
+                                .or(popped.layer_clip_rect)
+                                .unwrap_or_else(|| {
+                                    Rect::from_xywh(
+                                        0.0,
+                                        0.0,
+                                        self.width as Scalar,
+                                        self.height as Scalar,
+                                    )
+                                });
+                            self.commands.push(DrawCommand::SaveLayer {
+                                bounds,
+                                commands: sub_commands,
+                                alpha: layer_alpha,
+                                blend_mode: layer_blend,
+                                color_filter: layer_paint
+                                    .color_filter
+                                    .as_ref()
+                                    .map(ColorFilter::to_layer_color_filter),
+                                image_filter: layer_paint
+                                    .image_filter
+                                    .as_ref()
+                                    .map(ImageFilter::to_layer_image_filter),
+                                clip_rect: popped.layer_clip_rect,
+                            });
+                        }
+                    }
                 }
             }
             true
@@ -2538,6 +2883,195 @@ impl Canvas {
             return;
         }
 
+        let is_image_shader = matches!(
+            paint.effective_color_source(),
+            Some(ColorSource::Image { .. })
+        );
+        let needs_filter_layer =
+            paint.image_filter.is_some() || (is_image_shader && paint.color_filter.is_some());
+
+        if needs_filter_layer {
+            let Some(dev_bounds) = mesh_device_bounds(&mesh, &transform) else {
+                return;
+            };
+            let layer_cf = paint
+                .color_filter
+                .as_ref()
+                .map(ColorFilter::to_layer_color_filter);
+            let layer_if = paint
+                .image_filter
+                .as_ref()
+                .map(ImageFilter::to_layer_image_filter);
+
+            let mut mesh_opt = Some(mesh);
+            let last_idx = clip_targets.len() - 1;
+            for (i, &clip_rect) in clip_targets.iter().enumerate() {
+                let cur_mesh = if i == last_idx {
+                    mesh_opt.take().unwrap_or_default()
+                } else {
+                    mesh_opt.as_ref().cloned().unwrap_or_default()
+                };
+                let (inner_cmd, layer_alpha) = match paint.effective_color_source() {
+                    Some(ColorSource::LinearGradient(grad)) => {
+                        let mut normalized = grad.clone();
+                        normalized.stops = Paint::convert_stops(&grad.stops);
+                        normalized.alpha = (normalized.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::LinearGradientFill {
+                                mesh: cur_mesh,
+                                transform,
+                                gradient: normalized,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                    Some(ColorSource::RadialGradient(grad)) => {
+                        let mut normalized = grad.clone();
+                        normalized.stops = Paint::convert_stops(&grad.stops);
+                        normalized.alpha = (normalized.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::RadialGradientFill {
+                                mesh: cur_mesh,
+                                transform,
+                                gradient: normalized,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                    Some(ColorSource::SweepGradient(grad)) => {
+                        let mut normalized = grad.clone();
+                        normalized.stops = Paint::convert_stops(&grad.stops);
+                        normalized.alpha =
+                            (normalized.alpha * paint.color.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::SweepGradientFill {
+                                mesh: cur_mesh,
+                                transform,
+                                gradient: normalized,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                    Some(ColorSource::ConicalGradient(grad)) => {
+                        let mut normalized = grad.clone();
+                        normalized.stops = Paint::convert_stops(&grad.stops);
+                        normalized.alpha =
+                            (normalized.alpha * paint.color.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::ConicalGradientFill {
+                                mesh: cur_mesh,
+                                transform,
+                                gradient: normalized,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                    Some(ColorSource::Image {
+                        texture,
+                        tile_mode_x,
+                        tile_mode_y,
+                        matrix,
+                        linear_filter,
+                    }) => {
+                        let inv_w = 1.0 / (texture.width.max(1) as Scalar);
+                        let inv_h = 1.0 / (texture.height.max(1) as Scalar);
+                        let uv_mat = invert_matrix(matrix).unwrap_or(Matrix::IDENTITY);
+                        let vertices: Vec<UvVertex> = cur_mesh
+                            .vertices
+                            .iter()
+                            .map(|v| {
+                                let pt = uv_mat
+                                    .transform_point(Point::new(v.position[0], v.position[1]));
+                                UvVertex::new(
+                                    v.position[0],
+                                    v.position[1],
+                                    pt.x * inv_w,
+                                    pt.y * inv_h,
+                                )
+                            })
+                            .collect();
+                        (
+                            DrawCommand::TextureFill(TextureFillBatch {
+                                vertices,
+                                indices: cur_mesh.indices,
+                                transform,
+                                texture: texture.clone(),
+                                alpha: 1.0,
+                                tile_mode_x: *tile_mode_x,
+                                tile_mode_y: *tile_mode_y,
+                                linear_filter: *linear_filter,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            }),
+                            (paint.color.alpha * cov).clamp(0.0, 1.0),
+                        )
+                    }
+                    Some(ColorSource::Solid(c)) => {
+                        let mut color = *c;
+                        if paint.invert_colors {
+                            color = Color::new(
+                                (1.0 - color.red).clamp(0.0, 1.0),
+                                (1.0 - color.green).clamp(0.0, 1.0),
+                                (1.0 - color.blue).clamp(0.0, 1.0),
+                                color.alpha,
+                            );
+                        }
+                        color.alpha = (color.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::SolidFill {
+                                mesh: cur_mesh,
+                                transform,
+                                color,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                    None => {
+                        let mut color = paint.color;
+                        if paint.invert_colors {
+                            color = Color::new(
+                                (1.0 - color.red).clamp(0.0, 1.0),
+                                (1.0 - color.green).clamp(0.0, 1.0),
+                                (1.0 - color.blue).clamp(0.0, 1.0),
+                                color.alpha,
+                            );
+                        }
+                        color.alpha = (color.alpha * cov).clamp(0.0, 1.0);
+                        (
+                            DrawCommand::SolidFill {
+                                mesh: cur_mesh,
+                                transform,
+                                color,
+                                blend_mode: BlendMode::SrcOver,
+                                clip_rect: None,
+                            },
+                            1.0,
+                        )
+                    }
+                };
+                self.commands.push(DrawCommand::SaveLayer {
+                    bounds: dev_bounds,
+                    commands: vec![inner_cmd],
+                    alpha: layer_alpha,
+                    blend_mode: paint.blend_mode,
+                    color_filter: layer_cf.clone(),
+                    image_filter: layer_if.clone(),
+                    clip_rect,
+                });
+            }
+            return;
+        }
+
         let mut mesh_opt = Some(mesh);
         let last_idx = clip_targets.len() - 1;
         for (i, &clip_rect) in clip_targets.iter().enumerate() {
@@ -2705,9 +3239,11 @@ impl Canvas {
         };
         let transform = self.get_current_transform();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
+        let imf = paint.image_filter.as_ref();
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets = self.resolve_clip_targets(Some(raw_bbox), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(raw_bbox), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2741,7 +3277,8 @@ impl Canvas {
                 };
                 let pad = eff_w * 0.5 * miter_mult.max(cap_mult);
                 let local_bounds = expand_rect(raw_bbox, pad);
-                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(local_bounds), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2775,9 +3312,10 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
+        let imf = paint.image_filter.as_ref();
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                let clip_targets = self.resolve_clip_targets_filtered(Some(rect), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2808,7 +3346,8 @@ impl Canvas {
                     && rect.get_height() > stroke_w
                 {
                     let local_bounds = expand_rect(rect, half_w);
-                    let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                    let clip_targets =
+                        self.resolve_clip_targets_filtered(Some(local_bounds), &transform, imf);
                     if clip_targets.is_empty() {
                         self.replay_stats.culled_count += 1;
                         return;
@@ -2862,6 +3401,7 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
+        let imf = paint.image_filter.as_ref();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
         let dx = rect.get_left();
         let dy = rect.get_top();
@@ -2878,7 +3418,7 @@ impl Canvas {
         };
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                let clip_targets = self.resolve_clip_targets_filtered(Some(rect), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2890,7 +3430,8 @@ impl Canvas {
                 let width = paint.effective_stroke_width();
                 let stroke_w = width.max(1.0 / scale);
                 let local_bounds = expand_rect(rect, stroke_w * 0.5);
-                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(local_bounds), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2921,7 +3462,11 @@ impl Canvas {
                 return;
             }
             let transform = self.get_current_transform();
-            let clip_targets = self.resolve_clip_targets(Some(outer_rect), &transform);
+            let clip_targets = self.resolve_clip_targets_filtered(
+                Some(outer_rect),
+                &transform,
+                paint.image_filter.as_ref(),
+            );
             if clip_targets.is_empty() {
                 self.replay_stats.culled_count += 1;
                 return;
@@ -2973,10 +3518,11 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
+        let imf = paint.image_filter.as_ref();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets = self.resolve_clip_targets(Some(rect), &transform);
+                let clip_targets = self.resolve_clip_targets_filtered(Some(rect), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -2988,7 +3534,7 @@ impl Canvas {
                 let stroke_w = paint.effective_stroke_width().max(1.0 / scale);
                 let local_bounds = expand_rect(rect, stroke_w * 0.5);
                 if self
-                    .resolve_clip_targets(Some(local_bounds), &transform)
+                    .resolve_clip_targets_filtered(Some(local_bounds), &transform, imf)
                     .is_empty()
                 {
                     self.replay_stats.culled_count += 1;
@@ -3022,13 +3568,15 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
+        let imf = paint.image_filter.as_ref();
         let scale = transform.get_max_basis_length_xy().max(1.0);
         let dx = center.x;
         let dy = center.y;
         let needs_local_uv = paint_uses_local_coords_for_shader(paint);
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets = self.resolve_clip_targets(Some(circle_rect), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(circle_rect), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -3050,7 +3598,8 @@ impl Canvas {
                 let width = paint.effective_stroke_width();
                 let stroke_w = width.max(1.0 / scale);
                 let local_bounds = expand_rect(circle_rect, stroke_w * 0.5);
-                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(local_bounds), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -3084,12 +3633,16 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
+        let imf = paint.image_filter.as_ref();
         let scale = transform.get_max_basis_length_xy().max(1e-4);
         let arc_geom = ArcGeometry::new(oval_bounds, start, sweep, use_center);
         match paint.style {
             DrawStyle::Fill => {
-                let clip_targets =
-                    self.resolve_clip_targets(Some(oval_bounds.get_positive()), &transform);
+                let clip_targets = self.resolve_clip_targets_filtered(
+                    Some(oval_bounds.get_positive()),
+                    &transform,
+                    imf,
+                );
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -3104,7 +3657,8 @@ impl Canvas {
                     oval_bounds.get_positive(),
                     stroke_w * 0.5 * std::f32::consts::SQRT_2,
                 );
-                let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+                let clip_targets =
+                    self.resolve_clip_targets_filtered(Some(local_bounds), &transform, imf);
                 if clip_targets.is_empty() {
                     self.replay_stats.culled_count += 1;
                     return;
@@ -3135,7 +3689,11 @@ impl Canvas {
             p0.x.max(p1.x) + pad,
             p0.y.max(p1.y) + pad,
         );
-        let clip_targets = self.resolve_clip_targets(Some(local_bounds), &transform);
+        let clip_targets = self.resolve_clip_targets_filtered(
+            Some(local_bounds),
+            &transform,
+            paint.image_filter.as_ref(),
+        );
         if clip_targets.is_empty() {
             self.replay_stats.culled_count += 1;
             return;
@@ -3334,14 +3892,33 @@ impl Canvas {
         }
 
         let prev_len = self.commands.len();
-        self.emit_glyph_quads_with_blend(
-            adjusted_quads,
-            transform,
-            paint.blend_mode,
-            use_linear_filter,
-        );
+        let inner_blend = if paint.image_filter.is_some() {
+            BlendMode::SrcOver
+        } else {
+            paint.blend_mode
+        };
+        self.emit_glyph_quads_with_blend(adjusted_quads, transform, inner_blend, use_linear_filter);
         if self.commands.len() > prev_len {
             self.sync_glyph_atlases();
+            if let Some(imf) = &paint.image_filter {
+                let mut sub_commands: Vec<DrawCommand> = self.commands.drain(prev_len..).collect();
+                for cmd in &mut sub_commands {
+                    if let DrawCommand::GlyphAtlas(b) = cmd {
+                        b.clip_rect = None;
+                    }
+                }
+                if let Some(bounds) = commands_device_bounds(&sub_commands) {
+                    self.commands.push(DrawCommand::SaveLayer {
+                        bounds,
+                        commands: sub_commands,
+                        alpha: 1.0,
+                        blend_mode: paint.blend_mode,
+                        color_filter: None,
+                        image_filter: Some(imf.to_layer_image_filter()),
+                        clip_rect: self.current_scissor_rect(),
+                    });
+                }
+            }
         }
     }
 
@@ -3649,12 +4226,50 @@ impl Canvas {
             return;
         }
         let transform = self.get_current_transform();
-        let clip_targets = self.resolve_clip_targets(Some(dst), &transform);
+        let clip_targets =
+            self.resolve_clip_targets_filtered(Some(dst), &transform, paint.image_filter.as_ref());
         if clip_targets.is_empty() {
             self.replay_stats.culled_count += 1;
             return;
         }
         let alpha = paint.color.alpha.clamp(0.0, 1.0);
+        let needs_filter_layer = paint.image_filter.is_some() || paint.color_filter.is_some();
+        if needs_filter_layer {
+            let dev_bounds = transform_rect(&transform, dst);
+            if dev_bounds.is_empty() {
+                return;
+            }
+            let layer_cf = paint
+                .color_filter
+                .as_ref()
+                .map(ColorFilter::to_layer_color_filter);
+            let layer_if = paint
+                .image_filter
+                .as_ref()
+                .map(ImageFilter::to_layer_image_filter);
+            for clip_rect in clip_targets {
+                let inner_cmd = DrawCommand::TextureFill(TextureFillBatch::from_rect(
+                    src,
+                    dst,
+                    transform,
+                    image.clone(),
+                    1.0,
+                    linear_filter,
+                    BlendMode::SrcOver,
+                    None,
+                ));
+                self.commands.push(DrawCommand::SaveLayer {
+                    bounds: dev_bounds,
+                    commands: vec![inner_cmd],
+                    alpha,
+                    blend_mode: paint.blend_mode,
+                    color_filter: layer_cf.clone(),
+                    image_filter: layer_if.clone(),
+                    clip_rect,
+                });
+            }
+            return;
+        }
         for clip_rect in clip_targets {
             self.commands
                 .push(DrawCommand::TextureFill(TextureFillBatch::from_rect(
@@ -3724,6 +4339,71 @@ impl Canvas {
             dst.get_bottom() - d_bottom_h,
             dst.get_bottom(),
         ];
+
+        let needs_filter_layer = paint.image_filter.is_some() || paint.color_filter.is_some();
+        if needs_filter_layer {
+            let transform = self.get_current_transform();
+            let clip_targets = self.resolve_clip_targets_filtered(
+                Some(dst),
+                &transform,
+                paint.image_filter.as_ref(),
+            );
+            if clip_targets.is_empty() {
+                self.replay_stats.culled_count += 1;
+                return;
+            }
+            let dev_bounds = transform_rect(&transform, dst);
+            if dev_bounds.is_empty() {
+                return;
+            }
+            let mut patches = Vec::with_capacity(9);
+            for row in 0..3 {
+                for col in 0..3 {
+                    let src_patch = Rect::from_ltrb(sx[col], sy[row], sx[col + 1], sy[row + 1]);
+                    let dst_patch = Rect::from_ltrb(dx[col], dy[row], dx[col + 1], dy[row + 1]);
+                    if src_patch.get_width() > 0.0
+                        && src_patch.get_height() > 0.0
+                        && dst_patch.get_width() > 0.0
+                        && dst_patch.get_height() > 0.0
+                    {
+                        patches.push(DrawCommand::TextureFill(TextureFillBatch::from_rect(
+                            src_patch,
+                            dst_patch,
+                            transform,
+                            image.clone(),
+                            1.0,
+                            linear_filter,
+                            BlendMode::SrcOver,
+                            None,
+                        )));
+                    }
+                }
+            }
+            if patches.is_empty() {
+                return;
+            }
+            let alpha = paint.color.alpha.clamp(0.0, 1.0);
+            let layer_cf = paint
+                .color_filter
+                .as_ref()
+                .map(ColorFilter::to_layer_color_filter);
+            let layer_if = paint
+                .image_filter
+                .as_ref()
+                .map(ImageFilter::to_layer_image_filter);
+            for clip_rect in clip_targets {
+                self.commands.push(DrawCommand::SaveLayer {
+                    bounds: dev_bounds,
+                    commands: patches.clone(),
+                    alpha,
+                    blend_mode: paint.blend_mode,
+                    color_filter: layer_cf.clone(),
+                    image_filter: layer_if.clone(),
+                    clip_rect,
+                });
+            }
+            return;
+        }
 
         for row in 0..3 {
             for col in 0..3 {
@@ -3806,6 +4486,44 @@ impl Canvas {
         let alpha = paint.map_or(1.0, |p| p.color.alpha.clamp(0.0, 1.0));
         let effective_blend = paint.map_or(blend_mode, |p| p.blend_mode);
 
+        if let Some(p) = paint.filter(|p| p.image_filter.is_some() || p.color_filter.is_some()) {
+            let Some(dev_bounds) = uv_vertices_device_bounds(&vertices, &transform) else {
+                return;
+            };
+            let layer_cf = p
+                .color_filter
+                .as_ref()
+                .map(ColorFilter::to_layer_color_filter);
+            let layer_if = p
+                .image_filter
+                .as_ref()
+                .map(ImageFilter::to_layer_image_filter);
+            for clip_rect in clip_targets {
+                let inner_cmd = DrawCommand::TextureFill(TextureFillBatch {
+                    vertices: vertices.clone(),
+                    indices: indices.clone(),
+                    transform,
+                    texture: atlas.clone(),
+                    alpha: 1.0,
+                    tile_mode_x: TileMode::Clamp,
+                    tile_mode_y: TileMode::Clamp,
+                    linear_filter,
+                    blend_mode: BlendMode::SrcOver,
+                    clip_rect: None,
+                });
+                self.commands.push(DrawCommand::SaveLayer {
+                    bounds: dev_bounds,
+                    commands: vec![inner_cmd],
+                    alpha,
+                    blend_mode: effective_blend,
+                    color_filter: layer_cf.clone(),
+                    image_filter: layer_if.clone(),
+                    clip_rect,
+                });
+            }
+            return;
+        }
+
         for clip_rect in clip_targets {
             self.commands
                 .push(DrawCommand::TextureFill(TextureFillBatch {
@@ -3882,6 +4600,44 @@ impl Canvas {
                     UvVertex::new(p.x, p.y, uv_pt.x * inv_w, uv_pt.y * inv_h)
                 })
                 .collect();
+            let alpha = paint.color.alpha.clamp(0.0, 1.0);
+            if paint.image_filter.is_some() || paint.color_filter.is_some() {
+                let Some(dev_bounds) = uv_vertices_device_bounds(&vertices, &transform) else {
+                    return;
+                };
+                let layer_cf = paint
+                    .color_filter
+                    .as_ref()
+                    .map(ColorFilter::to_layer_color_filter);
+                let layer_if = paint
+                    .image_filter
+                    .as_ref()
+                    .map(ImageFilter::to_layer_image_filter);
+                for clip_rect in clip_targets {
+                    let inner_cmd = DrawCommand::TextureFill(TextureFillBatch {
+                        vertices: vertices.clone(),
+                        indices: tri_indices.clone(),
+                        transform,
+                        texture: texture.clone(),
+                        alpha: 1.0,
+                        tile_mode_x: *tile_mode_x,
+                        tile_mode_y: *tile_mode_y,
+                        linear_filter: *linear_filter,
+                        blend_mode: BlendMode::SrcOver,
+                        clip_rect: None,
+                    });
+                    self.commands.push(DrawCommand::SaveLayer {
+                        bounds: dev_bounds,
+                        commands: vec![inner_cmd],
+                        alpha,
+                        blend_mode: paint.blend_mode,
+                        color_filter: layer_cf.clone(),
+                        image_filter: layer_if.clone(),
+                        clip_rect,
+                    });
+                }
+                return;
+            }
             for clip_rect in clip_targets {
                 self.commands
                     .push(DrawCommand::TextureFill(TextureFillBatch {
@@ -3889,7 +4645,7 @@ impl Canvas {
                         indices: tri_indices.clone(),
                         transform,
                         texture: texture.clone(),
-                        alpha: paint.color.alpha.clamp(0.0, 1.0),
+                        alpha,
                         tile_mode_x: *tile_mode_x,
                         tile_mode_y: *tile_mode_y,
                         linear_filter: *linear_filter,
@@ -3902,6 +4658,8 @@ impl Canvas {
 
         if let Some(v_colors) = colors {
             if v_colors.len() >= positions.len() {
+                let start_cmd_idx = self.commands.len();
+                let has_imf = paint.image_filter.is_some();
                 for &[t0, t1, t2] in tri_indices.as_chunks::<3>().0 {
                     let (i0, i1, i2) = (t0 as usize, t1 as usize, t2 as usize);
                     let avg = (v_colors[i0] + v_colors[i1] + v_colors[i2]) * (1.0 / 3.0);
@@ -3916,6 +4674,11 @@ impl Canvas {
                     tri_paint.color = tri_color;
                     tri_paint.shader = None;
                     tri_paint.color_source = None;
+                    if has_imf {
+                        tri_paint.image_filter = None;
+                        tri_paint.color_filter = None;
+                        tri_paint.blend_mode = BlendMode::SrcOver;
+                    }
                     let mesh = TessellatedMesh {
                         vertices: vec![
                             Vertex2D::from_point(positions[i0]),
@@ -3925,6 +4688,26 @@ impl Canvas {
                         indices: vec![0, 1, 2],
                     };
                     self.emit_mesh_with_transform(mesh, transform, &tri_paint);
+                }
+                if let Some(imf) = &paint.image_filter {
+                    let mut sub_commands: Vec<DrawCommand> =
+                        self.commands.drain(start_cmd_idx..).collect();
+                    for cmd in &mut sub_commands {
+                        if let DrawCommand::SolidFill { clip_rect, .. } = cmd {
+                            *clip_rect = None;
+                        }
+                    }
+                    if let Some(bounds) = commands_device_bounds(&sub_commands) {
+                        self.commands.push(DrawCommand::SaveLayer {
+                            bounds,
+                            commands: sub_commands,
+                            alpha: 1.0,
+                            blend_mode: paint.blend_mode,
+                            color_filter: None,
+                            image_filter: Some(imf.to_layer_image_filter()),
+                            clip_rect: self.current_scissor_rect(),
+                        });
+                    }
                 }
                 return;
             }
@@ -7738,5 +8521,156 @@ mod tests {
         } else {
             panic!("expected TextureFill for 9-slice center");
         }
+    }
+
+    /// C++ source: aiks_unittests.cc:CanCollapseIntoParentPassVsSaveLayerOffscreen
+    #[test]
+    fn test_phase12b_save_layer_collapse_vs_offscreen_emission() {
+        let renderer = shared_test_renderer();
+
+        // 1. Single-child save_layer with 50% opacity and no ImageFilter must collapse into parent pass:
+        let mut canvas = Canvas::new(100, 100, Color::BLACK);
+        let half_alpha_paint = Paint::fill(Color::new(1.0, 1.0, 1.0, 0.5));
+        canvas.save_layer(
+            Some(Rect::from_xywh(10.0, 10.0, 80.0, 80.0)),
+            Some(&half_alpha_paint),
+        );
+        canvas.draw_rect(
+            Rect::from_xywh(20.0, 20.0, 60.0, 60.0),
+            &Paint::fill(Color::RED),
+        );
+        canvas.restore();
+        assert_eq!(canvas.commands().len(), 1);
+        assert!(
+            matches!(canvas.commands()[0], DrawCommand::SolidFill { .. }),
+            "single-child opacity save_layer must collapse into SolidFill without SaveLayer"
+        );
+
+        // 2. Multi-child save_layer with 50% opacity must emit offscreen DrawCommand::SaveLayer
+        //    so overlapping children do NOT double-blend:
+        let mut group_canvas = Canvas::new(120, 100, Color::BLACK);
+        group_canvas.save_layer(
+            Some(Rect::from_xywh(10.0, 10.0, 100.0, 80.0)),
+            Some(&half_alpha_paint),
+        );
+        group_canvas.draw_rect(
+            Rect::from_xywh(20.0, 20.0, 50.0, 50.0),
+            &Paint::fill(Color::RED),
+        );
+        group_canvas.draw_rect(
+            Rect::from_xywh(40.0, 20.0, 50.0, 50.0),
+            &Paint::fill(Color::RED),
+        );
+        group_canvas.restore();
+
+        assert_eq!(group_canvas.commands().len(), 1);
+        assert!(
+            matches!(group_canvas.commands()[0], DrawCommand::SaveLayer { .. }),
+            "multi-child opacity save_layer must emit offscreen DrawCommand::SaveLayer"
+        );
+
+        let rgba = group_canvas
+            .render_to_pixels(&renderer)
+            .expect("render multi-child save_layer group opacity");
+        let left_px = get_pixel(&rgba, 120, 30, 45);
+        let overlap_px = get_pixel(&rgba, 120, 55, 45);
+        assert!(
+            left_px[0] >= 120 && left_px[0] <= 135,
+            "left non-overlap should be ~50% red, got {:?}",
+            left_px
+        );
+        assert!(
+            (overlap_px[0] as i32 - left_px[0] as i32).abs() <= 2,
+            "overlap region must match group opacity without double-blending: left={:?}, overlap={:?}",
+            left_px,
+            overlap_px
+        );
+    }
+
+    /// C++ source: aiks_image_filter_unittests.cc:CanRenderBlurImageFilterAndTextureColorFilter
+    #[test]
+    fn test_phase12b_blur_image_filter_and_texture_color_filter() {
+        let renderer = shared_test_renderer();
+
+        // 1. Standalone draw_rect with ImageFilter::Blur wraps into SaveLayer and renders Gaussian halo:
+        let mut blur_canvas = Canvas::new(120, 120, Color::BLACK);
+        let blur_paint = Paint::fill(Color::WHITE).with_image_filter(ImageFilter::Blur {
+            sigma_x: 6.0,
+            sigma_y: 6.0,
+            tile_mode: TileMode::Decal,
+        });
+        blur_canvas.draw_rect(Rect::from_xywh(40.0, 40.0, 40.0, 40.0), &blur_paint);
+        assert_eq!(blur_canvas.commands().len(), 1);
+        assert!(matches!(
+            blur_canvas.commands()[0],
+            DrawCommand::SaveLayer {
+                image_filter: Some(LayerImageFilter::Blur { .. }),
+                ..
+            }
+        ));
+
+        let blur_rgba = blur_canvas
+            .render_to_pixels(&renderer)
+            .expect("render blurred rect");
+        let center_px = get_pixel(&blur_rgba, 120, 60, 60);
+        let halo_px = get_pixel(&blur_rgba, 120, 36, 60);
+        let corner_px = get_pixel(&blur_rgba, 120, 4, 4);
+        assert!(
+            center_px[0] > 210,
+            "interior of blurred white rect should be bright, got {:?}",
+            center_px
+        );
+        assert!(
+            halo_px[0] > 25 && halo_px[0] < 190,
+            "outside border at x=36 should have Gaussian blur halo falloff, got {:?}",
+            halo_px
+        );
+        assert!(
+            corner_px[0] < 5,
+            "far corner should remain black, got {:?}",
+            corner_px
+        );
+
+        // 2. draw_image_rect with ColorFilter::Mode wraps into SaveLayer with LayerColorFilter:
+        let mut tex_canvas = Canvas::new(100, 100, Color::BLACK);
+        let red_tex = ImageTexture::new(
+            99,
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        );
+        let cf_paint = Paint::fill(Color::WHITE)
+            .with_color_filter(ColorFilter::Mode(Color::GREEN, BlendMode::SrcIn));
+        tex_canvas.draw_image_rect(
+            &red_tex,
+            Rect::from_xywh(0.0, 0.0, 2.0, 2.0),
+            Rect::from_xywh(20.0, 20.0, 60.0, 60.0),
+            &cf_paint,
+            false,
+        );
+        assert_eq!(tex_canvas.commands().len(), 1);
+        assert!(matches!(
+            tex_canvas.commands()[0],
+            DrawCommand::SaveLayer {
+                color_filter: Some(LayerColorFilter::Mode { .. }),
+                ..
+            }
+        ));
+
+        let tex_rgba = tex_canvas
+            .render_to_pixels(&renderer)
+            .expect("render color-filtered texture");
+        let filtered_px = get_pixel(&tex_rgba, 100, 50, 50);
+        assert_eq!(
+            filtered_px[0], 0,
+            "red texture channel must be filtered out"
+        );
+        assert!(
+            filtered_px[1] > 245,
+            "green channel must be full intensity after SrcIn(GREEN) filter, got {:?}",
+            filtered_px
+        );
     }
 }

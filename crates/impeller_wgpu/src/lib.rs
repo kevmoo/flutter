@@ -23,6 +23,7 @@ const RRECT_BLUR_WGSL: &str = include_str!("shaders/rrect_blur.wgsl");
 const GLYPH_ATLAS_WGSL: &str = include_str!("shaders/glyph_atlas.wgsl");
 const TEXTURE_FILL_WGSL: &str = include_str!("shaders/texture_fill.wgsl");
 const STENCIL_CLIP_WGSL: &str = include_str!("shaders/stencil_clip.wgsl");
+const IMAGE_FILTER_WGSL: &str = include_str!("shaders/image_filter.wgsl");
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
@@ -625,6 +626,57 @@ impl TextureFillBatch {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum LayerColorFilter {
+    Mode(Color, BlendMode),
+    Matrix([Scalar; 20]),
+    SrgbToLinear,
+    LinearToSrgb,
+    Compose(Box<LayerColorFilter>, Box<LayerColorFilter>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerImageFilter {
+    Blur {
+        sigma_x: Scalar,
+        sigma_y: Scalar,
+        tile_mode: TileMode,
+    },
+    Dilate {
+        radius_x: Scalar,
+        radius_y: Scalar,
+    },
+    Erode {
+        radius_x: Scalar,
+        radius_y: Scalar,
+    },
+    Matrix(Matrix),
+    ColorFilter(LayerColorFilter),
+    Compose(Box<LayerImageFilter>, Box<LayerImageFilter>),
+}
+
+impl LayerImageFilter {
+    pub fn halo_padding(&self) -> (Scalar, Scalar) {
+        match self {
+            Self::Blur {
+                sigma_x, sigma_y, ..
+            } => (
+                (sigma_x.max(0.0) * 3.0).ceil(),
+                (sigma_y.max(0.0) * 3.0).ceil(),
+            ),
+            Self::Dilate { radius_x, radius_y } | Self::Erode { radius_x, radius_y } => {
+                (radius_x.max(0.0).ceil(), radius_y.max(0.0).ceil())
+            }
+            Self::Matrix(_) | Self::ColorFilter(_) => (0.0, 0.0),
+            Self::Compose(outer, inner) => {
+                let (ix, iy) = inner.halo_padding();
+                let (ox, oy) = outer.halo_padding();
+                (ix + ox, iy + oy)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum DrawCommand {
     SolidFill {
         mesh: TessellatedMesh,
@@ -678,6 +730,15 @@ pub enum DrawCommand {
     PopClip {
         clip_rect: Option<Rect>,
     },
+    SaveLayer {
+        bounds: Rect,
+        commands: Vec<DrawCommand>,
+        alpha: Scalar,
+        blend_mode: BlendMode,
+        color_filter: Option<LayerColorFilter>,
+        image_filter: Option<LayerImageFilter>,
+        clip_rect: Option<Rect>,
+    },
 }
 
 impl DrawCommand {
@@ -690,7 +751,8 @@ impl DrawCommand {
             | DrawCommand::ConicalGradientFill { clip_rect, .. }
             | DrawCommand::RRectBlur { clip_rect, .. }
             | DrawCommand::PushClip { clip_rect, .. }
-            | DrawCommand::PopClip { clip_rect } => *clip_rect,
+            | DrawCommand::PopClip { clip_rect }
+            | DrawCommand::SaveLayer { clip_rect, .. } => *clip_rect,
             DrawCommand::GlyphAtlas(batch) => batch.clip_rect,
             DrawCommand::TextureFill(batch) => batch.clip_rect,
         }
@@ -703,7 +765,8 @@ impl DrawCommand {
             | DrawCommand::RadialGradientFill { blend_mode, .. }
             | DrawCommand::SweepGradientFill { blend_mode, .. }
             | DrawCommand::ConicalGradientFill { blend_mode, .. }
-            | DrawCommand::RRectBlur { blend_mode, .. } => *blend_mode,
+            | DrawCommand::RRectBlur { blend_mode, .. }
+            | DrawCommand::SaveLayer { blend_mode, .. } => *blend_mode,
             DrawCommand::GlyphAtlas(batch) => batch.blend_mode,
             DrawCommand::TextureFill(batch) => batch.blend_mode,
             DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => BlendMode::SrcOver,
@@ -719,7 +782,8 @@ impl DrawCommand {
             | DrawCommand::ConicalGradientFill { clip_rect, .. }
             | DrawCommand::RRectBlur { clip_rect, .. }
             | DrawCommand::PushClip { clip_rect, .. }
-            | DrawCommand::PopClip { clip_rect } => {
+            | DrawCommand::PopClip { clip_rect }
+            | DrawCommand::SaveLayer { clip_rect, .. } => {
                 *clip_rect = new_clip;
             }
             DrawCommand::GlyphAtlas(batch) => {
@@ -828,6 +892,36 @@ pub enum PipelineKind {
     TextureFill,
     StencilIncrement,
     StencilDecrement,
+    ImageFilter,
+}
+
+const FILTER_KIND_BLUR_1D: u32 = 0;
+const FILTER_KIND_DILATE_1D: u32 = 1;
+const FILTER_KIND_ERODE_1D: u32 = 2;
+const FILTER_KIND_COLOR_MATRIX: u32 = 3;
+const FILTER_KIND_COLOR_MODE: u32 = 4;
+const FILTER_KIND_SRGB_TO_LINEAR: u32 = 5;
+const FILTER_KIND_LINEAR_TO_SRGB: u32 = 6;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct ImageFilterFragUniform {
+    color_matrix_row0: [f32; 4],
+    color_matrix_row1: [f32; 4],
+    color_matrix_row2: [f32; 4],
+    color_matrix_row3: [f32; 4],
+    color_matrix_offset: [f32; 4],
+    mode_color_pm: [f32; 4],
+    step_uv: [f32; 2],
+    tex_size: [f32; 2],
+    sigma: f32,
+    alpha: f32,
+    filter_kind: u32,
+    radius: i32,
+    tile_mode: u32,
+    blend_mode: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -1427,7 +1521,9 @@ fn inspect_command_for_clustering(cmd: &DrawCommand) -> CommandClusterInfo {
                 uses_color: false,
             }
         }
-        DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => CommandClusterInfo {
+        DrawCommand::PushClip { .. }
+        | DrawCommand::PopClip { .. }
+        | DrawCommand::SaveLayer { .. } => CommandClusterInfo {
             dev_bounds: None,
             clusterable: false,
             uses_alpha: false,
@@ -1992,6 +2088,32 @@ impl OffscreenTarget {
     }
 }
 
+struct SaveLayerTexture {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+#[derive(Default)]
+struct SaveLayerPool {
+    available: Vec<Arc<SaveLayerTexture>>,
+}
+
+struct PreparedSubpass {
+    target_tex: Arc<SaveLayerTexture>,
+    has_stencil: bool,
+    calls: Vec<PendingArenaCall>,
+}
+
+struct ResolvedSubpass {
+    target_tex: Arc<SaveLayerTexture>,
+    has_stencil: bool,
+    calls: Vec<PendingArenaCall>,
+    resolved_bgs: Vec<Arc<wgpu::BindGroup>>,
+}
+
 #[derive(Clone)]
 enum DrawCallBinding {
     SolidFill,
@@ -2007,6 +2129,14 @@ enum DrawCallBinding {
     },
     TextureFill {
         gpu_tex: Arc<CachedGpuAtlas>,
+        linear_filter: bool,
+    },
+    LayerTextureFill {
+        layer_tex: Arc<SaveLayerTexture>,
+        linear_filter: bool,
+    },
+    ImageFilter {
+        src_tex: Arc<SaveLayerTexture>,
         linear_filter: bool,
     },
 }
@@ -2050,6 +2180,7 @@ type CachedGlyphBgValue = (
     Arc<wgpu::BindGroup>,
 );
 type CachedTextureBgValue = (Arc<CachedGpuAtlas>, Arc<wgpu::BindGroup>);
+type CachedLayerBgValue = (Arc<SaveLayerTexture>, Arc<wgpu::BindGroup>);
 type CachedSsaaBgValue = (usize, Arc<SsaaScratchTarget>, Arc<wgpu::BindGroup>);
 
 #[derive(Default)]
@@ -2071,6 +2202,8 @@ struct FrameArena {
     conical_gradient_bg: Option<Arc<wgpu::BindGroup>>,
     glyph_atlas_bgs: HashMap<(usize, usize, bool), CachedGlyphBgValue>,
     texture_fill_bgs: HashMap<(usize, bool), CachedTextureBgValue>,
+    layer_texture_bgs: HashMap<(usize, bool), CachedLayerBgValue>,
+    image_filter_bgs: HashMap<(usize, bool), CachedLayerBgValue>,
     ssaa_resolve_bg: Option<CachedSsaaBgValue>,
     seen_atlas_eviction_epoch: u64,
     last_frame_upload_count: usize,
@@ -2101,6 +2234,8 @@ impl FrameArena {
         self.conical_gradient_bg = None;
         self.glyph_atlas_bgs.clear();
         self.texture_fill_bgs.clear();
+        self.layer_texture_bgs.clear();
+        self.image_filter_bgs.clear();
         self.ssaa_resolve_bg = None;
     }
 
@@ -2119,6 +2254,8 @@ impl FrameArena {
             + usize::from(self.conical_gradient_bg.is_some())
             + self.glyph_atlas_bgs.len()
             + self.texture_fill_bgs.len()
+            + self.layer_texture_bgs.len()
+            + self.image_filter_bgs.len()
             + usize::from(self.ssaa_resolve_bg.is_some())
     }
 
@@ -2260,6 +2397,7 @@ pub struct WgpuRenderer {
     glyph_atlas_shader: wgpu::ShaderModule,
     texture_fill_shader: wgpu::ShaderModule,
     stencil_clip_shader: wgpu::ShaderModule,
+    image_filter_shader: wgpu::ShaderModule,
     solid_fill_layout: wgpu::BindGroupLayout,
     rrect_blur_layout: wgpu::BindGroupLayout,
     linear_gradient_layout: wgpu::BindGroupLayout,
@@ -2268,6 +2406,7 @@ pub struct WgpuRenderer {
     conical_gradient_layout: wgpu::BindGroupLayout,
     glyph_atlas_layout: wgpu::BindGroupLayout,
     texture_fill_layout: wgpu::BindGroupLayout,
+    image_filter_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
     fallback_alpha_atlas: Arc<CachedGpuAtlas>,
@@ -2279,6 +2418,7 @@ pub struct WgpuRenderer {
     ssaa_scratch: Mutex<Option<Arc<SsaaScratchTarget>>>,
     surface_msaa_scratch: Mutex<Option<Arc<SurfaceMsaaScratch>>>,
     stencil_scratch: Mutex<Option<Arc<StencilScratchTarget>>>,
+    save_layer_pool: Mutex<SaveLayerPool>,
     frame_arena: Mutex<FrameArena>,
 }
 
@@ -2547,6 +2687,10 @@ impl WgpuRenderer {
             label: Some("Impeller stencil_clip.wgsl"),
             source: wgpu::ShaderSource::Wgsl(STENCIL_CLIP_WGSL.into()),
         });
+        let image_filter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Impeller image_filter.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_FILTER_WGSL.into()),
+        });
 
         let dyn_uniform_entry = |binding: u32,
                                  visibility: wgpu::ShaderStages,
@@ -2760,6 +2904,39 @@ impl WgpuRenderer {
                 ],
             });
 
+        let image_filter_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Impeller ImageFilter BindGroupLayout"),
+                entries: &[
+                    dyn_uniform_entry(
+                        0,
+                        wgpu::ShaderStages::VERTEX,
+                        std::mem::size_of::<SolidFrameUniform>(),
+                    ),
+                    dyn_uniform_entry(
+                        1,
+                        wgpu::ShaderStages::FRAGMENT,
+                        std::mem::size_of::<ImageFilterFragUniform>(),
+                    ),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Impeller GlyphAtlas Linear Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -2817,6 +2994,7 @@ impl WgpuRenderer {
             glyph_atlas_shader,
             texture_fill_shader,
             stencil_clip_shader,
+            image_filter_shader,
             solid_fill_layout,
             rrect_blur_layout,
             linear_gradient_layout,
@@ -2825,6 +3003,7 @@ impl WgpuRenderer {
             conical_gradient_layout,
             glyph_atlas_layout,
             texture_fill_layout,
+            image_filter_layout,
             linear_sampler,
             nearest_sampler,
             fallback_alpha_atlas,
@@ -2836,6 +3015,7 @@ impl WgpuRenderer {
             ssaa_scratch: Mutex::new(None),
             surface_msaa_scratch: Mutex::new(None),
             stencil_scratch: Mutex::new(None),
+            save_layer_pool: Mutex::new(SaveLayerPool::default()),
             frame_arena: Mutex::new(FrameArena::default()),
         }
     }
@@ -3209,6 +3389,11 @@ impl WgpuRenderer {
                 &self.solid_fill_layout,
                 "Impeller StencilDecrement Pipeline",
             ),
+            PipelineKind::ImageFilter => (
+                &self.image_filter_shader,
+                &self.image_filter_layout,
+                "Impeller ImageFilter Pipeline",
+            ),
         };
 
         let pipeline_layout = self
@@ -3282,7 +3467,7 @@ impl WgpuRenderer {
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &glyph_attrs,
             },
-            PipelineKind::TextureFill => wgpu::VertexBufferLayout {
+            PipelineKind::TextureFill | PipelineKind::ImageFilter => wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<UvVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &uv_attrs,
@@ -3424,11 +3609,74 @@ impl WgpuRenderer {
         created
     }
 
+    fn acquire_save_layer_texture(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Arc<SaveLayerTexture> {
+        let w = width.max(1);
+        let h = height.max(1);
+        if let Ok(mut pool) = self.save_layer_pool.lock() {
+            if let Some(pos) = pool
+                .available
+                .iter()
+                .position(|t| t.width == w && t.height == h && t.format == format)
+            {
+                return pool.available.swap_remove(pos);
+            }
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Impeller SaveLayer Offscreen Texture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Arc::new(SaveLayerTexture {
+            width: w,
+            height: h,
+            format,
+            _texture: texture,
+            view,
+        })
+    }
+
+    fn release_save_layer_textures(&self, textures: Vec<Arc<SaveLayerTexture>>) {
+        if textures.is_empty() {
+            return;
+        }
+        if let Ok(mut pool) = self.save_layer_pool.lock() {
+            for tex in textures {
+                if pool.available.len() >= 32 {
+                    break;
+                }
+                pool.available.push(tex);
+            }
+        }
+    }
+
+    pub fn pooled_save_layer_texture_count(&self) -> usize {
+        self.save_layer_pool
+            .lock()
+            .map(|p| p.available.len())
+            .unwrap_or(0)
+    }
+
     fn compute_scissor_rect(
         clip_rect: Option<Rect>,
         internal_width: u32,
         internal_height: u32,
         ssaa_scale: u32,
+        layer_origin: Point,
     ) -> Option<[u32; 4]> {
         match clip_rect {
             None => Some([0, 0, internal_width, internal_height]),
@@ -3437,13 +3685,13 @@ impl WgpuRenderer {
                     return None;
                 }
                 let s = ssaa_scale.max(1) as Scalar;
-                let min_x = (r.get_left() * s).floor().max(0.0) as u32;
-                let min_y = (r.get_top() * s).floor().max(0.0) as u32;
-                let max_x = (r.get_right() * s)
+                let min_x = ((r.get_left() - layer_origin.x) * s).floor().max(0.0) as u32;
+                let min_y = ((r.get_top() - layer_origin.y) * s).floor().max(0.0) as u32;
+                let max_x = ((r.get_right() - layer_origin.x) * s)
                     .ceil()
                     .max(0.0)
                     .min(internal_width as Scalar) as u32;
-                let max_y = (r.get_bottom() * s)
+                let max_y = ((r.get_bottom() - layer_origin.y) * s)
                     .ceil()
                     .max(0.0)
                     .min(internal_height as Scalar) as u32;
@@ -3557,10 +3805,509 @@ impl WgpuRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn push_image_filter_subpass(
+        &self,
+        arena: &mut FrameArena,
+        subpasses: &mut Vec<PreparedSubpass>,
+        used_layer_textures: &mut Vec<Arc<SaveLayerTexture>>,
+        src_tex: Arc<SaveLayerTexture>,
+        frag_uniform: ImageFilterFragUniform,
+        linear_filter: bool,
+        format: wgpu::TextureFormat,
+        uniform_align: usize,
+    ) -> Arc<SaveLayerTexture> {
+        let dst_tex = self.acquire_save_layer_texture(src_tex.width, src_tex.height, format);
+        used_layer_textures.push(Arc::clone(&dst_tex));
+
+        let w = dst_tex.width as Scalar;
+        let h = dst_tex.height as Scalar;
+        let ortho = Matrix::make_orthographic(Size::new(w, h));
+        let frame_u = SolidFrameUniform { mvp: ortho.m };
+        let frame_off = arena.push_uniform(bytemuck::bytes_of(&frame_u), uniform_align);
+        let frag_off = arena.push_uniform(bytemuck::bytes_of(&frag_uniform), uniform_align);
+
+        let verts = [
+            UvVertex::new(0.0, 0.0, 0.0, 0.0),
+            UvVertex::new(w, 0.0, 1.0, 0.0),
+            UvVertex::new(w, h, 1.0, 1.0),
+            UvVertex::new(0.0, h, 0.0, 1.0),
+        ];
+        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+        FrameArena::align_cpu_4(&mut arena.index_cpu);
+        let vertex_offset = arena.vertex_cpu.len() as u64;
+        arena
+            .vertex_cpu
+            .extend_from_slice(bytemuck::cast_slice(&verts));
+        let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+        let index_offset = arena.index_cpu.len() as u64;
+        arena
+            .index_cpu
+            .extend_from_slice(bytemuck::cast_slice(&indices));
+        let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+        let pipeline = self.get_or_create_pipeline_full(
+            PipelineKind::ImageFilter,
+            BlendMode::Src,
+            1,
+            format,
+            false,
+        );
+        let call = PendingArenaCall {
+            pipeline,
+            binding: DrawCallBinding::ImageFilter {
+                src_tex,
+                linear_filter,
+            },
+            glyph_alpha_opt: None,
+            glyph_color_opt: None,
+            dynamic_offsets: [frame_off, frag_off, 0],
+            dynamic_offset_count: 2,
+            vertex_offset,
+            vertex_byte_len,
+            vertex_count: 4,
+            index_offset,
+            index_byte_len,
+            index_count: 6,
+            scissor: [0, 0, dst_tex.width, dst_tex.height],
+            stencil_ref: 0,
+            coalesce_tag: CoalesceTag::None,
+        };
+        subpasses.push(PreparedSubpass {
+            target_tex: Arc::clone(&dst_tex),
+            has_stencil: false,
+            calls: vec![call],
+        });
+        dst_tex
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bake_layer_transform_subpass(
+        &self,
+        arena: &mut FrameArena,
+        subpasses: &mut Vec<PreparedSubpass>,
+        used_layer_textures: &mut Vec<Arc<SaveLayerTexture>>,
+        src_tex: Arc<SaveLayerTexture>,
+        child_origin: Point,
+        ssaa_scalar: Scalar,
+        transform: Matrix,
+        format: wgpu::TextureFormat,
+        uniform_align: usize,
+    ) -> Arc<SaveLayerTexture> {
+        let dst_tex = self.acquire_save_layer_texture(src_tex.width, src_tex.height, format);
+        used_layer_textures.push(Arc::clone(&dst_tex));
+
+        let px_w = dst_tex.width as Scalar;
+        let px_h = dst_tex.height as Scalar;
+        let logical_w = px_w / ssaa_scalar;
+        let logical_h = px_h / ssaa_scalar;
+        let child_ortho = Matrix::make_orthographic(Size::new(px_w, px_h))
+            * Matrix::make_scale(ssaa_scalar, ssaa_scalar, 1.0)
+            * Matrix::make_translation(-child_origin.x, -child_origin.y, 0.0);
+        let mvp = child_ortho * transform;
+        let frame_u = SolidFrameUniform { mvp: mvp.m };
+        let frag_u = TextureFragUniform {
+            alpha: 1.0,
+            tile_mode_x: TileMode::Decal as u32,
+            tile_mode_y: TileMode::Decal as u32,
+            _pad: 0,
+        };
+        let frame_off = arena.push_uniform(bytemuck::bytes_of(&frame_u), uniform_align);
+        let frag_off = arena.push_uniform(bytemuck::bytes_of(&frag_u), uniform_align);
+
+        let x0 = child_origin.x;
+        let y0 = child_origin.y;
+        let x1 = x0 + logical_w;
+        let y1 = y0 + logical_h;
+        let verts = [
+            UvVertex::new(x0, y0, 0.0, 0.0),
+            UvVertex::new(x1, y0, 1.0, 0.0),
+            UvVertex::new(x1, y1, 1.0, 1.0),
+            UvVertex::new(x0, y1, 0.0, 1.0),
+        ];
+        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+        FrameArena::align_cpu_4(&mut arena.index_cpu);
+        let vertex_offset = arena.vertex_cpu.len() as u64;
+        arena
+            .vertex_cpu
+            .extend_from_slice(bytemuck::cast_slice(&verts));
+        let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+        let index_offset = arena.index_cpu.len() as u64;
+        arena
+            .index_cpu
+            .extend_from_slice(bytemuck::cast_slice(&indices));
+        let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+        let pipeline = self.get_or_create_pipeline_full(
+            PipelineKind::TextureFill,
+            BlendMode::Src,
+            1,
+            format,
+            false,
+        );
+        let call = PendingArenaCall {
+            pipeline,
+            binding: DrawCallBinding::LayerTextureFill {
+                layer_tex: src_tex,
+                linear_filter: !transform.is_translation_scale_only(),
+            },
+            glyph_alpha_opt: None,
+            glyph_color_opt: None,
+            dynamic_offsets: [frame_off, frag_off, 0],
+            dynamic_offset_count: 2,
+            vertex_offset,
+            vertex_byte_len,
+            vertex_count: 4,
+            index_offset,
+            index_byte_len,
+            index_count: 6,
+            scissor: [0, 0, dst_tex.width, dst_tex.height],
+            stencil_ref: 0,
+            coalesce_tag: CoalesceTag::None,
+        };
+        subpasses.push(PreparedSubpass {
+            target_tex: Arc::clone(&dst_tex),
+            has_stencil: false,
+            calls: vec![call],
+        });
+        dst_tex
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_color_filter_passes(
+        &self,
+        arena: &mut FrameArena,
+        subpasses: &mut Vec<PreparedSubpass>,
+        used_layer_textures: &mut Vec<Arc<SaveLayerTexture>>,
+        src_tex: Arc<SaveLayerTexture>,
+        filter: &LayerColorFilter,
+        format: wgpu::TextureFormat,
+        uniform_align: usize,
+    ) -> Arc<SaveLayerTexture> {
+        match filter {
+            LayerColorFilter::Mode(color, mode) => {
+                let frag = ImageFilterFragUniform {
+                    mode_color_pm: color.to_array_premultiplied(),
+                    tex_size: [src_tex.width as f32, src_tex.height as f32],
+                    alpha: 1.0,
+                    filter_kind: FILTER_KIND_COLOR_MODE,
+                    tile_mode: TileMode::Clamp as u32,
+                    blend_mode: *mode as u32,
+                    ..Default::default()
+                };
+                self.push_image_filter_subpass(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    src_tex,
+                    frag,
+                    false,
+                    format,
+                    uniform_align,
+                )
+            }
+            LayerColorFilter::Matrix(m) => {
+                let frag = ImageFilterFragUniform {
+                    color_matrix_row0: [m[0], m[1], m[2], m[3]],
+                    color_matrix_row1: [m[5], m[6], m[7], m[8]],
+                    color_matrix_row2: [m[10], m[11], m[12], m[13]],
+                    color_matrix_row3: [m[15], m[16], m[17], m[18]],
+                    color_matrix_offset: [m[4], m[9], m[14], m[19]],
+                    tex_size: [src_tex.width as f32, src_tex.height as f32],
+                    alpha: 1.0,
+                    filter_kind: FILTER_KIND_COLOR_MATRIX,
+                    tile_mode: TileMode::Clamp as u32,
+                    ..Default::default()
+                };
+                self.push_image_filter_subpass(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    src_tex,
+                    frag,
+                    false,
+                    format,
+                    uniform_align,
+                )
+            }
+            LayerColorFilter::SrgbToLinear => {
+                let frag = ImageFilterFragUniform {
+                    tex_size: [src_tex.width as f32, src_tex.height as f32],
+                    alpha: 1.0,
+                    filter_kind: FILTER_KIND_SRGB_TO_LINEAR,
+                    tile_mode: TileMode::Clamp as u32,
+                    ..Default::default()
+                };
+                self.push_image_filter_subpass(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    src_tex,
+                    frag,
+                    false,
+                    format,
+                    uniform_align,
+                )
+            }
+            LayerColorFilter::LinearToSrgb => {
+                let frag = ImageFilterFragUniform {
+                    tex_size: [src_tex.width as f32, src_tex.height as f32],
+                    alpha: 1.0,
+                    filter_kind: FILTER_KIND_LINEAR_TO_SRGB,
+                    tile_mode: TileMode::Clamp as u32,
+                    ..Default::default()
+                };
+                self.push_image_filter_subpass(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    src_tex,
+                    frag,
+                    false,
+                    format,
+                    uniform_align,
+                )
+            }
+            LayerColorFilter::Compose(outer, inner) => {
+                let mid = self.prepare_color_filter_passes(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    src_tex,
+                    inner,
+                    format,
+                    uniform_align,
+                );
+                self.prepare_color_filter_passes(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    mid,
+                    outer,
+                    format,
+                    uniform_align,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_image_filter_passes(
+        &self,
+        arena: &mut FrameArena,
+        subpasses: &mut Vec<PreparedSubpass>,
+        used_layer_textures: &mut Vec<Arc<SaveLayerTexture>>,
+        mut cur_tex: Arc<SaveLayerTexture>,
+        filter: &LayerImageFilter,
+        child_origin: Point,
+        ssaa_scalar: Scalar,
+        format: wgpu::TextureFormat,
+        uniform_align: usize,
+        post_transform: &mut Matrix,
+    ) -> Arc<SaveLayerTexture> {
+        match filter {
+            LayerImageFilter::Matrix(m) => {
+                *post_transform = *m * *post_transform;
+                cur_tex
+            }
+            LayerImageFilter::ColorFilter(cf) => {
+                if *post_transform != Matrix::IDENTITY {
+                    cur_tex = self.bake_layer_transform_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        child_origin,
+                        ssaa_scalar,
+                        *post_transform,
+                        format,
+                        uniform_align,
+                    );
+                    *post_transform = Matrix::IDENTITY;
+                }
+                self.prepare_color_filter_passes(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    cur_tex,
+                    cf,
+                    format,
+                    uniform_align,
+                )
+            }
+            LayerImageFilter::Blur {
+                sigma_x,
+                sigma_y,
+                tile_mode,
+            } => {
+                if *post_transform != Matrix::IDENTITY {
+                    cur_tex = self.bake_layer_transform_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        child_origin,
+                        ssaa_scalar,
+                        *post_transform,
+                        format,
+                        uniform_align,
+                    );
+                    *post_transform = Matrix::IDENTITY;
+                }
+                let sx = (sigma_x * ssaa_scalar).max(0.0);
+                let sy = (sigma_y * ssaa_scalar).max(0.0);
+                if sx > 1.0e-4 {
+                    let rx = (sx * 3.0).ceil().clamp(1.0, 64.0) as i32;
+                    let frag_x = ImageFilterFragUniform {
+                        step_uv: [1.0 / (cur_tex.width as f32), 0.0],
+                        tex_size: [cur_tex.width as f32, cur_tex.height as f32],
+                        sigma: sx,
+                        alpha: 1.0,
+                        filter_kind: FILTER_KIND_BLUR_1D,
+                        radius: rx,
+                        tile_mode: *tile_mode as u32,
+                        ..Default::default()
+                    };
+                    cur_tex = self.push_image_filter_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        frag_x,
+                        true,
+                        format,
+                        uniform_align,
+                    );
+                }
+                if sy > 1.0e-4 {
+                    let ry = (sy * 3.0).ceil().clamp(1.0, 64.0) as i32;
+                    let frag_y = ImageFilterFragUniform {
+                        step_uv: [0.0, 1.0 / (cur_tex.height as f32)],
+                        tex_size: [cur_tex.width as f32, cur_tex.height as f32],
+                        sigma: sy,
+                        alpha: 1.0,
+                        filter_kind: FILTER_KIND_BLUR_1D,
+                        radius: ry,
+                        tile_mode: *tile_mode as u32,
+                        ..Default::default()
+                    };
+                    cur_tex = self.push_image_filter_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        frag_y,
+                        true,
+                        format,
+                        uniform_align,
+                    );
+                }
+                cur_tex
+            }
+            LayerImageFilter::Dilate { radius_x, radius_y }
+            | LayerImageFilter::Erode { radius_x, radius_y } => {
+                if *post_transform != Matrix::IDENTITY {
+                    cur_tex = self.bake_layer_transform_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        child_origin,
+                        ssaa_scalar,
+                        *post_transform,
+                        format,
+                        uniform_align,
+                    );
+                    *post_transform = Matrix::IDENTITY;
+                }
+                let kind = if matches!(filter, LayerImageFilter::Dilate { .. }) {
+                    FILTER_KIND_DILATE_1D
+                } else {
+                    FILTER_KIND_ERODE_1D
+                };
+                let rx = (radius_x * ssaa_scalar).ceil().clamp(0.0, 64.0) as i32;
+                let ry = (radius_y * ssaa_scalar).ceil().clamp(0.0, 64.0) as i32;
+                if rx >= 1 {
+                    let frag_x = ImageFilterFragUniform {
+                        step_uv: [1.0 / (cur_tex.width as f32), 0.0],
+                        tex_size: [cur_tex.width as f32, cur_tex.height as f32],
+                        alpha: 1.0,
+                        filter_kind: kind,
+                        radius: rx,
+                        tile_mode: TileMode::Decal as u32,
+                        ..Default::default()
+                    };
+                    cur_tex = self.push_image_filter_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        frag_x,
+                        false,
+                        format,
+                        uniform_align,
+                    );
+                }
+                if ry >= 1 {
+                    let frag_y = ImageFilterFragUniform {
+                        step_uv: [0.0, 1.0 / (cur_tex.height as f32)],
+                        tex_size: [cur_tex.width as f32, cur_tex.height as f32],
+                        alpha: 1.0,
+                        filter_kind: kind,
+                        radius: ry,
+                        tile_mode: TileMode::Decal as u32,
+                        ..Default::default()
+                    };
+                    cur_tex = self.push_image_filter_subpass(
+                        arena,
+                        subpasses,
+                        used_layer_textures,
+                        cur_tex,
+                        frag_y,
+                        false,
+                        format,
+                        uniform_align,
+                    );
+                }
+                cur_tex
+            }
+            LayerImageFilter::Compose(outer, inner) => {
+                let mid = self.prepare_image_filter_passes(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    cur_tex,
+                    inner,
+                    child_origin,
+                    ssaa_scalar,
+                    format,
+                    uniform_align,
+                    post_transform,
+                );
+                self.prepare_image_filter_passes(
+                    arena,
+                    subpasses,
+                    used_layer_textures,
+                    mid,
+                    outer,
+                    child_origin,
+                    ssaa_scalar,
+                    format,
+                    uniform_align,
+                    post_transform,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_pass_into_arena(
         &self,
         arena: &mut FrameArena,
         commands: &[DrawCommand],
+        subpasses: &mut Vec<PreparedSubpass>,
+        used_layer_textures: &mut Vec<Arc<SaveLayerTexture>>,
         ortho: Matrix,
         internal_width: u32,
         internal_height: u32,
@@ -3569,6 +4316,7 @@ impl WgpuRenderer {
         format: wgpu::TextureFormat,
         uniform_align: usize,
         has_stencil: bool,
+        layer_origin: Point,
     ) -> Vec<PendingArenaCall> {
         let clustered = cluster_non_overlapping_commands(commands);
         let mut calls: Vec<PendingArenaCall> = Vec::with_capacity(clustered.len().min(256));
@@ -3582,6 +4330,7 @@ impl WgpuRenderer {
                 internal_width,
                 internal_height,
                 ssaa_scale,
+                layer_origin,
             );
 
             if let DrawCommand::PushClip {
@@ -3602,10 +4351,10 @@ impl WgpuRenderer {
                         });
                         if *is_difference {
                             let s = ssaa_scale.max(1) as Scalar;
-                            let qx0 = (scissor[0] as Scalar) / s;
-                            let qy0 = (scissor[1] as Scalar) / s;
-                            let qx1 = ((scissor[0] + scissor[2]) as Scalar) / s;
-                            let qy1 = ((scissor[1] + scissor[3]) as Scalar) / s;
+                            let qx0 = layer_origin.x + (scissor[0] as Scalar) / s;
+                            let qy0 = layer_origin.y + (scissor[1] as Scalar) / s;
+                            let qx1 = layer_origin.x + ((scissor[0] + scissor[2]) as Scalar) / s;
+                            let qy1 = layer_origin.y + ((scissor[1] + scissor[3]) as Scalar) / s;
                             let quad_verts = [
                                 SolidVertex::new(qx0, qy0),
                                 SolidVertex::new(qx1, qy0),
@@ -3692,10 +4441,10 @@ impl WgpuRenderer {
                     let cur_depth = stencil_depth;
                     if let Some(scissor) = scissor_opt {
                         let s = ssaa_scale.max(1) as Scalar;
-                        let qx0 = (scissor[0] as Scalar) / s;
-                        let qy0 = (scissor[1] as Scalar) / s;
-                        let qx1 = ((scissor[0] + scissor[2]) as Scalar) / s;
-                        let qy1 = ((scissor[1] + scissor[3]) as Scalar) / s;
+                        let qx0 = layer_origin.x + (scissor[0] as Scalar) / s;
+                        let qy0 = layer_origin.y + (scissor[1] as Scalar) / s;
+                        let qx1 = layer_origin.x + ((scissor[0] + scissor[2]) as Scalar) / s;
+                        let qy1 = layer_origin.y + ((scissor[1] + scissor[3]) as Scalar) / s;
                         let quad_verts = [
                             SolidVertex::new(qx0, qy0),
                             SolidVertex::new(qx1, qy0),
@@ -4675,6 +5424,207 @@ impl WgpuRenderer {
                         coalesce_tag: CoalesceTag::None,
                     });
                 }
+                DrawCommand::SaveLayer {
+                    bounds,
+                    commands: child_cmds,
+                    alpha,
+                    blend_mode,
+                    color_filter,
+                    image_filter,
+                    ..
+                } => {
+                    if bounds.is_empty()
+                        || *alpha <= 0.0
+                        || (child_cmds.is_empty()
+                            && color_filter.is_none()
+                            && *blend_mode == BlendMode::SrcOver)
+                    {
+                        continue;
+                    }
+
+                    let (halo_x, halo_y) = image_filter
+                        .as_ref()
+                        .map(|f| f.halo_padding())
+                        .unwrap_or((0.0, 0.0));
+                    let s = ssaa_scale.max(1) as Scalar;
+                    let parent_logical_w = (internal_width as Scalar) / s;
+                    let parent_logical_h = (internal_height as Scalar) / s;
+                    let clamp_rect = Rect::from_ltrb(
+                        layer_origin.x - halo_x,
+                        layer_origin.y - halo_y,
+                        layer_origin.x + parent_logical_w + halo_x,
+                        layer_origin.y + parent_logical_h + halo_y,
+                    );
+                    let expanded_bounds = Rect::from_ltrb(
+                        bounds.get_left() - halo_x,
+                        bounds.get_top() - halo_y,
+                        bounds.get_right() + halo_x,
+                        bounds.get_bottom() + halo_y,
+                    );
+                    let Some(clipped_layer_bounds) = intersect_rects(expanded_bounds, clamp_rect)
+                    else {
+                        continue;
+                    };
+
+                    let min_px_x = (clipped_layer_bounds.get_left() * s).floor();
+                    let min_px_y = (clipped_layer_bounds.get_top() * s).floor();
+                    let max_px_x = (clipped_layer_bounds.get_right() * s).ceil();
+                    let max_px_y = (clipped_layer_bounds.get_bottom() * s).ceil();
+                    let layer_px_w = ((max_px_x - min_px_x).max(0.0) as u32).min(4096);
+                    let layer_px_h = ((max_px_y - min_px_y).max(0.0) as u32).min(4096);
+                    if layer_px_w == 0 || layer_px_h == 0 {
+                        continue;
+                    }
+
+                    let child_origin = Point::new(min_px_x / s, min_px_y / s);
+                    let child_logical_w = (layer_px_w as Scalar) / s;
+                    let child_logical_h = (layer_px_h as Scalar) / s;
+                    let child_ortho = Matrix::make_orthographic(Size::new(
+                        layer_px_w as Scalar,
+                        layer_px_h as Scalar,
+                    )) * Matrix::make_scale(s, s, 1.0)
+                        * Matrix::make_translation(-child_origin.x, -child_origin.y, 0.0);
+
+                    let child_has_stencil = child_cmds
+                        .iter()
+                        .any(|c| matches!(c, DrawCommand::PushClip { .. }));
+                    let raw_layer_tex =
+                        self.acquire_save_layer_texture(layer_px_w, layer_px_h, TARGET_FORMAT);
+                    used_layer_textures.push(Arc::clone(&raw_layer_tex));
+
+                    let child_calls = self.prepare_pass_into_arena(
+                        arena,
+                        child_cmds,
+                        subpasses,
+                        used_layer_textures,
+                        child_ortho,
+                        layer_px_w,
+                        layer_px_h,
+                        ssaa_scale,
+                        1,
+                        TARGET_FORMAT,
+                        uniform_align,
+                        child_has_stencil,
+                        child_origin,
+                    );
+                    subpasses.push(PreparedSubpass {
+                        target_tex: Arc::clone(&raw_layer_tex),
+                        has_stencil: child_has_stencil,
+                        calls: child_calls,
+                    });
+
+                    let mut cur_tex = raw_layer_tex;
+                    let mut post_transform = Matrix::IDENTITY;
+                    if let Some(img_filter) = image_filter {
+                        cur_tex = self.prepare_image_filter_passes(
+                            arena,
+                            subpasses,
+                            used_layer_textures,
+                            cur_tex,
+                            img_filter,
+                            child_origin,
+                            s,
+                            TARGET_FORMAT,
+                            uniform_align,
+                            &mut post_transform,
+                        );
+                    }
+                    if let Some(col_filter) = color_filter {
+                        if post_transform != Matrix::IDENTITY {
+                            cur_tex = self.bake_layer_transform_subpass(
+                                arena,
+                                subpasses,
+                                used_layer_textures,
+                                cur_tex,
+                                child_origin,
+                                s,
+                                post_transform,
+                                TARGET_FORMAT,
+                                uniform_align,
+                            );
+                            post_transform = Matrix::IDENTITY;
+                        }
+                        cur_tex = self.prepare_color_filter_passes(
+                            arena,
+                            subpasses,
+                            used_layer_textures,
+                            cur_tex,
+                            col_filter,
+                            TARGET_FORMAT,
+                            uniform_align,
+                        );
+                    }
+
+                    let pipeline = self.get_or_create_pipeline_full(
+                        PipelineKind::TextureFill,
+                        *blend_mode,
+                        sample_count,
+                        format,
+                        has_stencil,
+                    );
+                    let frame_off = if post_transform == Matrix::IDENTITY {
+                        *ortho_frame_offset.get_or_insert_with(|| {
+                            let u = SolidFrameUniform { mvp: ortho.m };
+                            arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                        })
+                    } else {
+                        let mvp = ortho * post_transform;
+                        let u = SolidFrameUniform { mvp: mvp.m };
+                        arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                    };
+                    let frag_u = TextureFragUniform {
+                        alpha: alpha.clamp(0.0, 1.0),
+                        tile_mode_x: TileMode::Decal as u32,
+                        tile_mode_y: TileMode::Decal as u32,
+                        _pad: 0,
+                    };
+                    let frag_off = arena.push_uniform(bytemuck::bytes_of(&frag_u), uniform_align);
+
+                    let qx0 = child_origin.x;
+                    let qy0 = child_origin.y;
+                    let qx1 = qx0 + child_logical_w;
+                    let qy1 = qy0 + child_logical_h;
+                    let quad_verts = [
+                        UvVertex::new(qx0, qy0, 0.0, 0.0),
+                        UvVertex::new(qx1, qy0, 1.0, 0.0),
+                        UvVertex::new(qx1, qy1, 1.0, 1.0),
+                        UvVertex::new(qx0, qy1, 0.0, 1.0),
+                    ];
+                    let quad_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+                    FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+                    FrameArena::align_cpu_4(&mut arena.index_cpu);
+                    let vertex_offset = arena.vertex_cpu.len() as u64;
+                    arena
+                        .vertex_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&quad_verts));
+                    let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+                    let index_offset = arena.index_cpu.len() as u64;
+                    arena
+                        .index_cpu
+                        .extend_from_slice(bytemuck::cast_slice(&quad_indices));
+                    let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+                    calls.push(PendingArenaCall {
+                        pipeline,
+                        binding: DrawCallBinding::LayerTextureFill {
+                            layer_tex: cur_tex,
+                            linear_filter: !post_transform.is_translation_scale_only(),
+                        },
+                        glyph_alpha_opt: None,
+                        glyph_color_opt: None,
+                        dynamic_offsets: [frame_off, frag_off, 0],
+                        dynamic_offset_count: 2,
+                        vertex_offset,
+                        vertex_byte_len,
+                        vertex_count: 4,
+                        index_offset,
+                        index_byte_len,
+                        index_count: 6,
+                        scissor,
+                        stencil_ref: stencil_depth,
+                        coalesce_tag: CoalesceTag::None,
+                    });
+                }
                 DrawCommand::PushClip { .. } | DrawCommand::PopClip { .. } => {}
             }
         }
@@ -4998,6 +5948,106 @@ impl WgpuRenderer {
                     .insert(key, (Arc::clone(gpu_tex), Arc::clone(&created)));
                 created
             }
+            DrawCallBinding::LayerTextureFill {
+                layer_tex,
+                linear_filter,
+            } => {
+                let key = (Arc::as_ptr(layer_tex) as usize, *linear_filter);
+                if let Some((_, bg)) = arena.layer_texture_bgs.get(&key) {
+                    return Arc::clone(bg);
+                }
+                if arena.layer_texture_bgs.len() >= 64 {
+                    arena.layer_texture_bgs.clear();
+                }
+                let sampler = if *linear_filter {
+                    &self.linear_sampler
+                } else {
+                    &self.nearest_sampler
+                };
+                let created = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("LayerTextureFill Arena BindGroup"),
+                    layout: &self.texture_fill_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<SolidFrameUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<TextureFragUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&layer_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+                arena.last_frame_bind_groups_created += 1;
+                arena
+                    .layer_texture_bgs
+                    .insert(key, (Arc::clone(layer_tex), Arc::clone(&created)));
+                created
+            }
+            DrawCallBinding::ImageFilter {
+                src_tex,
+                linear_filter,
+            } => {
+                let key = (Arc::as_ptr(src_tex) as usize, *linear_filter);
+                if let Some((_, bg)) = arena.image_filter_bgs.get(&key) {
+                    return Arc::clone(bg);
+                }
+                if arena.image_filter_bgs.len() >= 64 {
+                    arena.image_filter_bgs.clear();
+                }
+                let sampler = if *linear_filter {
+                    &self.linear_sampler
+                } else {
+                    &self.nearest_sampler
+                };
+                let created = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ImageFilter Arena BindGroup"),
+                    layout: &self.image_filter_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<SolidFrameUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: Self::uniform_binding(
+                                uniform_gpu,
+                                std::mem::size_of::<ImageFilterFragUniform>(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&src_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+                arena.last_frame_bind_groups_created += 1;
+                arena
+                    .image_filter_bgs
+                    .insert(key, (Arc::clone(src_tex), Arc::clone(&created)));
+                created
+            }
         }
     }
 
@@ -5044,6 +6094,87 @@ impl WgpuRenderer {
         arena.last_frame_bind_groups_created += 1;
         arena.ssaa_resolve_bg = Some((scratch_id, Arc::clone(scratch), Arc::clone(&created)));
         created
+    }
+
+    fn resolve_subpasses(
+        &self,
+        arena: &mut FrameArena,
+        subpasses: Vec<PreparedSubpass>,
+    ) -> Vec<ResolvedSubpass> {
+        if subpasses.is_empty() {
+            return Vec::new();
+        }
+        let Some(uniform_gpu) = arena.uniform_gpu.as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        subpasses
+            .into_iter()
+            .map(|sub| {
+                let resolved_bgs = sub
+                    .calls
+                    .iter()
+                    .map(|c| self.resolve_call_bind_group(arena, &c.binding, &uniform_gpu))
+                    .collect();
+                ResolvedSubpass {
+                    target_tex: sub.target_tex,
+                    has_stencil: sub.has_stencil,
+                    calls: sub.calls,
+                    resolved_bgs,
+                }
+            })
+            .collect()
+    }
+
+    fn record_subpasses(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        subpasses: &[ResolvedSubpass],
+        vertex_gpu: Option<&Arc<wgpu::Buffer>>,
+        index_gpu: Option<&Arc<wgpu::Buffer>>,
+    ) {
+        for sub in subpasses {
+            let stencil_scratch = sub.has_stencil.then(|| {
+                self.get_or_create_stencil_scratch(sub.target_tex.width, sub.target_tex.height, 1)
+            });
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Impeller SaveLayer Offscreen Subpass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &sub.target_tex.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: stencil_scratch.as_ref().map(|s| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &s.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                    }
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !sub.calls.is_empty() {
+                if let (Some(vb), Some(ib)) = (vertex_gpu, index_gpu) {
+                    Self::record_arena_calls(
+                        &mut rpass,
+                        &sub.calls,
+                        &sub.resolved_bgs,
+                        vb,
+                        ib,
+                        sub.has_stencil,
+                    );
+                }
+            }
+        }
     }
 
     fn record_arena_calls<'a>(
@@ -5110,15 +6241,19 @@ impl WgpuRenderer {
             .iter()
             .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
-        let (calls, resolved_bgs, vertex_gpu, index_gpu) = {
+        let mut used_layer_textures: Vec<Arc<SaveLayerTexture>> = Vec::new();
+        let (resolved_subpasses, calls, resolved_bgs, vertex_gpu, index_gpu) = {
             let mut arena = self
                 .frame_arena
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             arena.begin_frame(self.atlas_eviction_epoch.load(Ordering::Relaxed));
+            let mut subpasses: Vec<PreparedSubpass> = Vec::new();
             let calls = self.prepare_pass_into_arena(
                 &mut arena,
                 commands,
+                &mut subpasses,
+                &mut used_layer_textures,
                 ortho,
                 target.internal_width,
                 target.internal_height,
@@ -5127,10 +6262,13 @@ impl WgpuRenderer {
                 TARGET_FORMAT,
                 uniform_align,
                 has_stencil,
+                Point::ZERO,
             );
-            arena.last_frame_draw_call_count = calls.len();
+            let subpass_draw_count: usize = subpasses.iter().map(|s| s.calls.len()).sum();
+            arena.last_frame_draw_call_count = subpass_draw_count + calls.len();
             arena.upload_cpu_buffers(&self.device, &self.queue, uniform_align);
 
+            let resolved_subpasses = self.resolve_subpasses(&mut arena, subpasses);
             let resolved_bgs: Vec<Arc<wgpu::BindGroup>> = if calls.is_empty() {
                 Vec::new()
             } else {
@@ -5141,6 +6279,7 @@ impl WgpuRenderer {
                     .collect()
             };
             (
+                resolved_subpasses,
                 calls,
                 resolved_bgs,
                 arena.vertex_gpu.clone(),
@@ -5161,6 +6300,13 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Impeller Offscreen CommandEncoder"),
             });
+
+        self.record_subpasses(
+            &mut encoder,
+            &resolved_subpasses,
+            vertex_gpu.as_ref(),
+            index_gpu.as_ref(),
+        );
 
         let pm_clear = clear_color.premultiply();
         let (attachment_view, resolve_target, store_op) = match &target.msaa_view {
@@ -5215,6 +6361,7 @@ impl WgpuRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.release_save_layer_textures(used_layer_textures);
         Ok(())
     }
 
@@ -5317,7 +6464,9 @@ impl WgpuRenderer {
             .iter()
             .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
+        let mut used_layer_textures: Vec<Arc<SaveLayerTexture>> = Vec::new();
         let (
+            resolved_subpasses,
             calls,
             resolved_bgs,
             resolve_bg,
@@ -5332,9 +6481,12 @@ impl WgpuRenderer {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             arena.begin_frame(self.atlas_eviction_epoch.load(Ordering::Relaxed));
+            let mut subpasses: Vec<PreparedSubpass> = Vec::new();
             let calls = self.prepare_pass_into_arena(
                 &mut arena,
                 commands,
+                &mut subpasses,
+                &mut used_layer_textures,
                 pass1_ortho,
                 ssaa_w,
                 ssaa_h,
@@ -5343,8 +6495,10 @@ impl WgpuRenderer {
                 TARGET_FORMAT,
                 uniform_align,
                 has_stencil,
+                Point::ZERO,
             );
-            arena.last_frame_draw_call_count = calls.len() + 1;
+            let subpass_draw_count: usize = subpasses.iter().map(|s| s.calls.len()).sum();
+            arena.last_frame_draw_call_count = subpass_draw_count + calls.len() + 1;
 
             let resolve_frame_off =
                 arena.push_uniform(bytemuck::bytes_of(&resolve_frame), uniform_align);
@@ -5367,6 +6521,7 @@ impl WgpuRenderer {
 
             arena.upload_cpu_buffers(&self.device, &self.queue, uniform_align);
 
+            let resolved_subpasses = self.resolve_subpasses(&mut arena, subpasses);
             let uniform_gpu = Arc::clone(arena.uniform_gpu.as_ref().expect("uniform_gpu"));
             let resolved_bgs: Vec<Arc<wgpu::BindGroup>> = calls
                 .iter()
@@ -5375,6 +6530,7 @@ impl WgpuRenderer {
             let resolve_bg = self.resolve_ssaa_bind_group(&mut arena, &scratch, &uniform_gpu);
 
             (
+                resolved_subpasses,
                 calls,
                 resolved_bgs,
                 resolve_bg,
@@ -5394,6 +6550,13 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Impeller Surface SSAA CommandEncoder"),
             });
+
+        self.record_subpasses(
+            &mut encoder,
+            &resolved_subpasses,
+            Some(&vertex_gpu),
+            Some(&index_gpu),
+        );
 
         let pm_clear = clear_color.premultiply();
         {
@@ -5465,6 +6628,7 @@ impl WgpuRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.release_save_layer_textures(used_layer_textures);
         Ok(())
     }
 
@@ -5505,15 +6669,19 @@ impl WgpuRenderer {
             .iter()
             .any(|c| matches!(c, DrawCommand::PushClip { .. }));
 
-        let (calls, resolved_bgs, vertex_gpu, index_gpu) = {
+        let mut used_layer_textures: Vec<Arc<SaveLayerTexture>> = Vec::new();
+        let (resolved_subpasses, calls, resolved_bgs, vertex_gpu, index_gpu) = {
             let mut arena = self
                 .frame_arena
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             arena.begin_frame(self.atlas_eviction_epoch.load(Ordering::Relaxed));
+            let mut subpasses: Vec<PreparedSubpass> = Vec::new();
             let calls = self.prepare_pass_into_arena(
                 &mut arena,
                 commands,
+                &mut subpasses,
+                &mut used_layer_textures,
                 ortho,
                 w,
                 h,
@@ -5522,10 +6690,13 @@ impl WgpuRenderer {
                 format,
                 uniform_align,
                 has_stencil,
+                Point::ZERO,
             );
-            arena.last_frame_draw_call_count = calls.len();
+            let subpass_draw_count: usize = subpasses.iter().map(|s| s.calls.len()).sum();
+            arena.last_frame_draw_call_count = subpass_draw_count + calls.len();
             arena.upload_cpu_buffers(&self.device, &self.queue, uniform_align);
 
+            let resolved_subpasses = self.resolve_subpasses(&mut arena, subpasses);
             let resolved_bgs: Vec<Arc<wgpu::BindGroup>> = if calls.is_empty() {
                 Vec::new()
             } else {
@@ -5536,6 +6707,7 @@ impl WgpuRenderer {
                     .collect()
             };
             (
+                resolved_subpasses,
                 calls,
                 resolved_bgs,
                 arena.vertex_gpu.clone(),
@@ -5551,6 +6723,13 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Impeller Surface CommandEncoder"),
             });
+
+        self.record_subpasses(
+            &mut encoder,
+            &resolved_subpasses,
+            vertex_gpu.as_ref(),
+            index_gpu.as_ref(),
+        );
 
         let pm_clear = clear_color.premultiply();
         let (attachment_view, resolve_target, store_op) = match msaa_view {
@@ -5605,6 +6784,7 @@ impl WgpuRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.release_save_layer_textures(used_layer_textures);
         Ok(())
     }
 
@@ -8198,5 +9378,210 @@ mod tests {
         );
         // At outer edge +X (36 + 24 = 60, 32) -> t = 1.0 -> BLUE
         assert_pixel_approx(pixel_at(&rgba_conical, 64, 60, 32), [0, 0, 255, 255], 8);
+    }
+
+    /// C++ source: entity_unittests.cc:SubpassSaveLayerGroupOpacity
+    #[test]
+    fn test_save_layer_group_opacity_and_pool_reuse() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let rect1 = DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(10.0, 10.0, 25.0, 25.0)),
+            transform: Matrix::IDENTITY,
+            color: Color::WHITE,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let rect2 = DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(20.0, 20.0, 25.0, 25.0)),
+            transform: Matrix::IDENTITY,
+            color: Color::WHITE,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let save_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(10.0, 10.0, 35.0, 35.0),
+            commands: vec![rect1, rect2],
+            alpha: 0.5,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: None,
+            image_filter: None,
+            clip_rect: None,
+        };
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::BLACK, std::slice::from_ref(&save_layer))
+            .expect("savelayer group opacity render");
+        // Non-overlapping region (15, 15) and overlapping region (25, 25) must both be ~128 gray,
+        // NOT ~191 (0.75) from naive per-command opacity double-blending.
+        assert_pixel_approx(pixel_at(&rgba, 64, 15, 15), [128, 128, 128, 255], 3);
+        assert_pixel_approx(pixel_at(&rgba, 64, 25, 25), [128, 128, 128, 255], 3);
+        assert_pixel_approx(pixel_at(&rgba, 64, 40, 40), [128, 128, 128, 255], 3);
+        assert_pixel_approx(pixel_at(&rgba, 64, 5, 5), [0, 0, 0, 255], 1);
+
+        let pooled_after_first = ctx.pooled_save_layer_texture_count();
+        assert_eq!(pooled_after_first, 1);
+
+        // Render a second frame with identical SaveLayer dimensions and verify zero new allocations.
+        let _ = target
+            .render_and_readback(&ctx, Color::BLACK, &[save_layer])
+            .expect("savelayer second frame render");
+        assert_eq!(ctx.pooled_save_layer_texture_count(), pooled_after_first);
+    }
+
+    /// C++ source: entity_unittests.cc:GaussianBlurFilterContents
+    #[test]
+    fn test_save_layer_gaussian_blur_image_filter() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let inner_rect = DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(24.0, 24.0, 16.0, 16.0)),
+            transform: Matrix::IDENTITY,
+            color: Color::WHITE,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        let blur_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(24.0, 24.0, 16.0, 16.0),
+            commands: vec![inner_rect],
+            alpha: 1.0,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: None,
+            image_filter: Some(LayerImageFilter::Blur {
+                sigma_x: 4.0,
+                sigma_y: 4.0,
+                tile_mode: TileMode::Decal,
+            }),
+            clip_rect: None,
+        };
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::BLACK, &[blur_layer])
+            .expect("savelayer gaussian blur render");
+        let center = pixel_at(&rgba, 64, 32, 32);
+        let edge = pixel_at(&rgba, 64, 24, 32);
+        let halo = pixel_at(&rgba, 64, 20, 32);
+        let far = pixel_at(&rgba, 64, 2, 2);
+
+        assert!(
+            center[0] > 180,
+            "blur center should remain bright, got {center:?}"
+        );
+        assert!(
+            edge[0] > 60 && edge[0] < center[0],
+            "blur edge should be softer than center, got edge={edge:?} center={center:?}"
+        );
+        assert!(
+            halo[0] > 15 && halo[0] < edge[0],
+            "blur halo outside original bounds should receive diffused light, got halo={halo:?}"
+        );
+        assert_pixel_approx(far, [0, 0, 0, 255], 2);
+    }
+
+    /// C++ source: entity_unittests.cc:MorphologyFilterContents
+    #[test]
+    fn test_save_layer_morphology_dilate_and_erode() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let base_rect = DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(26.0, 26.0, 12.0, 12.0)),
+            transform: Matrix::IDENTITY,
+            color: Color::WHITE,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+
+        // 1. Dilate by 4px: [26..38] expands to [22..42]
+        let dilate_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(26.0, 26.0, 12.0, 12.0),
+            commands: vec![base_rect.clone()],
+            alpha: 1.0,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: None,
+            image_filter: Some(LayerImageFilter::Dilate {
+                radius_x: 4.0,
+                radius_y: 4.0,
+            }),
+            clip_rect: None,
+        };
+        let rgba_dilate = target
+            .render_and_readback(&ctx, Color::BLACK, &[dilate_layer])
+            .expect("savelayer dilate render");
+        assert_pixel_approx(pixel_at(&rgba_dilate, 64, 23, 32), [255, 255, 255, 255], 2);
+        assert_pixel_approx(pixel_at(&rgba_dilate, 64, 18, 32), [0, 0, 0, 255], 2);
+
+        // 2. Erode by 3px: [26..38] shrinks to [29..35]
+        let erode_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(26.0, 26.0, 12.0, 12.0),
+            commands: vec![base_rect],
+            alpha: 1.0,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: None,
+            image_filter: Some(LayerImageFilter::Erode {
+                radius_x: 3.0,
+                radius_y: 3.0,
+            }),
+            clip_rect: None,
+        };
+        let rgba_erode = target
+            .render_and_readback(&ctx, Color::BLACK, &[erode_layer])
+            .expect("savelayer erode render");
+        assert_pixel_approx(pixel_at(&rgba_erode, 64, 27, 32), [0, 0, 0, 255], 2);
+        assert_pixel_approx(pixel_at(&rgba_erode, 64, 32, 32), [255, 255, 255, 255], 2);
+    }
+
+    /// C++ source: entity_unittests.cc:ColorMatrixFilterContents
+    #[test]
+    fn test_save_layer_color_filter_matrix_and_mode() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 64, 64, 1);
+
+        let red_rect = DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(16.0, 16.0, 32.0, 32.0)),
+            transform: Matrix::IDENTITY,
+            color: Color::RED,
+            blend_mode: BlendMode::SrcOver,
+            clip_rect: None,
+        };
+        // Swap R and G channels: R' = G, G' = R, B' = B, A' = A
+        let swap_rg_matrix: [Scalar; 20] = [
+            0.0, 1.0, 0.0, 0.0, 0.0, // R'
+            1.0, 0.0, 0.0, 0.0, 0.0, // G'
+            0.0, 0.0, 1.0, 0.0, 0.0, // B'
+            0.0, 0.0, 0.0, 1.0, 0.0, // A'
+        ];
+        let matrix_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(16.0, 16.0, 32.0, 32.0),
+            commands: vec![red_rect.clone()],
+            alpha: 1.0,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: Some(LayerColorFilter::Matrix(swap_rg_matrix)),
+            image_filter: None,
+            clip_rect: None,
+        };
+        let rgba_matrix = target
+            .render_and_readback(&ctx, Color::BLACK, &[matrix_layer])
+            .expect("savelayer color matrix render");
+        assert_pixel_approx(pixel_at(&rgba_matrix, 64, 32, 32), [0, 255, 0, 255], 2);
+        assert_pixel_approx(pixel_at(&rgba_matrix, 64, 8, 8), [0, 0, 0, 255], 1);
+
+        // Mode filter: tint opaque red rect with Color::BLUE using BlendMode::SrcIn -> BLUE inside, transparent outside
+        let mode_layer = DrawCommand::SaveLayer {
+            bounds: Rect::from_xywh(16.0, 16.0, 32.0, 32.0),
+            commands: vec![red_rect],
+            alpha: 1.0,
+            blend_mode: BlendMode::SrcOver,
+            color_filter: Some(LayerColorFilter::Mode(Color::BLUE, BlendMode::SrcIn)),
+            image_filter: None,
+            clip_rect: None,
+        };
+        let rgba_mode = target
+            .render_and_readback(&ctx, Color::BLACK, &[mode_layer])
+            .expect("savelayer color mode render");
+        assert_pixel_approx(pixel_at(&rgba_mode, 64, 32, 32), [0, 0, 255, 255], 2);
+        assert_pixel_approx(pixel_at(&rgba_mode, 64, 8, 8), [0, 0, 0, 255], 1);
     }
 }

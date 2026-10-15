@@ -647,6 +647,19 @@ fn invoke_surface_callback_now(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn commands_need_atlas_sync(commands: &[impeller_wgpu::DrawCommand]) -> bool {
+    commands.iter().any(|cmd| match cmd {
+        impeller_wgpu::DrawCommand::GlyphAtlas(b) => {
+            b.alpha_atlas.is_none() && b.color_atlas.is_none() && !b.quads.is_empty()
+        }
+        impeller_wgpu::DrawCommand::SaveLayer { commands: sub, .. } => {
+            commands_need_atlas_sync(sub)
+        }
+        _ => false,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 fn render_pictures_now(surface_handle: u32, pic_handles: &[u32]) -> JsValue {
     let start_ms = now_milliseconds();
     let trace_perf = trace_performance();
@@ -697,16 +710,7 @@ fn render_pictures_now(surface_handle: u32, pic_handles: &[u32]) -> JsValue {
                     let t_replay_start = now_milliseconds();
                     surf.canvas.reset(w, h, Color::TRANSPARENT);
                     surf.canvas.draw_display_list(dl);
-                    let needs_atlas_sync = surf.canvas.commands().iter().any(|cmd| {
-                        matches!(
-                            cmd,
-                            impeller_wgpu::DrawCommand::GlyphAtlas(b)
-                                if b.alpha_atlas.is_none()
-                                    && b.color_atlas.is_none()
-                                    && !b.quads.is_empty()
-                        )
-                    });
-                    if needs_atlas_sync {
+                    if commands_need_atlas_sync(surf.canvas.commands()) {
                         surf.canvas
                             .sync_glyph_atlases_with_arcs(&alpha_arc, &color_arc);
                     }
@@ -2918,10 +2922,7 @@ pub unsafe extern "C" fn canvas_saveLayer(
             }
         }
         if let Some(c) = st.canvases.get_mut(&canvas_handle) {
-            c.canvas.save();
-            if let Some(b) = bounds {
-                c.canvas.clip_rect_with_op(b, ClipOperation::Intersect);
-            }
+            c.canvas.save_layer(bounds, paint.as_ref());
             c.dl_builder.save_layer(bounds, paint);
         }
     });
@@ -5674,6 +5675,84 @@ mod tests {
             path_dispose(p_diff);
             path_dispose(p_b);
             path_dispose(p_a);
+        }
+    }
+
+    /// C++ source: dl_op_spy_unittests.cc:CanvasSaveLayerAndImageColorFilterFFI
+    #[test]
+    fn test_phase12b_ffi_save_layer_and_image_color_filters() {
+        unsafe {
+            let rec = pictureRecorder_create();
+            let cull_rect = [0.0f32, 0.0, 200.0, 200.0];
+            let canvas = pictureRecorder_beginRecording(rec, cull_rect.as_ptr());
+
+            // 1. Multi-child saveLayer with blur image filter + color filter:
+            let blur_if = imageFilter_createBlur(4.0, 4.0, 3);
+            let mode_cf = colorFilter_createMode(0xFF00FF00u32 as i32, 5); // SrcIn green
+            let layer_paint = paint_create(1, 3, 0x80FFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            paint_setImageFilter(layer_paint, blur_if);
+            paint_setColorFilter(layer_paint, mode_cf);
+
+            let layer_bounds = [20.0f32, 20.0, 120.0, 120.0];
+            canvas_saveLayer(canvas, layer_bounds.as_ptr(), layer_paint, 0);
+
+            let child_paint = paint_create(1, 3, 0xFFFF0000u32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            let r1 = [30.0f32, 30.0, 80.0, 80.0];
+            let r2 = [60.0f32, 50.0, 110.0, 100.0];
+            canvas_drawRect(canvas, r1.as_ptr(), child_paint);
+            canvas_drawRect(canvas, r2.as_ptr(), child_paint);
+            canvas_restore(canvas);
+
+            // 2. Standalone drawRect with paint imageFilter:
+            let standalone_paint = paint_create(1, 3, 0xFFFFFFFFu32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            paint_setImageFilter(standalone_paint, blur_if);
+            let r3 = [130.0f32, 30.0, 180.0, 80.0];
+            canvas_drawRect(canvas, r3.as_ptr(), standalone_paint);
+
+            let pic = pictureRecorder_endRecording(rec);
+            let (save_layer_cmds, blur_layers, cf_layers) = with_state(|st| {
+                let dl = &st.pictures.get(&pic).unwrap().display_list;
+                let mut target = Canvas::new(200, 200, Color::TRANSPARENT);
+                target.draw_display_list(dl);
+                let mut sl = 0;
+                let mut bl = 0;
+                let mut cf = 0;
+                for cmd in target.commands() {
+                    if let impeller_wgpu::DrawCommand::SaveLayer {
+                        image_filter,
+                        color_filter,
+                        ..
+                    } = cmd
+                    {
+                        sl += 1;
+                        if matches!(
+                            image_filter,
+                            Some(impeller_wgpu::LayerImageFilter::Blur { .. })
+                        ) {
+                            bl += 1;
+                        }
+                        if matches!(
+                            color_filter,
+                            Some(impeller_wgpu::LayerColorFilter::Mode { .. })
+                        ) {
+                            cf += 1;
+                        }
+                    }
+                }
+                (sl, bl, cf)
+            });
+
+            assert_eq!(save_layer_cmds, 2);
+            assert_eq!(blur_layers, 2);
+            assert_eq!(cf_layers, 1);
+
+            paint_dispose(standalone_paint);
+            paint_dispose(child_paint);
+            paint_dispose(layer_paint);
+            colorFilter_dispose(mode_cf);
+            imageFilter_dispose(blur_if);
+            picture_dispose(pic);
+            pictureRecorder_dispose(rec);
         }
     }
 }
