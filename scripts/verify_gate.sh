@@ -14,7 +14,7 @@ check_crate_hygiene() {
 
   echo "=== Checking hygiene, C++ provenance, & wasm32 compile for $crate_name (min $min_tests C++ tests) ==="
 
-  if [[ "$crate_name" != "impeller_skwasm_ffi" ]]; then
+  if [[ "$crate_name" != "impeller_skwasm_ffi" && "$crate_name" != "impeller_interop_c" ]]; then
     if ! grep -q '#!\[forbid(unsafe_code)\]' "$crate_dir/src/lib.rs"; then
       echo "FAIL [$crate_name]: Missing #![forbid(unsafe_code)] in src/lib.rs"
       exit 1
@@ -57,6 +57,7 @@ case "$CRATE" in
   impeller_canvas)      check_crate_hygiene impeller_canvas 22 ;;
   impeller_web)         check_crate_hygiene impeller_web 2 ;;
   impeller_skwasm_ffi)  check_crate_hygiene impeller_skwasm_ffi 10 ;;
+  impeller_interop_c)   check_crate_hygiene impeller_interop_c 12 ;;
   all)
     check_crate_hygiene impeller_geometry 40
     check_crate_hygiene impeller_path 25
@@ -67,11 +68,12 @@ case "$CRATE" in
     check_crate_hygiene impeller_canvas 22
     check_crate_hygiene impeller_web 2
     check_crate_hygiene impeller_skwasm_ffi 10
+    check_crate_hygiene impeller_interop_c 12
     CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked -p impeller_canvas --test golden_parity
     CARGO_TARGET_DIR="$TARGET_DIR" cargo run --locked -p impeller_canvas --bin showcase -- "$REPO_ROOT/showcase.png"
     ;;
   *)
-    echo "Usage: $0 [impeller_geometry|impeller_path|impeller_core|impeller_tessellator|impeller_typographer|impeller_wgpu|impeller_canvas|impeller_web|impeller_skwasm_ffi|all]"
+    echo "Usage: $0 [impeller_geometry|impeller_path|impeller_core|impeller_tessellator|impeller_typographer|impeller_wgpu|impeller_canvas|impeller_web|impeller_skwasm_ffi|impeller_interop_c|all]"
     exit 1
     ;;
 esac

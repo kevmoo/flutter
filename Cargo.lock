@@ -575,6 +575,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "impeller_interop_c"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "impeller_canvas",
+ "impeller_core",
+ "impeller_geometry",
+ "impeller_path",
+ "impeller_tessellator",
+ "impeller_typographer",
+ "impeller_wgpu",
+]
+
+[[package]]
 name = "impeller_path"
 version = "0.1.0"
 dependencies = [

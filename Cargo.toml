@@ -10,6 +10,7 @@ members = [
     "crates/impeller_canvas",
     "crates/impeller_web",
     "crates/impeller_skwasm_ffi",
+    "crates/impeller_interop_c",
 ]
 
 [workspace.package]
@@ -51,6 +52,7 @@ impeller_wgpu = { path = "crates/impeller_wgpu" }
 impeller_canvas = { path = "crates/impeller_canvas" }
 impeller_web = { path = "crates/impeller_web" }
 impeller_skwasm_ffi = { path = "crates/impeller_skwasm_ffi" }
+impeller_interop_c = { path = "crates/impeller_interop_c" }
 
 [profile.release]
 lto = true
