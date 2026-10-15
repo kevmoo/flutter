@@ -4700,6 +4700,42 @@ impl WgpuRenderer {
         }
     }
 
+    fn compute_programmable_blend_scissor(
+        cmd: &DrawCommand,
+        internal_width: u32,
+        internal_height: u32,
+        ssaa_scale: u32,
+        layer_origin: Point,
+    ) -> Option<[u32; 4]> {
+        let clip_sc = Self::compute_scissor_rect(
+            cmd.clip_rect(),
+            internal_width,
+            internal_height,
+            ssaa_scale,
+            layer_origin,
+        )?;
+        let info = inspect_command_for_clustering(cmd);
+        let sc = if let Some(dev_bounds) = info.dev_bounds {
+            let bounds_sc = Self::compute_scissor_rect(
+                Some(dev_bounds),
+                internal_width,
+                internal_height,
+                ssaa_scale,
+                layer_origin,
+            )?;
+            Self::intersect_scissors(clip_sc, bounds_sc)?
+        } else {
+            clip_sc
+        };
+        let rw = sc[2].min(4096);
+        let rh = sc[3].min(4096);
+        if rw == 0 || rh == 0 {
+            None
+        } else {
+            Some([sc[0], sc[1], rw, rh])
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_pass_into_arena(
         &self,
@@ -4724,7 +4760,8 @@ impl WgpuRenderer {
         let mut white_frag_offset: Option<u32> = None;
         let mut stencil_depth: u32 = 0;
 
-        for cmd in clustered {
+        let mut clustered_iter = clustered.into_iter().peekable();
+        while let Some(cmd) = clustered_iter.next() {
             let scissor_opt = Self::compute_scissor_rect(
                 cmd.clip_rect(),
                 internal_width,
@@ -5276,38 +5313,67 @@ impl WgpuRenderer {
             }
 
             if blend_mode_requires_framebuffer_readback(cmd.blend_mode()) {
-                let info = inspect_command_for_clustering(cmd);
-                let cmd_scissor = if let Some(dev_bounds) = info.dev_bounds {
-                    let Some(bounds_sc) = Self::compute_scissor_rect(
-                        Some(dev_bounds),
+                let Some(first_sc) = Self::compute_programmable_blend_scissor(
+                    cmd,
+                    internal_width,
+                    internal_height,
+                    ssaa_scale,
+                    layer_origin,
+                ) else {
+                    continue;
+                };
+
+                let mut batch_items: Vec<(&DrawCommand, [u32; 4])> = vec![(cmd, first_sc)];
+                let mut union_sc = first_sc;
+
+                while batch_items.len() < 512 {
+                    let Some(&next_cmd) = clustered_iter.peek() else {
+                        break;
+                    };
+                    if matches!(
+                        next_cmd,
+                        DrawCommand::PushClip { .. }
+                            | DrawCommand::PopClip { .. }
+                            | DrawCommand::SaveLayer { .. }
+                    ) || !blend_mode_requires_framebuffer_readback(next_cmd.blend_mode())
+                    {
+                        break;
+                    }
+                    let Some(next_sc) = Self::compute_programmable_blend_scissor(
+                        next_cmd,
                         internal_width,
                         internal_height,
                         ssaa_scale,
                         layer_origin,
                     ) else {
-                        continue;
+                        break;
                     };
-                    let Some(sc) = Self::intersect_scissors(scissor, bounds_sc) else {
-                        continue;
-                    };
-                    sc
-                } else {
-                    scissor
-                };
-                let [reg_x, reg_y, reg_w_raw, reg_h_raw] = cmd_scissor;
-                let reg_w = reg_w_raw.min(4096);
-                let reg_h = reg_h_raw.min(4096);
-                if reg_w == 0 || reg_h == 0 {
-                    continue;
+                    if batch_items
+                        .iter()
+                        .any(|(_, prev_sc)| Self::intersect_scissors(*prev_sc, next_sc).is_some())
+                    {
+                        break;
+                    }
+                    let ux0 = union_sc[0].min(next_sc[0]);
+                    let uy0 = union_sc[1].min(next_sc[1]);
+                    let ux1 = (union_sc[0] + union_sc[2]).max(next_sc[0] + next_sc[2]);
+                    let uy1 = (union_sc[1] + union_sc[3]).max(next_sc[1] + next_sc[3]);
+                    let uw = ux1 - ux0;
+                    let uh = uy1 - uy0;
+                    if uw > 4096 || uh > 4096 {
+                        break;
+                    }
+                    clustered_iter.next();
+                    union_sc = [ux0, uy0, uw, uh];
+                    batch_items.push((next_cmd, next_sc));
                 }
 
+                let [reg_x, reg_y, reg_w, reg_h] = union_sc;
                 let s = ssaa_scale.max(1) as Scalar;
                 let reg_origin = Point::new(
                     layer_origin.x + (reg_x as Scalar) / s,
                     layer_origin.y + (reg_y as Scalar) / s,
                 );
-                let reg_logical_w = (reg_w as Scalar) / s;
-                let reg_logical_h = (reg_h as Scalar) / s;
                 let reg_ortho =
                     Matrix::make_orthographic(Size::new(reg_w as Scalar, reg_h as Scalar))
                         * Matrix::make_scale(s, s, 1.0)
@@ -5318,13 +5384,22 @@ impl WgpuRenderer {
                 used_layer_textures.push(Arc::clone(&src_tex));
                 used_layer_textures.push(Arc::clone(&dst_snapshot));
 
-                let single_cmd = [cmd
-                    .clone()
-                    .with_blend_mode(BlendMode::SrcOver)
-                    .with_clip_rect(None)];
+                let is_single = batch_items.len() == 1;
+                let src_cmds: Vec<DrawCommand> = batch_items
+                    .iter()
+                    .map(|(b_cmd, _)| {
+                        let c = (*b_cmd).clone().with_blend_mode(BlendMode::SrcOver);
+                        if is_single {
+                            c.with_clip_rect(None)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+
                 let src_pass = self.prepare_pass_into_arena(
                     arena,
-                    &single_cmd,
+                    &src_cmds,
                     used_layer_textures,
                     reg_ortho,
                     reg_w,
@@ -5342,33 +5417,126 @@ impl WgpuRenderer {
                     pass: src_pass,
                 };
 
-                let reg_quad_rect =
-                    Rect::from_xywh(reg_origin.x, reg_origin.y, reg_logical_w, reg_logical_h);
-                let composite_call = self.build_blend_advanced_call(
-                    arena,
-                    ortho,
-                    Matrix::IDENTITY,
-                    &mut ortho_frame_offset,
-                    src_tex,
-                    Arc::clone(&dst_snapshot),
-                    reg_quad_rect,
-                    [
-                        (reg_x as f32) / (internal_width as f32),
-                        (reg_y as f32) / (internal_height as f32),
-                    ],
-                    [
-                        (internal_width as f32) / (reg_w as f32),
-                        (internal_height as f32) / (reg_h as f32),
-                    ],
-                    1.0,
-                    cmd.blend_mode(),
-                    [reg_x, reg_y, reg_w, reg_h],
-                    stencil_depth,
+                let dst_uv_offset = [
+                    (reg_x as f32) / (internal_width as f32),
+                    (reg_y as f32) / (internal_height as f32),
+                ];
+                let dst_uv_scale = [
+                    (internal_width as f32) / (reg_w as f32),
+                    (internal_height as f32) / (reg_h as f32),
+                ];
+                let pipeline = self.get_or_create_pipeline_full(
+                    PipelineKind::BlendAdvanced,
+                    BlendMode::Src,
                     sample_count,
                     format,
-                    uniform_align,
                     has_stencil,
                 );
+                let frame_off = *ortho_frame_offset.get_or_insert_with(|| {
+                    let u = SolidFrameUniform { mvp: ortho.m };
+                    arena.push_uniform(bytemuck::bytes_of(&u), uniform_align)
+                });
+
+                let mut composite_calls = Vec::new();
+                let mut run_start = 0usize;
+                while run_start < batch_items.len() {
+                    let run_bm = batch_items[run_start].0.blend_mode();
+                    let mut run_end = run_start + 1;
+                    let mut run_sc = batch_items[run_start].1;
+                    while run_end < batch_items.len()
+                        && batch_items[run_end].0.blend_mode() == run_bm
+                    {
+                        let nsc = batch_items[run_end].1;
+                        let rx0 = run_sc[0].min(nsc[0]);
+                        let ry0 = run_sc[1].min(nsc[1]);
+                        let rx1 = (run_sc[0] + run_sc[2]).max(nsc[0] + nsc[2]);
+                        let ry1 = (run_sc[1] + run_sc[3]).max(nsc[1] + nsc[3]);
+                        run_sc = [rx0, ry0, rx1 - rx0, ry1 - ry0];
+                        run_end += 1;
+                    }
+
+                    let frag_u = BlendAdvancedFragUniform {
+                        dst_uv_offset,
+                        dst_uv_scale,
+                        alpha: 1.0,
+                        blend_mode: run_bm as u32,
+                        tile_mode_x: TileMode::Decal as u32,
+                        tile_mode_y: TileMode::Decal as u32,
+                    };
+                    let frag_off = arena.push_uniform(bytemuck::bytes_of(&frag_u), uniform_align);
+
+                    FrameArena::align_cpu_4(&mut arena.vertex_cpu);
+                    FrameArena::align_cpu_4(&mut arena.index_cpu);
+                    let vertex_offset = arena.vertex_cpu.len() as u64;
+                    let index_offset = arena.index_cpu.len() as u64;
+                    let quad_count = run_end - run_start;
+                    arena
+                        .vertex_cpu
+                        .reserve(quad_count * 4 * std::mem::size_of::<UvVertex>());
+                    arena
+                        .index_cpu
+                        .reserve(quad_count * 6 * std::mem::size_of::<u32>());
+
+                    let inv_reg_w = 1.0 / (reg_w as Scalar);
+                    let inv_reg_h = 1.0 / (reg_h as Scalar);
+                    let mut base_v = 0u32;
+                    for &(_, [bx, by, bw, bh]) in &batch_items[run_start..run_end] {
+                        let qx0 = layer_origin.x + (bx as Scalar) / s;
+                        let qy0 = layer_origin.y + (by as Scalar) / s;
+                        let qx1 = layer_origin.x + ((bx + bw) as Scalar) / s;
+                        let qy1 = layer_origin.y + ((by + bh) as Scalar) / s;
+                        let u0 = ((bx - reg_x) as Scalar) * inv_reg_w;
+                        let v0 = ((by - reg_y) as Scalar) * inv_reg_h;
+                        let u1 = ((bx + bw - reg_x) as Scalar) * inv_reg_w;
+                        let v1 = ((by + bh - reg_y) as Scalar) * inv_reg_h;
+                        let verts = [
+                            UvVertex::new(qx0, qy0, u0, v0),
+                            UvVertex::new(qx1, qy0, u1, v0),
+                            UvVertex::new(qx1, qy1, u1, v1),
+                            UvVertex::new(qx0, qy1, u0, v1),
+                        ];
+                        let idxs = [
+                            base_v,
+                            base_v + 1,
+                            base_v + 2,
+                            base_v,
+                            base_v + 2,
+                            base_v + 3,
+                        ];
+                        arena
+                            .vertex_cpu
+                            .extend_from_slice(bytemuck::cast_slice(&verts));
+                        arena
+                            .index_cpu
+                            .extend_from_slice(bytemuck::cast_slice(&idxs));
+                        base_v += 4;
+                    }
+                    let vertex_byte_len = (arena.vertex_cpu.len() as u64) - vertex_offset;
+                    let index_byte_len = (arena.index_cpu.len() as u64) - index_offset;
+
+                    composite_calls.push(PendingArenaCall {
+                        pipeline: pipeline.clone(),
+                        binding: DrawCallBinding::BlendAdvanced {
+                            src_tex: Arc::clone(&src_tex),
+                            dst_tex: Arc::clone(&dst_snapshot),
+                            linear_filter: false,
+                        },
+                        glyph_alpha_opt: None,
+                        glyph_color_opt: None,
+                        dynamic_offsets: [frame_off, frag_off, 0],
+                        dynamic_offset_count: 2,
+                        vertex_offset,
+                        vertex_byte_len,
+                        vertex_count: (quad_count * 4) as u32,
+                        index_offset,
+                        index_byte_len,
+                        index_count: (quad_count * 6) as u32,
+                        scissor: run_sc,
+                        stencil_ref: stencil_depth,
+                        coalesce_tag: CoalesceTag::None,
+                    });
+                    run_start = run_end;
+                }
 
                 barriers.push((
                     PassBarrier {
@@ -5376,7 +5544,7 @@ impl WgpuRenderer {
                         snapshot_tex: dst_snapshot,
                         subpasses: vec![src_subpass],
                     },
-                    vec![composite_call],
+                    composite_calls,
                 ));
                 continue;
             }
@@ -10739,5 +10907,79 @@ mod tests {
             clipped_seam[0] > 70 && clipped_seam[2] > 70,
             "inside stencil clip must be blurred purple, got {clipped_seam:?}"
         );
+    }
+
+    /// C++ source: aiks_dl_blend_unittests.cc:DisjointProgrammableBlendBatching
+    #[test]
+    fn test_disjoint_programmable_blend_batching_reduces_barriers_and_preserves_pixels() {
+        let ctx = WgpuContext::new_headless().expect("headless wgpu context");
+        let target = OffscreenTarget::new_with_sample_count(&ctx, 128, 64, 1);
+
+        let dst_color = Color::new(0.75, 0.35, 0.25, 0.90);
+        let src_colors = [
+            Color::new(0.20, 0.80, 0.45, 0.85),
+            Color::new(0.85, 0.25, 0.70, 0.80),
+            Color::new(0.30, 0.55, 0.90, 0.95),
+            Color::new(0.90, 0.75, 0.15, 0.75),
+        ];
+        let modes = [
+            BlendMode::Overlay,
+            BlendMode::Overlay,
+            BlendMode::ColorDodge,
+            BlendMode::Luminosity,
+        ];
+
+        let mut cmds = vec![DrawCommand::SolidFill {
+            mesh: make_rect_mesh(Rect::from_xywh(0.0, 0.0, 128.0, 64.0)),
+            transform: Matrix::IDENTITY,
+            color: dst_color,
+            blend_mode: BlendMode::Src,
+            clip_rect: None,
+        }];
+        for i in 0..4 {
+            let x = (8 + i * 28) as f32;
+            cmds.push(DrawCommand::SolidFill {
+                mesh: make_rect_mesh(Rect::from_xywh(x, 12.0, 20.0, 40.0)),
+                transform: Matrix::IDENTITY,
+                color: src_colors[i],
+                blend_mode: modes[i],
+                clip_rect: None,
+            });
+        }
+
+        let rgba = target
+            .render_and_readback(&ctx, Color::TRANSPARENT, &cmds)
+            .expect("disjoint programmable blend batch render");
+
+        // All 4 disjoint programmable-blend rects must coalesce into a single PassBarrier (2 textures: src + dst).
+        assert!(
+            ctx.pooled_save_layer_texture_count() <= 2,
+            "expected at most 2 pooled textures from 1 batched barrier, got {}",
+            ctx.pooled_save_layer_texture_count()
+        );
+
+        let to_pm_u8 = |c: Color| -> [u8; 4] {
+            let pm = c.premultiply();
+            [
+                (pm.red.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (pm.green.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (pm.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (pm.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]
+        };
+
+        let unblended = to_pm_u8(dst_color);
+        assert_pixel_approx(pixel_at(&rgba, 128, 2, 2), unblended, 2);
+
+        for i in 0..4 {
+            let cx = (8 + i * 28 + 10) as u32;
+            let expected = to_pm_u8(dst_color.blend(src_colors[i], modes[i]));
+            assert_pixel_approx(pixel_at(&rgba, 128, cx, 32), expected, 2);
+            // Gap between disjoint rects must remain unblended dst_color!
+            let gap_x = (8 + i * 28 + 24) as u32;
+            if gap_x < 128 {
+                assert_pixel_approx(pixel_at(&rgba, 128, gap_x, 32), unblended, 2);
+            }
+        }
     }
 }

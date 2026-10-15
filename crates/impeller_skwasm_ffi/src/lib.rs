@@ -406,6 +406,15 @@ impl RasterTelemetryRing {
     }
 }
 
+#[derive(Clone)]
+struct AnimatedImageEntry {
+    frame_texture: ImageTexture,
+    frame_count: i32,
+    repetition_count: i32,
+    frame_duration_ms: i32,
+    current_frame: i32,
+}
+
 struct SkwasmState {
     next_handle: u32,
     next_callback_id: u32,
@@ -426,6 +435,7 @@ struct SkwasmState {
     color_filters: HashMap<u32, ColorFilter>,
     image_filters: HashMap<u32, ImageFilter>,
     images: HashMap<u32, ImageTexture>,
+    animated_images: HashMap<u32, AnimatedImageEntry>,
     vertices: HashMap<u32, VerticesEntry>,
     runtime_effects: HashMap<u32, String>,
     uniform_data: HashMap<u32, Vec<u8>>,
@@ -442,6 +452,10 @@ struct SkwasmState {
     canvases: HashMap<u32, RecordingCanvasEntry>,
     pictures: HashMap<u32, PictureEntry>,
     surfaces: HashMap<u32, SurfaceEntry>,
+    #[cfg(target_arch = "wasm32")]
+    pending_texture_sources: HashMap<u32, (u32, u32, JsValue)>,
+    #[cfg(target_arch = "wasm32")]
+    texture_extractor_js: Option<js_sys::Function>,
     #[cfg(target_arch = "wasm32")]
     js_callbacks: HashMap<u32, js_sys::Function>,
     #[cfg(target_arch = "wasm32")]
@@ -470,6 +484,7 @@ impl SkwasmState {
             color_filters: HashMap::new(),
             image_filters: HashMap::new(),
             images: HashMap::new(),
+            animated_images: HashMap::new(),
             vertices: HashMap::new(),
             runtime_effects: HashMap::new(),
             uniform_data: HashMap::new(),
@@ -487,10 +502,50 @@ impl SkwasmState {
             pictures: HashMap::new(),
             surfaces: HashMap::new(),
             #[cfg(target_arch = "wasm32")]
+            pending_texture_sources: HashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            texture_extractor_js: None,
+            #[cfg(target_arch = "wasm32")]
             js_callbacks: HashMap::new(),
             #[cfg(target_arch = "wasm32")]
             telemetry: RasterTelemetryRing::new(),
         }
+    }
+
+    fn ensure_image_materialized(&mut self, handle: u32) -> Option<ImageTexture> {
+        if let Some(tex) = self.images.get(&handle) {
+            return Some(tex.clone());
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some((w, h, frame)) = self.pending_texture_sources.remove(&handle) {
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            if let Some(extractor) = &self.texture_extractor_js {
+                let ok = extractor
+                    .call4(
+                        &JsValue::NULL,
+                        &frame,
+                        &JsValue::from(w),
+                        &JsValue::from(h),
+                        &JsValue::from(rgba.as_mut_ptr() as u32),
+                    )
+                    .ok()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if ok {
+                    for px in rgba.as_chunks_mut::<4>().0 {
+                        let af = u16::from(px[3]);
+                        px[0] = ((u16::from(px[0]) * af + 127) / 255) as u8;
+                        px[1] = ((u16::from(px[1]) * af + 127) / 255) as u8;
+                        px[2] = ((u16::from(px[2]) * af + 127) / 255) as u8;
+                    }
+                }
+            }
+            let img_id = NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let tex = ImageTexture::new(img_id, w, h, rgba);
+            self.images.insert(handle, tex.clone());
+            return Some(tex);
+        }
+        None
     }
 
     fn alloc_handle(&mut self) -> u32 {
@@ -622,6 +677,50 @@ pub fn skwasm_register_callback_js(callback: JsValue) -> u32 {
     {
         let _ = callback;
         with_state(|st| st.alloc_handle())
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_set_texture_extractor_js(extractor: JsValue) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        with_state(|st| {
+            st.texture_extractor_js = extractor.dyn_into::<js_sys::Function>().ok();
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = extractor;
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_image_create_from_texture_source_js(
+    frame: JsValue,
+    width: i32,
+    height: i32,
+    _surface_handle: u32,
+) -> u32 {
+    let w = width.max(1) as u32;
+    let h = height.max(1) as u32;
+    #[cfg(target_arch = "wasm32")]
+    {
+        with_state(|st| {
+            let id = st.alloc_handle();
+            st.pending_texture_sources.insert(id, (w, h, frame));
+            id
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = frame;
+        with_state(|st| {
+            let img_id = NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let tex = ImageTexture::new(img_id, w, h, vec![0u8; (w * h * 4) as usize]);
+            let id = st.alloc_handle();
+            st.images.insert(id, tex);
+            id
+        })
     }
 }
 
@@ -1366,8 +1465,7 @@ pub unsafe extern "C" fn surface_rasterizeImage(
     let (callback_id, data_handle) = with_state(|st| {
         let cb_id = st.alloc_callback_id();
         let bytes = st
-            .images
-            .get(&image_handle)
+            .ensure_image_materialized(image_handle)
             .map_or_else(|| vec![0u8; 4], |img| img.rgba_premultiplied.to_vec());
         let len = bytes.len();
         let data_id = st.alloc_handle();
@@ -2190,7 +2288,7 @@ pub unsafe extern "C" fn shader_createFromImage(
 ) -> u32 {
     let mat = read_matrix33_ptr(matrix33_ptr);
     with_state(|st| {
-        let Some(tex) = st.images.get(&image_handle).cloned() else {
+        let Some(tex) = st.ensure_image_materialized(image_handle) else {
             return 0;
         };
         let src = ColorSource::Image {
@@ -2650,20 +2748,157 @@ pub unsafe extern "C" fn image_createFromPicture(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn image_ref(_handle: u32) {}
+
+#[no_mangle]
 pub unsafe extern "C" fn image_dispose(handle: u32) {
     with_state(|st| {
         st.images.remove(&handle);
+        #[cfg(target_arch = "wasm32")]
+        st.pending_texture_sources.remove(&handle);
     });
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn image_getWidth(handle: u32) -> i32 {
-    with_state(|st| st.images.get(&handle).map_or(0, |img| img.width as i32))
+    with_state(|st| {
+        if let Some(img) = st.images.get(&handle) {
+            return img.width as i32;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(&(w, _, _)) = st.pending_texture_sources.get(&handle) {
+            return w as i32;
+        }
+        0
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn image_getHeight(handle: u32) -> i32 {
-    with_state(|st| st.images.get(&handle).map_or(0, |img| img.height as i32))
+    with_state(|st| {
+        if let Some(img) = st.images.get(&handle) {
+            return img.height as i32;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(&(_, h, _)) = st.pending_texture_sources.get(&handle) {
+            return h as i32;
+        }
+        0
+    })
+}
+
+fn parse_animated_image_metadata(buf: &[u8]) -> (u32, u32, i32, i32) {
+    if buf.len() >= 10 && (&buf[0..6] == b"GIF87a" || &buf[0..6] == b"GIF89a") {
+        let w = u32::from(u16::from_le_bytes([buf[6], buf[7]])).max(1);
+        let h = u32::from(u16::from_le_bytes([buf[8], buf[9]])).max(1);
+        let mut gce_count = 0i32;
+        let mut first_duration_ms = 100i32;
+        let mut i = 10usize;
+        while i + 6 < buf.len() {
+            if buf[i] == 0x21 && buf[i + 1] == 0xF9 && buf[i + 2] == 0x04 {
+                if gce_count == 0 {
+                    let cs = i32::from(u16::from_le_bytes([buf[i + 4], buf[i + 5]]));
+                    if cs > 0 {
+                        first_duration_ms = cs * 10;
+                    }
+                }
+                gce_count += 1;
+                i += 7;
+            } else {
+                i += 1;
+            }
+        }
+        return (w, h, gce_count.max(1), first_duration_ms);
+    }
+    if buf.len() >= 24 && &buf[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]).max(1);
+        let h = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]).max(1);
+        return (w, h, 1, 100);
+    }
+    (1, 1, 1, 100)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_create(data_handle: u32, width: i32, height: i32) -> u32 {
+    with_state(|st| {
+        let (parsed_w, parsed_h, frame_count, frame_duration_ms) = st
+            .sk_data
+            .get(&data_handle)
+            .map_or((1, 1, 1, 100), |d| parse_animated_image_metadata(&d.buf));
+        let w = if width > 0 { width as u32 } else { parsed_w }.max(1);
+        let h = if height > 0 { height as u32 } else { parsed_h }.max(1);
+        let img_id = NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+        let frame_texture = ImageTexture::new(img_id, w, h, vec![0u8; (w * h * 4) as usize]);
+        let id = st.alloc_handle();
+        st.animated_images.insert(
+            id,
+            AnimatedImageEntry {
+                frame_texture,
+                frame_count,
+                repetition_count: -1,
+                frame_duration_ms,
+                current_frame: 0,
+            },
+        );
+        id
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_dispose(handle: u32) {
+    with_state(|st| {
+        st.animated_images.remove(&handle);
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_getFrameCount(handle: u32) -> i32 {
+    with_state(|st| st.animated_images.get(&handle).map_or(0, |a| a.frame_count))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_getRepetitionCount(handle: u32) -> i32 {
+    with_state(|st| {
+        st.animated_images
+            .get(&handle)
+            .map_or(0, |a| a.repetition_count)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_getCurrentFrameDurationMilliseconds(handle: u32) -> i32 {
+    with_state(|st| {
+        st.animated_images
+            .get(&handle)
+            .map_or(0, |a| a.frame_duration_ms)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_decodeNextFrame(handle: u32) {
+    with_state(|st| {
+        if let Some(a) = st.animated_images.get_mut(&handle) {
+            if a.frame_count > 0 {
+                a.current_frame = (a.current_frame + 1) % a.frame_count;
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn animatedImage_getCurrentFrame(handle: u32) -> u32 {
+    with_state(|st| {
+        let Some(tex) = st
+            .animated_images
+            .get(&handle)
+            .map(|a| a.frame_texture.clone())
+        else {
+            return 0;
+        };
+        let id = st.alloc_handle();
+        st.images.insert(id, tex);
+        id
+    })
 }
 
 #[no_mangle]
@@ -2862,6 +3097,9 @@ pub unsafe extern "C" fn pictureRecorder_endRecording(handle: u32) -> u32 {
         pid
     })
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn picture_ref(_handle: u32) {}
 
 #[no_mangle]
 pub unsafe extern "C" fn picture_dispose(handle: u32) {
@@ -3305,7 +3543,7 @@ pub unsafe extern "C" fn canvas_drawImage(
     filter_quality: i32,
 ) {
     with_state(|st| {
-        let Some(img) = st.images.get(&image_handle).cloned() else {
+        let Some(img) = st.ensure_image_materialized(image_handle) else {
             return;
         };
         let paint = st.paints.get(&paint_handle).cloned().unwrap_or_default();
@@ -3330,7 +3568,7 @@ pub unsafe extern "C" fn canvas_drawImageRect(
         return;
     };
     with_state(|st| {
-        let Some(img) = st.images.get(&image_handle).cloned() else {
+        let Some(img) = st.ensure_image_materialized(image_handle) else {
             return;
         };
         let paint = st.paints.get(&paint_handle).cloned().unwrap_or_default();
@@ -3359,7 +3597,7 @@ pub unsafe extern "C" fn canvas_drawImageNine(
     let ir = std::slice::from_raw_parts(center_irect_ptr, 4);
     let center = Rect::from_ltrb(ir[0] as f32, ir[1] as f32, ir[2] as f32, ir[3] as f32);
     with_state(|st| {
-        let Some(img) = st.images.get(&image_handle).cloned() else {
+        let Some(img) = st.ensure_image_materialized(image_handle) else {
             return;
         };
         let paint = st.paints.get(&paint_handle).cloned().unwrap_or_default();
@@ -3499,7 +3737,7 @@ pub unsafe extern "C" fn canvas_drawAtlas(
     let linear = filter_quality != 0;
 
     with_state(|st| {
-        let Some(atlas) = st.images.get(&atlas_handle).cloned() else {
+        let Some(atlas) = st.ensure_image_materialized(atlas_handle) else {
             return;
         };
         let paint = st.paints.get(&paint_handle).cloned();
@@ -4678,66 +4916,42 @@ pub unsafe extern "C" fn lineMetrics_getHardBreak(handle: u32) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getAscent(handle: u32) -> f64 {
+pub unsafe extern "C" fn lineMetrics_getAscent(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.ascent))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lineMetrics_getDescent(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.descent))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lineMetrics_getUnscaledAscent(handle: u32) -> f32 {
     with_state(|st| {
         st.line_metrics
             .get(&handle)
-            .map_or(0.0, |m| f64::from(m.ascent))
+            .map_or(0.0, |m| m.unscaled_ascent)
     })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getDescent(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.descent))
-    })
+pub unsafe extern "C" fn lineMetrics_getHeight(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.height))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getUnscaledAscent(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.unscaled_ascent))
-    })
+pub unsafe extern "C" fn lineMetrics_getWidth(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.width))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getHeight(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.height))
-    })
+pub unsafe extern "C" fn lineMetrics_getLeft(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.left))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getWidth(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.width))
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getLeft(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.left))
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lineMetrics_getBaseline(handle: u32) -> f64 {
-    with_state(|st| {
-        st.line_metrics
-            .get(&handle)
-            .map_or(0.0, |m| f64::from(m.baseline))
-    })
+pub unsafe extern "C" fn lineMetrics_getBaseline(handle: u32) -> f32 {
+    with_state(|st| st.line_metrics.get(&handle).map_or(0.0, |m| m.baseline))
 }
 
 #[no_mangle]
@@ -5889,6 +6103,60 @@ mod tests {
             imageFilter_dispose(backdrop_blur);
             picture_dispose(pic);
             pictureRecorder_dispose(rec);
+        }
+    }
+
+    /// C++ source: skwasm/images.cpp:AnimatedImageAndLineMetricsF32Abi
+    #[test]
+    fn test_animated_image_and_line_metrics_f32_abi() {
+        unsafe {
+            // Minimal GIF89a with 32x24 dimensions and 2 GCE blocks (5cs = 50ms)
+            let gif_bytes: &[u8] = &[
+                b'G', b'I', b'F', b'8', b'9', b'a', 32, 0, 24, 0, 0x00, 0, 0, // header
+                0x21, 0xF9, 0x04, 0x00, 5, 0, 0x00, 0x00, // GCE 1 (50ms)
+                0x21, 0xF9, 0x04, 0x00, 5, 0, 0x00, 0x00, // GCE 2 (50ms)
+                0x3B,
+            ];
+            let data = skData_create(gif_bytes.len());
+            std::slice::from_raw_parts_mut(skData_getPointer(data), gif_bytes.len())
+                .copy_from_slice(gif_bytes);
+
+            let anim = animatedImage_create(data, 0, 0);
+            assert_ne!(anim, 0);
+            assert_eq!(animatedImage_getFrameCount(anim), 2);
+            assert_eq!(animatedImage_getRepetitionCount(anim), -1);
+            assert_eq!(animatedImage_getCurrentFrameDurationMilliseconds(anim), 50);
+
+            let frame0 = animatedImage_getCurrentFrame(anim);
+            assert_ne!(frame0, 0);
+            assert_eq!(image_getWidth(frame0), 32);
+            assert_eq!(image_getHeight(frame0), 24);
+            animatedImage_decodeNextFrame(anim);
+            let frame1 = animatedImage_getCurrentFrame(anim);
+            assert_ne!(frame1, 0);
+            assert_ne!(frame0, frame1);
+            image_dispose(frame0);
+            image_dispose(frame1);
+            animatedImage_dispose(anim);
+            skData_dispose(data);
+
+            // Verify lineMetrics_get* return f32 matching raw_line_metrics.dart
+            let lm = lineMetrics_create(1, 12.5, 3.25, 12.0, 16.0, 84.5, 2.0, 12.5, 0);
+            let ascent: f32 = lineMetrics_getAscent(lm);
+            let descent: f32 = lineMetrics_getDescent(lm);
+            let unscaled: f32 = lineMetrics_getUnscaledAscent(lm);
+            let height: f32 = lineMetrics_getHeight(lm);
+            let width: f32 = lineMetrics_getWidth(lm);
+            let left: f32 = lineMetrics_getLeft(lm);
+            let baseline: f32 = lineMetrics_getBaseline(lm);
+            assert!((ascent - 12.5).abs() < 1e-4);
+            assert!((descent - 3.25).abs() < 1e-4);
+            assert!((unscaled - 12.0).abs() < 1e-4);
+            assert!((height - 16.0).abs() < 1e-4);
+            assert!((width - 84.5).abs() < 1e-4);
+            assert!((left - 2.0).abs() < 1e-4);
+            assert!((baseline - 12.5).abs() < 1e-4);
+            lineMetrics_dispose(lm);
         }
     }
 }
