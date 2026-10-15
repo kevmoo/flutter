@@ -11,9 +11,11 @@
 //! to record display lists, shape paragraphs, and render 2x SSAA frames on `impeller_wgpu`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+pub mod worker_protocol;
 
 use impeller_canvas::{
     BlendMode, Canvas, Cap, ClipOperation, ColorFilter, ColorSource, ConicalGradientParams,
@@ -273,6 +275,8 @@ struct SurfaceEntry {
     #[cfg(target_arch = "wasm32")]
     initializing: bool,
     #[cfg(target_arch = "wasm32")]
+    worker_ready: bool,
+    #[cfg(target_arch = "wasm32")]
     pending_tasks: Vec<PendingSurfaceTask>,
     #[cfg(target_arch = "wasm32")]
     gpu: Option<GpuSurfaceState>,
@@ -452,6 +456,21 @@ struct SkwasmState {
     canvases: HashMap<u32, RecordingCanvasEntry>,
     pictures: HashMap<u32, PictureEntry>,
     surfaces: HashMap<u32, SurfaceEntry>,
+    multi_threaded: bool,
+    worker_alpha_state: (u64, u64, u64),
+    worker_color_state: (u64, u64, u64),
+    worker_uploaded_images: HashSet<u64>,
+    worker_disposed_images: Vec<u64>,
+    #[cfg(target_arch = "wasm32")]
+    worker_post_set_canvas_js: Option<js_sys::Function>,
+    #[cfg(target_arch = "wasm32")]
+    worker_post_set_size_js: Option<js_sys::Function>,
+    #[cfg(target_arch = "wasm32")]
+    worker_post_render_frame_js: Option<js_sys::Function>,
+    #[cfg(target_arch = "wasm32")]
+    worker_post_destroy_surface_js: Option<js_sys::Function>,
+    #[cfg(target_arch = "wasm32")]
+    in_flight_worker_frames: HashMap<(u32, u32), (f64, u32, impeller_canvas::CanvasReplayStats)>,
     #[cfg(target_arch = "wasm32")]
     pending_texture_sources: HashMap<u32, (u32, u32, JsValue)>,
     #[cfg(target_arch = "wasm32")]
@@ -501,6 +520,21 @@ impl SkwasmState {
             canvases: HashMap::new(),
             pictures: HashMap::new(),
             surfaces: HashMap::new(),
+            multi_threaded: false,
+            worker_alpha_state: (0, 0, 0),
+            worker_color_state: (0, 0, 0),
+            worker_uploaded_images: HashSet::new(),
+            worker_disposed_images: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            worker_post_set_canvas_js: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_post_set_size_js: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_post_render_frame_js: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_post_destroy_surface_js: None,
+            #[cfg(target_arch = "wasm32")]
+            in_flight_worker_frames: HashMap::new(),
             #[cfg(target_arch = "wasm32")]
             pending_texture_sources: HashMap::new(),
             #[cfg(target_arch = "wasm32")]
@@ -745,7 +779,7 @@ fn invoke_surface_callback_now(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn commands_need_atlas_sync(commands: &[impeller_wgpu::DrawCommand]) -> bool {
     commands.iter().any(|cmd| match cmd {
         impeller_wgpu::DrawCommand::GlyphAtlas(b) => {
@@ -756,6 +790,331 @@ fn commands_need_atlas_sync(commands: &[impeller_wgpu::DrawCommand]) -> bool {
         }
         _ => false,
     })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn prepare_worker_frame_packet(
+    st: &mut SkwasmState,
+    surface_handle: u32,
+    pic_handles: &[u32],
+) -> Option<(
+    worker_protocol::WorkerFramePacket,
+    u32,
+    impeller_canvas::CanvasReplayStats,
+)> {
+    let mut pictures_to_render = Vec::with_capacity(pic_handles.len());
+    for pid in pic_handles {
+        if let Some(pic) = st.pictures.get(pid) {
+            pictures_to_render.push(Arc::clone(&pic.display_list));
+        }
+    }
+    let (alpha_arc, color_arc) = st.shared_glyph_atlases();
+    let (w, h, picture_commands, last_cmd_count, last_replay_stats) = {
+        let surf = st.surfaces.get_mut(&surface_handle)?;
+        let w = surf.width.max(1);
+        let h = surf.height.max(1);
+        surf.canvas
+            .set_default_glyph_atlases(Some(Arc::clone(&alpha_arc)), Some(Arc::clone(&color_arc)));
+        let mut picture_commands = Vec::with_capacity(pictures_to_render.len());
+        let mut last_cmd_count = 0u32;
+        let mut last_replay_stats = impeller_canvas::CanvasReplayStats::default();
+        for dl in &pictures_to_render {
+            surf.canvas.reset(w, h, Color::TRANSPARENT);
+            surf.canvas.draw_display_list(dl);
+            if commands_need_atlas_sync(surf.canvas.commands()) {
+                surf.canvas
+                    .sync_glyph_atlases_with_arcs(&alpha_arc, &color_arc);
+            }
+            let cmds = surf.canvas.commands().to_vec();
+            last_cmd_count = cmds.len() as u32;
+            last_replay_stats = surf.canvas.replay_stats();
+            picture_commands.push(cmds);
+        }
+        (w, h, picture_commands, last_cmd_count, last_replay_stats)
+    };
+
+    let mut alpha_used = false;
+    let mut color_used = false;
+    let mut new_images = Vec::new();
+    for cmds in &picture_commands {
+        let (ua, uc) = worker_protocol::commands_atlas_usage(cmds);
+        alpha_used |= ua;
+        color_used |= uc;
+        worker_protocol::collect_missing_images(
+            cmds,
+            &mut st.worker_uploaded_images,
+            &mut new_images,
+        );
+    }
+
+    let alpha_delta = if alpha_used {
+        worker_protocol::build_atlas_delta(&st.typographer.alpha_atlas, &mut st.worker_alpha_state)
+    } else {
+        None
+    };
+    let color_delta = if color_used {
+        worker_protocol::build_atlas_delta(&st.typographer.color_atlas, &mut st.worker_color_state)
+    } else {
+        None
+    };
+    let disposed_image_ids = std::mem::take(&mut st.worker_disposed_images);
+
+    Some((
+        worker_protocol::WorkerFramePacket {
+            width: w,
+            height: h,
+            alpha_used,
+            color_used,
+            alpha_delta,
+            color_delta,
+            new_images,
+            disposed_image_ids,
+            picture_commands,
+        },
+        last_cmd_count,
+        last_replay_stats,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_worker_set_size(surface_handle: u32, width: u32, height: u32, callback_id: u32) {
+    let post_fn = with_state(|st| {
+        if let Some(surf) = st.surfaces.get_mut(&surface_handle) {
+            surf.width = width;
+            surf.height = height;
+            surf.canvas.reset(width, height, Color::TRANSPARENT);
+        }
+        st.worker_post_set_size_js.clone()
+    });
+    if let Some(f) = post_fn {
+        let dims = js_sys::Array::new();
+        dims.push(&JsValue::from(width));
+        dims.push(&JsValue::from(height));
+        let _ = f.call3(
+            &JsValue::NULL,
+            &JsValue::from(surface_handle),
+            &JsValue::from(callback_id),
+            &dims,
+        );
+    } else {
+        invoke_surface_callback_now(surface_handle, callback_id, 0, &JsValue::NULL);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_worker_render_pictures(surface_handle: u32, pic_handles: &[u32], callback_id: u32) {
+    let t_replay_start = now_milliseconds();
+    let prepared = with_state(|st| {
+        let (packet, cmd_count, replay_stats) =
+            prepare_worker_frame_packet(st, surface_handle, pic_handles)?;
+        let dl_replay_ms = (now_milliseconds() - t_replay_start).max(0.0);
+        let bytes = worker_protocol::encode_frame_packet(&packet);
+        let post_fn = st.worker_post_render_frame_js.clone()?;
+        st.in_flight_worker_frames.insert(
+            (surface_handle, callback_id),
+            (dl_replay_ms, cmd_count, replay_stats),
+        );
+        Some((bytes, post_fn))
+    });
+
+    if let Some((bytes, post_fn)) = prepared {
+        let ab = js_sys::ArrayBuffer::new(bytes.len() as u32);
+        let u8_view = js_sys::Uint8Array::new(&ab);
+        u8_view.copy_from(&bytes);
+        let _ = post_fn.call3(
+            &JsValue::NULL,
+            &JsValue::from(surface_handle),
+            &JsValue::from(callback_id),
+            &ab,
+        );
+    } else {
+        let now_ms = now_milliseconds();
+        let raster_result = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("imageBitmaps"),
+            &js_sys::Array::new(),
+        );
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("rasterStartMilliseconds"),
+            &JsValue::from_f64(now_ms),
+        );
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("rasterEndMilliseconds"),
+            &JsValue::from_f64(now_ms),
+        );
+        invoke_surface_callback_now(surface_handle, callback_id, 0, &raster_result.into());
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_set_multi_threaded_js(enabled: bool) {
+    with_state(|st| {
+        st.multi_threaded = enabled;
+        if !enabled {
+            st.worker_alpha_state = (0, 0, 0);
+            st.worker_color_state = (0, 0, 0);
+            st.worker_uploaded_images.clear();
+            st.worker_disposed_images.clear();
+        }
+    });
+}
+
+#[wasm_bindgen]
+pub fn skwasm_register_worker_bridge_js(
+    post_set_canvas: JsValue,
+    post_set_size: JsValue,
+    post_render_frame: JsValue,
+    post_destroy_surface: JsValue,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        with_state(|st| {
+            st.worker_post_set_canvas_js = post_set_canvas.dyn_into::<js_sys::Function>().ok();
+            st.worker_post_set_size_js = post_set_size.dyn_into::<js_sys::Function>().ok();
+            st.worker_post_render_frame_js = post_render_frame.dyn_into::<js_sys::Function>().ok();
+            st.worker_post_destroy_surface_js =
+                post_destroy_surface.dyn_into::<js_sys::Function>().ok();
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (
+            post_set_canvas,
+            post_set_size,
+            post_render_frame,
+            post_destroy_surface,
+        );
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_on_worker_surface_initialized_js(
+    surface_handle: u32,
+    callback_id: u32,
+    context_lost_cb_id: u32,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pending = with_state(|st| {
+            if let Some(surf_entry) = st.surfaces.get_mut(&surface_handle) {
+                surf_entry.initializing = false;
+                surf_entry.worker_ready = true;
+                std::mem::take(&mut surf_entry.pending_tasks)
+            } else {
+                Vec::new()
+            }
+        });
+
+        invoke_surface_callback_now(
+            surface_handle,
+            callback_id,
+            context_lost_cb_id,
+            &JsValue::NULL,
+        );
+
+        for task in pending {
+            match task {
+                PendingSurfaceTask::SetSize {
+                    width,
+                    height,
+                    callback_id: sz_cb,
+                } => {
+                    dispatch_worker_set_size(surface_handle, width, height, sz_cb);
+                }
+                PendingSurfaceTask::RenderPictures {
+                    pic_handles,
+                    callback_id: rp_cb,
+                } => {
+                    dispatch_worker_render_pictures(surface_handle, &pic_handles, rp_cb);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (surface_handle, callback_id, context_lost_cb_id);
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_on_worker_size_set_js(surface_handle: u32, callback_id: u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        invoke_surface_callback_now(surface_handle, callback_id, 0, &JsValue::NULL);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (surface_handle, callback_id);
+    }
+}
+
+#[wasm_bindgen]
+pub fn skwasm_on_worker_render_done_js(
+    surface_handle: u32,
+    callback_id: u32,
+    image_bitmaps: JsValue,
+    worker_elapsed_ms: f64,
+    atlas_sync_ms: f64,
+    wgpu_render_ms: f64,
+    bitmap_transfer_ms: f64,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let end_ms = now_milliseconds();
+        let elapsed = worker_elapsed_ms.max(0.0);
+        let start_ms = (end_ms - elapsed).max(0.0);
+
+        with_state(|st| {
+            let (dl_replay_ms, cmd_count, replay_stats) = st
+                .in_flight_worker_frames
+                .remove(&(surface_handle, callback_id))
+                .unwrap_or_default();
+            let total_ms = dl_replay_ms + elapsed;
+            st.telemetry.record_and_publish(FrameTimingSample {
+                total_ms,
+                atlas_sync_ms,
+                dl_replay_ms,
+                wgpu_render_ms,
+                bitmap_transfer_ms,
+                command_count: cmd_count,
+                replay_stats,
+            });
+        });
+
+        let raster_result = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("imageBitmaps"),
+            &image_bitmaps,
+        );
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("rasterStartMilliseconds"),
+            &JsValue::from_f64(start_ms),
+        );
+        let _ = js_sys::Reflect::set(
+            &raster_result,
+            &JsValue::from_str("rasterEndMilliseconds"),
+            &JsValue::from_f64(end_ms),
+        );
+        let raster_js: JsValue = raster_result.into();
+        invoke_surface_callback_now(surface_handle, callback_id, 0, &raster_js);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (
+            surface_handle,
+            callback_id,
+            image_bitmaps,
+            worker_elapsed_ms,
+            atlas_sync_ms,
+            wgpu_render_ms,
+            bitmap_transfer_ms,
+        );
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -924,6 +1283,7 @@ pub fn skwasm_surface_set_canvas_js(surface_handle: u32, canvas: JsValue) -> u32
         #[cfg(target_arch = "wasm32")]
         if let Some(surf) = st.surfaces.get_mut(&surface_handle) {
             surf.initializing = true;
+            surf.worker_ready = false;
         }
         (st.alloc_callback_id(), st.alloc_callback_id())
     });
@@ -937,6 +1297,33 @@ pub fn skwasm_surface_set_canvas_js(surface_handle: u32, canvas: JsValue) -> u32
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+        let worker_post = with_state(|st| {
+            if !st.multi_threaded {
+                return None;
+            }
+            let (w, h) = st
+                .surfaces
+                .get(&surface_handle)
+                .map_or((1, 1), |s| (s.width.max(1), s.height.max(1)));
+            st.worker_post_set_canvas_js.clone().map(|f| (f, w, h))
+        });
+
+        if let Some((post_fn, w, h)) = worker_post {
+            let meta = js_sys::Array::new();
+            meta.push(&JsValue::from(w));
+            meta.push(&JsValue::from(h));
+            meta.push(&JsValue::from_bool(prefer_webgpu));
+            meta.push(&JsValue::from(callback_id));
+            meta.push(&JsValue::from(context_lost_cb_id));
+            let _ = post_fn.call3(
+                &JsValue::NULL,
+                &JsValue::from(surface_handle),
+                &canvas,
+                &meta,
+            );
+            return callback_id;
+        }
 
         wasm_bindgen_futures::spawn_local(async move {
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
@@ -1112,7 +1499,7 @@ pub unsafe extern "C" fn skwasm_isHeavy() -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn skwasm_isMultiThreaded() -> i32 {
-    0
+    with_state(|st| i32::from(st.multi_threaded))
 }
 
 #[no_mangle]
@@ -1322,6 +1709,8 @@ pub unsafe extern "C" fn surface_create() -> u32 {
                 #[cfg(target_arch = "wasm32")]
                 initializing: false,
                 #[cfg(target_arch = "wasm32")]
+                worker_ready: false,
+                #[cfg(target_arch = "wasm32")]
                 pending_tasks: Vec::new(),
                 #[cfg(target_arch = "wasm32")]
                 gpu: None,
@@ -1333,6 +1722,22 @@ pub unsafe extern "C" fn surface_create() -> u32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn surface_destroy(handle: u32) {
+    #[cfg(target_arch = "wasm32")]
+    let post_destroy = with_state(|st| {
+        st.surfaces.remove(&handle);
+        st.in_flight_worker_frames
+            .retain(|&(sh, _), _| sh != handle);
+        if st.multi_threaded {
+            st.worker_post_destroy_surface_js.clone()
+        } else {
+            None
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    if let Some(post_fn) = post_destroy {
+        let _ = post_fn.call1(&JsValue::NULL, &JsValue::from(handle));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     with_state(|st| {
         st.surfaces.remove(&handle);
     });
@@ -1375,17 +1780,21 @@ pub unsafe extern "C" fn surface_setSize(handle: u32, width: i32, height: i32) -
         wasm_bindgen_futures::spawn_local(async move {
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
                 .await;
-            let queued = with_state(|st| {
+            let (queued, use_worker) = with_state(|st| {
+                let is_mt = st.multi_threaded;
                 let Some(surf) = st.surfaces.get_mut(&handle) else {
-                    return false;
+                    return (false, false);
                 };
-                if surf.initializing && surf.gpu.is_none() {
+                if surf.initializing && surf.gpu.is_none() && !surf.worker_ready {
                     surf.pending_tasks.push(PendingSurfaceTask::SetSize {
                         width: w,
                         height: h,
                         callback_id,
                     });
-                    return true;
+                    return (true, false);
+                }
+                if is_mt && surf.worker_ready {
+                    return (false, true);
                 }
                 if let Some(gpu) = &mut surf.gpu {
                     gpu.offscreen_canvas.set_width(w);
@@ -1394,9 +1803,14 @@ pub unsafe extern "C" fn surface_setSize(handle: u32, width: i32, height: i32) -
                     gpu.config.height = h;
                     gpu.surface.configure(gpu.renderer.device(), &gpu.config);
                 }
-                false
+                (false, false)
             });
-            if !queued {
+            if queued {
+                return;
+            }
+            if use_worker {
+                dispatch_worker_set_size(handle, w, h, callback_id);
+            } else {
                 invoke_surface_callback_now(handle, callback_id, 0, &JsValue::NULL);
             }
         });
@@ -1424,20 +1838,26 @@ pub unsafe extern "C" fn surface_renderPictures(
         wasm_bindgen_futures::spawn_local(async move {
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
                 .await;
-            let queued = with_state(|st| {
+            let (queued, use_worker) = with_state(|st| {
+                let is_mt = st.multi_threaded;
                 let Some(surf) = st.surfaces.get_mut(&handle) else {
-                    return false;
+                    return (false, false);
                 };
-                if surf.initializing && surf.gpu.is_none() {
+                if surf.initializing && surf.gpu.is_none() && !surf.worker_ready {
                     surf.pending_tasks.push(PendingSurfaceTask::RenderPictures {
                         pic_handles: pic_handles.clone(),
                         callback_id,
                     });
-                    return true;
+                    return (true, false);
                 }
-                false
+                (false, is_mt && surf.worker_ready)
             });
-            if !queued {
+            if queued {
+                return;
+            }
+            if use_worker {
+                dispatch_worker_render_pictures(handle, &pic_handles, callback_id);
+            } else {
                 let raster_result = render_pictures_now(handle, &pic_handles);
                 invoke_surface_callback_now(handle, callback_id, 0, &raster_result);
             }
@@ -2753,7 +3173,11 @@ pub unsafe extern "C" fn image_ref(_handle: u32) {}
 #[no_mangle]
 pub unsafe extern "C" fn image_dispose(handle: u32) {
     with_state(|st| {
-        st.images.remove(&handle);
+        if let Some(removed) = st.images.remove(&handle) {
+            if st.worker_uploaded_images.remove(&removed.id) {
+                st.worker_disposed_images.push(removed.id);
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         st.pending_texture_sources.remove(&handle);
     });
@@ -3833,6 +4257,8 @@ pub unsafe extern "C" fn fontCollection_clearCaches(_handle: u32) {
         st.typographer.clear_caches();
         st.cached_alpha_atlas = None;
         st.cached_color_atlas = None;
+        st.worker_alpha_state = (0, 0, 0);
+        st.worker_color_state = (0, 0, 0);
     });
 }
 
@@ -6157,6 +6583,80 @@ mod tests {
             assert!((left - 2.0).abs() < 1e-4);
             assert!((baseline - 12.5).abs() < 1e-4);
             lineMetrics_dispose(lm);
+        }
+    }
+
+    /// C++ source: skwasm/surface_mt.cpp:MultiThreadedSurfaceWorkerPacketAndFlag
+    #[test]
+    fn test_multi_threaded_surface_worker_packet_and_flag() {
+        unsafe {
+            assert_eq!(skwasm_isMultiThreaded(), 0);
+            skwasm_set_multi_threaded_js(true);
+            assert_eq!(skwasm_isMultiThreaded(), 1);
+
+            let surf = surface_create();
+            surface_setSize(surf, 320, 240);
+
+            // Create a 2x2 RGBA image and draw it + a solid rect into a picture
+            let img_data = skData_create(16);
+            std::slice::from_raw_parts_mut(skData_getPointer(img_data), 16).copy_from_slice(&[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ]);
+            let img = image_createFromPixels(img_data, 2, 2, 0, 8);
+            assert_ne!(img, 0);
+
+            let rec = pictureRecorder_create();
+            let cull = [0.0f32, 0.0, 320.0, 240.0];
+            let canvas = pictureRecorder_beginRecording(rec, cull.as_ptr());
+            let paint = paint_create(1, 3, 0xFF336699u32 as i32, 0, 1.0, 0, 0, 4.0, 0);
+            let rect = [10.0f32, 20.0, 110.0, 120.0];
+            canvas_drawRect(canvas, rect.as_ptr(), paint);
+            canvas_drawImage(canvas, img, 16.0, 16.0, paint, 1);
+            let pic = pictureRecorder_endRecording(rec);
+
+            // First frame should include the newly referenced image
+            let (pkt1, cmd_count1, stats1) = with_state(|st| {
+                prepare_worker_frame_packet(st, surf, &[pic]).expect("frame 1 packet")
+            });
+            assert_eq!(pkt1.width, 320);
+            assert_eq!(pkt1.height, 240);
+            assert_eq!(pkt1.new_images.len(), 1);
+            assert!(pkt1.disposed_image_ids.is_empty());
+            assert!(cmd_count1 >= 2);
+            assert_eq!(stats1.op_count, 2);
+
+            // Encode + decode round-trip on simulated worker image map
+            let mut worker_imgs = HashMap::new();
+            let encoded1 = worker_protocol::encode_frame_packet(&pkt1);
+            let decoded1 = worker_protocol::decode_frame_packet(&encoded1, &mut worker_imgs)
+                .expect("decode 1");
+            assert_eq!(decoded1.picture_commands.len(), 1);
+            assert_eq!(worker_imgs.len(), 1);
+
+            // Second frame with same image should NOT re-upload image bytes
+            let (pkt2, _, _) = with_state(|st| {
+                prepare_worker_frame_packet(st, surf, &[pic]).expect("frame 2 packet")
+            });
+            assert!(pkt2.new_images.is_empty());
+
+            // Dispose image and verify next frame packet carries its disposed_image_ids
+            image_dispose(img);
+            let (pkt3, _, _) = with_state(|st| {
+                prepare_worker_frame_packet(st, surf, &[pic]).expect("frame 3 packet")
+            });
+            assert_eq!(pkt3.disposed_image_ids.len(), 1);
+            let encoded3 = worker_protocol::encode_frame_packet(&pkt3);
+            let _ = worker_protocol::decode_frame_packet(&encoded3, &mut worker_imgs)
+                .expect("decode 3");
+            assert!(worker_imgs.is_empty());
+
+            picture_dispose(pic);
+            paint_dispose(paint);
+            pictureRecorder_dispose(rec);
+            skData_dispose(img_data);
+            surface_destroy(surf);
+            skwasm_set_multi_threaded_js(false);
+            assert_eq!(skwasm_isMultiThreaded(), 0);
         }
     }
 }

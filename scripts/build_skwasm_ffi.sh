@@ -33,10 +33,11 @@ echo "=== Generating wasm-bindgen ES module into ${OUT_DIR} ==="
 CARGO_TARGET_DIR="${TARGET_DIR}" cargo run --locked --release -p impeller_skwasm_ffi --bin bundle_skwasm_ffi -- "${WASM_FILE}" "${OUT_DIR}"
 
 cp "${ROOT_DIR}/crates/impeller_skwasm_ffi/js/impeller_skwasm_loader.js" "${OUT_DIR}/impeller_skwasm_loader.js"
+cp "${ROOT_DIR}/crates/impeller_skwasm_ffi/js/impeller_worker.js" "${OUT_DIR}/impeller_worker.js"
 
 if [[ -f "${ABI_CHECKER}" ]]; then
   echo "=== Verifying 157 skwasm C-ABI exports against main.dart.wasm ==="
   python3 "${ABI_CHECKER}" "${OUT_DIR}/impeller_skwasm_ffi_bg.wasm"
 fi
 
-ls -lh "${OUT_DIR}/impeller_skwasm_ffi.js" "${OUT_DIR}/impeller_skwasm_ffi_bg.wasm" "${OUT_DIR}/impeller_skwasm_loader.js"
+ls -lh "${OUT_DIR}/impeller_skwasm_ffi.js" "${OUT_DIR}/impeller_skwasm_ffi_bg.wasm" "${OUT_DIR}/impeller_skwasm_loader.js" "${OUT_DIR}/impeller_worker.js"
