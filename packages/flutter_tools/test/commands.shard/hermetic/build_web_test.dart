@@ -324,6 +324,42 @@ void main() {
     expect(logger.statusText, contains('canvaskit/**'));
   });
 
+  testWithoutContext('Warns about web/assets/ when --web-content-hash is used', () async {
+    final TestWebBuildCommand buildCommand = createBuildCommand();
+    final CommandRunner<void> runner = createTestCommandRunner(buildCommand);
+    setupFileSystemForEndToEndTest(fileSystem);
+    fileSystem
+        .file(fileSystem.path.join('web', 'assets', 'splash.png'))
+        .createSync(recursive: true);
+    await runner.run(<String>['build', 'web', '--no-pub', '--web-content-hash']);
+
+    expect(logger.warningText, contains('"web/assets/"'));
+    expect(logger.warningText, contains('splash.png'));
+    expect(logger.warningText, contains('without a content hash'));
+  });
+
+  testWithoutContext('Does not warn about web/assets/ without --web-content-hash', () async {
+    final TestWebBuildCommand buildCommand = createBuildCommand();
+    final CommandRunner<void> runner = createTestCommandRunner(buildCommand);
+    setupFileSystemForEndToEndTest(fileSystem);
+    fileSystem
+        .file(fileSystem.path.join('web', 'assets', 'splash.png'))
+        .createSync(recursive: true);
+    await runner.run(<String>['build', 'web', '--no-pub']);
+
+    expect(logger.warningText, isNot(contains('"web/assets/"')));
+  });
+
+  testWithoutContext('Does not warn when web/assets/ has no files', () async {
+    final TestWebBuildCommand buildCommand = createBuildCommand();
+    final CommandRunner<void> runner = createTestCommandRunner(buildCommand);
+    setupFileSystemForEndToEndTest(fileSystem);
+    fileSystem.directory(fileSystem.path.join('web', 'assets')).createSync(recursive: true);
+    await runner.run(<String>['build', 'web', '--no-pub', '--web-content-hash']);
+
+    expect(logger.warningText, isNot(contains('"web/assets/"')));
+  });
+
   testWithoutContext('Builds successfully without --web-define', () async {
     final TestWebBuildCommand buildCommand = createBuildCommand(
       buildSystem: TestBuildSystem.all(BuildResult(success: true), (

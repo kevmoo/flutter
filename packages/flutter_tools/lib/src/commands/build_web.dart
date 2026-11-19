@@ -197,6 +197,9 @@ class BuildWebCommand extends BuildSubCommand {
         );
       }
     }
+    if (webContentHash) {
+      _warnOnUnhashedWebAssets(project.web.directory.childDirectory('assets'));
+    }
 
     final String? outputDirectoryPath = getValue(CommonOptions.outputDir);
 
@@ -231,6 +234,45 @@ class BuildWebCommand extends BuildSubCommand {
       );
     }
     return FlutterCommandResult.success();
+  }
+
+  /// Warns when `web/assets/` contains files.
+  ///
+  /// Files under `web/` are copied verbatim into the output directory after
+  /// `build/web/assets/` is content-hashed, so files in `web/assets/` keep
+  /// their original names next to hashed files that are safe to serve with
+  /// `immutable` caching.
+  void _warnOnUnhashedWebAssets(Directory webAssetsDir) {
+    if (!webAssetsDir.existsSync()) {
+      return;
+    }
+    final List<String> relativePaths =
+        webAssetsDir
+            .listSync(recursive: true)
+            .whereType<File>()
+            .map(
+              (File file) =>
+                  webAssetsDir.fileSystem.path.relative(file.path, from: webAssetsDir.path),
+            )
+            .toList()
+          ..sort();
+    if (relativePaths.isEmpty) {
+      return;
+    }
+    const maxListed = 5;
+    final String listed = relativePaths.take(maxListed).map((String p) => '  $p').join('\n');
+    final more = relativePaths.length > maxListed
+        ? '\n  ...and ${relativePaths.length - maxListed} more'
+        : '';
+    logger.printWarning(
+      'Found ${relativePaths.length} file(s) in "web/assets/":\n'
+      '$listed$more\n'
+      'With "--web-content-hash", these are copied into "build/web/assets/" without a content hash, '
+      'next to hashed files that are safe to serve with "immutable" caching. '
+      '"web/assets/" is not the Flutter asset directory: declare app assets in pubspec.yaml '
+      'so they are hashed, or move hand-authored web files to another folder under "web/" '
+      '(for example, "web/static/") and update any references to them.',
+    );
   }
 
   void _validateIndexHtmlForContentHash(File indexHtmlFile, {File? bootstrapJsFile}) {
